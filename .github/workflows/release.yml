@@ -1,0 +1,117 @@
+# Release pipeline for Pulse.
+#
+# How a release ships: bump `version` in Cargo.toml (the single source of
+# truth), commit, tag that commit `vX.Y.Z`, push the tag. This workflow
+# builds, tests, packs (Velopack) and publishes Setup.exe + full/delta
+# .nupkg + the releases manifest to the GitHub Release for that tag.
+#
+# The pack/publish engine is installer/publish.ps1 - the same script used
+# for local/emergency releases - so CI and local artifacts cannot drift.
+#
+# Manual runs (workflow_dispatch) default to dry_run: the full pipeline
+# executes (build, test, delta-base download, pack) but nothing is uploaded.
+# A manual run with dry_run unchecked publishes a release tagged with the
+# Cargo.toml version at the built commit (emergency lane; prefer tag pushes).
+#
+# Org policy: every action must be pinned to a full-length commit SHA
+# (workflows referencing floating tags are refused).
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Pack only - upload nothing (pipeline test)'
+        type: boolean
+        default: true
+
+# One release build at a time; never cancel a publish mid-flight.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      # Create the GitHub Release and upload its assets (org default is
+      # read-only, so this must be granted explicitly at the job level).
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Assert tag matches Cargo.toml version
+        if: github.event_name == 'push'
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $line = Get-Content Cargo.toml |
+            Where-Object { $_ -match '^\s*version\s*=\s*"([^"]+)"' } |
+            Select-Object -First 1
+          if (-not $line) {
+            Write-Host '::error::Could not read version from Cargo.toml'
+            exit 1
+          }
+          $version = [regex]::Match($line, '"([^"]+)"').Groups[1].Value
+          if ($env:TAG -ne "v$version") {
+            Write-Host "::error::Tag '$($env:TAG)' does not match Cargo.toml version 'v$version'. Releases are cut by bumping Cargo.toml, committing, then tagging THAT commit vX.Y.Z and pushing the tag."
+            exit 1
+          }
+          Write-Host "Tag $($env:TAG) matches Cargo.toml version $version"
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Test (release)
+        # A release built from untested code must not ship. This runs the
+        # same suite the PR gate runs; if it fails here, nothing is packed.
+        run: cargo test --release
+
+      - name: Install vpk
+        # The vpk CLI generation must match the velopack crate in Cargo.toml
+        # ("1.2"): a mismatched CLI/SDK pair produces broken packages. Bump
+        # this pin together with the Cargo dependency.
+        run: dotnet tool install --global vpk --version 1.2.0
+
+      - name: Pack and publish
+        if: github.event_name == 'push' || inputs.dry_run != true
+        env:
+          # publish.ps1's vpk calls read the token from VPK_GITHUB_TOKEN for
+          # both the delta-base download and the release upload.
+          VPK_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # -SkipBuild: binaries were built (and tested) by the steps above.
+        # publish.ps1 downloads the previous release as the delta base (a
+        # missing previous release is fine - first publish has no deltas),
+        # packs with packId AIPulseDaily.Pulse / --noPortable / icon+splash,
+        # and uploads to the GitHub Release for tag v<Cargo.toml version>.
+        run: .\installer\publish.ps1 -SkipBuild
+
+      - name: Pack only (dry run)
+        if: github.event_name == 'workflow_dispatch' && inputs.dry_run == true
+        env:
+          VPK_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          .\installer\publish.ps1 -SkipBuild -NoUpload
+          Write-Host ''
+          Write-Host 'Packed artifacts (nothing uploaded):'
+          Get-ChildItem target\releases | Format-Table Name, Length -AutoSize | Out-String | Write-Host

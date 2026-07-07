@@ -6,11 +6,12 @@
 
 **A persistent terminal manager for Windows. Your sessions survive reboots.**
 
+[![CI](https://github.com/aipulsedaily/pulse/actions/workflows/ci.yml/badge.svg)](https://github.com/aipulsedaily/pulse/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6)](#install)
 [![Rust](https://img.shields.io/badge/built%20with-Rust-dea584)](https://www.rust-lang.org)
 
-<img src="assets/readme/tests.png" width="900" alt="Pulse — folders in the sidebar on the left, a live terminal with a full cargo test run (4 passing tests) on the right">
+<img src="assets/readme/hero.png" width="900" alt="Pulse mid-workday: color-tagged folders of terminals in the sidebar, a live cargo build of ripgrep scrolling in the terminal, and the composer showing the running command with its elapsed time">
 
 </div>
 
@@ -43,7 +44,17 @@ collapse groups. The sidebar is pure hover-reveal chrome — no dividers, no
 visual noise — with a live activity dot per terminal.
 
 <div align="center">
-<img src="assets/readme/hero.png" width="820" alt="Terminals grouped into work and servers folders in the sidebar, with a gridcalc terminal showing git log and cargo build output">
+<img src="assets/readme/tests.png" width="820" alt="A full cargo test run of ripgrep's ignore crate — 137 tests passed — with work and linux folders in the sidebar and a running Claude session attributed on its terminal row">
+</div>
+
+### A dashboard of live previews
+
+One click zooms out to a card grid of every terminal — live scrolling
+previews, folder-scoped or all — so you can watch a build, a benchmark, and a
+server at the same time. Click a card to jump in.
+
+<div align="center">
+<img src="assets/readme/dashboard.png" width="820" alt="The dashboard: seven live terminal cards — a cargo build, a passing test run, a hyperfine benchmark, a directory listing, a Claude session, a redis-benchmark run in WSL, and htop">
 </div>
 
 ### An always-there command composer
@@ -54,7 +65,23 @@ and a live busy indicator. It covers the prompt row seamlessly, so the terminal
 reads as one continuous surface.
 
 <div align="center">
-<img src="assets/readme/composer.png" width="820" alt="The command composer at the bottom of a terminal with a queued cargo command and a lit Run button">
+<img src="assets/readme/composer.png" width="820" alt="A multi-line hyperfine command queued in the composer with the Run button lit, above real benchmark results and rg match counts">
+</div>
+
+Every command you run — in any terminal, past or present — lands in a
+cross-session history you can search and re-run from the composer.
+
+<div align="center">
+<img src="assets/readme/history.png" width="820" alt="The command history popup: deduped commands across terminals with their working directories, run counts, and ages">
+</div>
+
+### Search the whole scrollback
+
+Full-scrollback search with live match highlighting and a match counter —
+including everything replayed from the journal after a restart.
+
+<div align="center">
+<img src="assets/readme/search.png" width="820" alt="Scrollback search for 'Compiling grep' showing 1/24 matches highlighted across a real cargo build transcript">
 </div>
 
 ### Claude Code and Codex session attribution
@@ -62,11 +89,11 @@ reads as one continuous surface.
 Pulse recognizes when you launch [Claude
 Code](https://www.claude.com/product/claude-code) or Codex inside a terminal,
 pins the session identity, and restores it deterministically with `--resume`
-after a restart — never guessing "most recent". Launch a fresh Claude session
-or reattach an existing one straight from the new-terminal palette.
+after a restart — never guessing "most recent". The sidebar row shows what the
+session is working on, live.
 
 <div align="center">
-<img src="assets/readme/launcher.png" width="820" alt="The new-terminal palette showing PowerShell, cmd, WSL distros, SSH hosts, recent directories, and a New Claude session entry">
+<img src="assets/readme/claude.png" width="820" alt="A real Claude Code session inside Pulse answering questions about hyperfine's source, with the sidebar row showing the session's live task attribution">
 </div>
 
 ### SSH and WSL terminals
@@ -74,10 +101,16 @@ or reattach an existing one straight from the new-terminal palette.
 First-class WSL (per-distro) and SSH terminals alongside PowerShell and cmd.
 SSH terminals auto-reconnect after an unexpected drop, and file drag-and-drop
 uploads over SFTP. WSL and SSH sessions keep POSIX paths and restore into the
-right remote directory.
+right remote directory. Everything spawns from one palette: shells, WSL
+distros, SSH hosts, recent directories, and fresh or reattached Claude
+sessions.
 
 <div align="center">
-<img src="assets/readme/wsl.png" width="820" alt="A WSL Ubuntu terminal showing real lsb_release, uname, free, and df output">
+<img src="assets/readme/wsl.png" width="820" alt="A WSL Ubuntu terminal: neofetch system info, then a freshly built redis-server started on a custom port and a full redis-benchmark run">
+</div>
+
+<div align="center">
+<img src="assets/readme/launcher.png" width="820" alt="The new-terminal palette showing PowerShell, cmd, WSL distros, SSH hosts, recent directories, and a New Claude session entry">
 </div>
 
 ### Settings that stay out of the way
@@ -87,7 +120,7 @@ per-host permission consents — all in a quiet, modal-light settings surface
 that matches the app's zero-divider doctrine.
 
 <div align="center">
-<img src="assets/readme/settings.png" width="820" alt="The settings dialog over a live terminal, showing Appearance and Terminal sections">
+<img src="assets/readme/settings.png" width="820" alt="The settings dialog floating over a live build, showing Appearance and Terminal sections">
 </div>
 
 ### Seamless background updates

@@ -1,9 +1,14 @@
 # Pulse - Velopack release publisher.
 #
-# CI-less local flow:
+# This is the single pack/publish engine. Normal releases run it FROM GitHub
+# Actions (.github\workflows\release.yml, triggered by pushing a vX.Y.Z tag);
+# running it locally is the emergency/offline fallback and for staging proofs.
+#
+# Local flows:
 #   .\installer\publish.ps1                        # pack + upload to GitHub Releases
 #   .\installer\publish.ps1 -Local C:\tcfeed       # pack into a local feed dir (staging proof)
 #   .\installer\publish.ps1 -Local C:\tcfeed -SkipBuild   # reuse target\release binaries
+#   .\installer\publish.ps1 -SkipBuild -NoUpload   # full GitHub-path rehearsal, no publish
 #
 # Facts this script encodes (do not drift):
 # - packId is AIPulseDaily.Pulse - NEVER bare "Pulse": Velopack's
@@ -30,7 +35,11 @@ param(
     # repo in Cargo.toml `repository`.
     [string]$Repo = 'https://github.com/aipulsedaily/pulse',
     # Reuse existing target\release binaries instead of rebuilding.
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    # GitHub path, but stop before the upload: still downloads the delta base
+    # and packs, publishes nothing. Used by the release workflow's dry_run and
+    # for local pipeline rehearsal.
+    [switch]$NoUpload
 )
 
 $ErrorActionPreference = 'Stop'
@@ -111,6 +120,8 @@ if ($LASTEXITCODE -ne 0) { throw "vpk pack failed ($LASTEXITCODE)" }
 if ($Local) {
     Write-Host "Local feed ready: $outDir"
     Write-Host "Point the app at it with: TC_UPDATE_FEED=$outDir"
+} elseif ($NoUpload) {
+    Write-Host "Dry run: pack complete, nothing uploaded. Artifacts in $outDir"
 } else {
     Write-Host "vpk upload github ($Repo)"
     vpk upload github --repoUrl $Repo --outputDir $outDir --publish --releaseName "Pulse v$version" --tag "v$version"

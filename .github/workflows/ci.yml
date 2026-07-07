@@ -1,0 +1,54 @@
+# PR / main gate for Pulse: clippy (deny warnings) + the full test suite,
+# on windows-latest because this is a Windows-native app (ConPTY, Win32,
+# Direct2D) - it does not compile elsewhere.
+#
+# `cargo fmt --check` is deliberately absent: the repo has no rustfmt config
+# and the tree is not rustfmt-clean, so the gate would force an unrelated
+# whole-tree reformat. Add it only after a dedicated formatting pass.
+#
+# Org policy: every action must be pinned to a full-length commit SHA
+# (workflows referencing floating tags are refused).
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Newer pushes to the same ref supersede in-flight runs.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Rust toolchain (stable + clippy)
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test (release)
+        # --release matches the local house rule (and the release workflow),
+        # so CI green means the shipped profile is green.
+        run: cargo test --release

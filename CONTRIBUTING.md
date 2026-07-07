@@ -126,5 +126,44 @@ PRs run against the checklist in the PR template.
 - `cargo test --release` green and `cargo clippy --all-targets` clean.
 - Describe what you changed and how you verified it.
 
+CI runs the same gates on every PR (`.github/workflows/ci.yml`): clippy with
+warnings denied, plus the full test suite, on `windows-latest`.
+
+## Releases (maintainers)
+
+Releases are built and published by GitHub Actions
+(`.github/workflows/release.yml`) — not from a dev machine. The process:
+
+1. Bump `version` in `Cargo.toml` (the single source of truth) and commit.
+2. Tag **that commit** `vX.Y.Z` — the tag must match `Cargo.toml` exactly or
+   the workflow fails fast — and push the tag.
+3. Actions builds `--release`, runs the full test suite (a failing suite
+   aborts the release), packs with Velopack (`vpk`), and publishes
+   `Setup.exe` + full/delta `.nupkg` + the update manifest to the GitHub
+   Release for that tag. Installed apps pick it up via the built-in updater.
+
+```sh
+# example: shipping 0.2.0
+#   edit Cargo.toml -> version = "0.2.0"
+git commit -am "release: v0.2.0"
+git tag v0.2.0
+git push origin main v0.2.0
+gh run watch    # follow the release build
+```
+
+To rehearse the pipeline without publishing anything, run the `release`
+workflow manually from the Actions tab with `dry_run` checked (the default):
+it builds, tests, and packs, but uploads nothing.
+
+`installer\publish.ps1` remains the local/emergency fallback — it is the same
+pack engine the workflow runs, so it produces identical artifacts. It needs
+the Rust toolchain, `vpk` (`dotnet tool install -g vpk`), and a GitHub token
+in `VPK_GITHUB_TOKEN` for the upload. Prefer the Actions path: every shipped
+build then comes from a clean, tested runner.
+
+When editing the workflows, note the org policy: every action reference must
+be pinned to a full-length commit SHA (with a trailing `# vX.Y.Z` comment) —
+workflows that reference floating tags are refused.
+
 By contributing, you agree that your contributions are dual-licensed under
 MIT OR Apache-2.0, matching the project [license](README.md#license).
