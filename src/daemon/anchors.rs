@@ -449,7 +449,7 @@ pub fn compute_hints(
             r += 1;
         }
     }
-    out.sort_by(|a, b| (a.row, a.start_off).cmp(&(b.row, b.start_off)));
+    out.sort_by_key(|a| (a.row, a.start_off));
     out
 }
 

@@ -649,7 +649,7 @@ fn claude_extract(
     }
 
     // Fall back to the most-recently-written journal (the active session).
-    cands.sort_by(|a, b| b.2.cmp(&a.2));
+    cands.sort_by_key(|c| std::cmp::Reverse(c.2));
     if cands.len() == 1 {
         return (Some(cands[0].0.to_string()), CliConfidence::Correlated);
     }
