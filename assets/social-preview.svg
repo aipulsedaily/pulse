@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640">
+  <!-- GitHub social preview (1280x640): Logo A mark + wordmark + tagline on
+       the app's near-black palette (src/gui/theme.rs). Rendered to
+       assets/social-preview.png by assets/gen-social.ps1 (resvg). -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0.4" y2="1">
+      <stop offset="0" stop-color="#0E1017"/>
+      <stop offset="1" stop-color="#0B0D12"/>
+    </linearGradient>
+    <linearGradient id="plate" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#14161F"/>
+      <stop offset="1" stop-color="#0B0D12"/>
+    </linearGradient>
+    <linearGradient id="acc" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#9096FF"/>
+      <stop offset="1" stop-color="#7C83FF"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.32" cy="0.42" r="0.55">
+      <stop offset="0" stop-color="#7C83FF" stop-opacity="0.13"/>
+      <stop offset="1" stop-color="#7C83FF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect x="0" y="0" width="1280" height="640" fill="url(#bg)"/>
+  <rect x="0" y="0" width="1280" height="640" fill="url(#glow)"/>
+
+  <!-- Logo A mark, left-centered, scale 0.86 of the 256 canvas -->
+  <g transform="translate(150, 210) scale(0.86)">
+    <rect x="8" y="8" width="240" height="240" rx="52" fill="url(#plate)"/>
+    <path d="M 172 60 H 76 Q 52 60 52 84 v 88 Q 52 196 76 196 h 104 Q 204 196 204 172 V 104"
+          fill="none" stroke="#454C66" stroke-width="12" stroke-linecap="round"/>
+    <path d="M 88 102 L 118 128 L 88 154" fill="none" stroke="url(#acc)"
+          stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+    <line x1="136" y1="154" x2="170" y2="154" stroke="#E7E9EF"
+          stroke-width="16" stroke-linecap="round"/>
+    <path d="M 204 44 l 7.5 20.5 L 232 72 l -20.5 7.5 L 204 100 l -7.5 -20.5 L 176 72 l 20.5 -7.5 Z"
+          fill="url(#acc)"/>
+    <circle cx="232" cy="44" r="6" fill="#9096FF" opacity="0.75"/>
+  </g>
+
+  <!-- wordmark + tagline, right of the mark -->
+  <text x="470" y="300" text-anchor="start"
+        font-family="Segoe UI, Arial, sans-serif" font-size="76" font-weight="700"
+        letter-spacing="0.5" fill="#E7E9EF">Pulse</text>
+  <text x="474" y="356" text-anchor="start"
+        font-family="Segoe UI, Arial, sans-serif" font-size="30" font-weight="400"
+        letter-spacing="0.3" fill="#9AA0B4">A persistent terminal manager for Windows.</text>
+  <text x="474" y="398" text-anchor="start"
+        font-family="Segoe UI, Arial, sans-serif" font-size="30" font-weight="400"
+        letter-spacing="0.3" fill="#9AA0B4">Your sessions survive reboots.</text>
+
+  <!-- accent underline -->
+  <rect x="474" y="424" width="120" height="4" rx="2" fill="url(#acc)"/>
+</svg>

@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- Pulse app mark (Logo A, chosen 2026-07-06): terminal window
+       frame + prompt chevron + cursor underscore, with a four-point spark
+       breaking the frame's top-right corner ("terminal with magic"). This is
+       the canonical FULL mark — used for the large icon frames (32px and up),
+       the splash, and the lifecycle windows. The simplified small-size mark
+       is icon-16.svg. Palette: plate #0B0D12 family, ACCENT #7C83FF, TEXT
+       #E7E9EF (src/gui/theme.rs). -->
+  <defs>
+    <linearGradient id="plate" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#14161F"/>
+      <stop offset="1" stop-color="#0B0D12"/>
+    </linearGradient>
+    <linearGradient id="acc" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#9096FF"/>
+      <stop offset="1" stop-color="#7C83FF"/>
+    </linearGradient>
+  </defs>
+
+  <!-- near-black rounded plate -->
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="url(#plate)"/>
+
+  <!-- terminal window frame, muted indigo-gray; top-right corner left open
+       where the spark sits -->
+  <path d="M 172 60 H 76 Q 52 60 52 84 v 88 Q 52 196 76 196 h 104 Q 204 196 204 172 V 104"
+        fill="none" stroke="#454C66" stroke-width="12" stroke-linecap="round"/>
+
+  <!-- prompt chevron, accent -->
+  <path d="M 88 102 L 118 128 L 88 154" fill="none" stroke="url(#acc)"
+        stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- cursor underscore, text white -->
+  <line x1="136" y1="154" x2="170" y2="154" stroke="#E7E9EF"
+        stroke-width="16" stroke-linecap="round"/>
+
+  <!-- spark: four-point star breaking the frame's top-right corner -->
+  <path d="M 204 44 l 7.5 20.5 L 232 72 l -20.5 7.5 L 204 100 l -7.5 -20.5 L 176 72 l 20.5 -7.5 Z"
+        fill="url(#acc)"/>
+  <circle cx="232" cy="44" r="6" fill="#9096FF" opacity="0.75"/>
+</svg>

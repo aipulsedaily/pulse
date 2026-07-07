@@ -1,0 +1,97 @@
+[package]
+name = "pulse"
+version = "0.1.0"
+edition = "2021"
+description = "Pulse: persistent terminal manager for Windows — daemon-owned ConPTY sessions, journaled scrollback, terminals that survive reboots"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/aipulsedaily/pulse"
+readme = "README.md"
+keywords = ["terminal", "conpty", "windows", "persistent", "sessions"]
+categories = ["command-line-utilities", "gui"]
+
+# Two shipped binaries: pulse.exe (GUI + daemon + probe roles, windows
+# subsystem in release) and pulse-ctl.exe (the controller CLI, a real console
+# program — see src/bin/pulse_ctl.rs for why it is a separate binary).
+[[bin]]
+name = "pulse"
+path = "src/main.rs"
+
+[[bin]]
+name = "pulse-ctl"
+path = "src/bin/pulse_ctl.rs"
+
+[dependencies]
+egui = "0.35"
+eframe = { version = "0.35", default-features = false, features = [
+    "default_fonts",
+    "wgpu",
+    "accesskit",
+] }
+alacritty_terminal = "0.26"
+portable-pty = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Codex attribution: format-preserving insert/update into the user's real
+# ~/.codex/config.toml [hooks.state] trust table — never reserialize (would
+# drop their comments/ordering). Already in the build graph via
+# proc-macro-crate, so a direct dep is a free reuse of the same artifact.
+toml_edit = "0.25"
+bincode = "1.3"
+uuid = { version = "1", features = ["v4", "serde"] }
+dirs = "6"
+anyhow = "1"
+log = "0.4"
+simplelog = "0.12"
+open = "5"
+winreg = "0.55"
+memchr = "2"
+parking_lot = "0.12"
+# P5 wait engine: linear-time regex (no catastrophic backtracking inside the
+# daemon); bytes flavor so mid-UTF-8 chunk splits can't break matching.
+regex = "1"
+socket2 = "0.5"
+windows = { version = "0.62", features = [
+    "Win32_System_Threading",
+    # Daemon startup clears an inherited ignore-Ctrl+C disposition via
+    # SetConsoleCtrlHandler(None, false) — ConPTY children inherit our
+    # ConsoleFlags, and launchers like MSYS bash seed the ignore bit.
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Shutdown",
+    "Win32_System_LibraryLoader",
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Wdk_System_Threading",
+    "Wdk_System_SystemServices",
+    # QOL §6.1: the ~30-line CF_UNICODETEXT clipboard read (menu Paste +
+    # middle-click paste) — egui 0.35 surfaces the clipboard as events only.
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    # Codex attribution: GetShortPathNameW reduces a space-containing tc.exe
+    # path to its 8.3 form so the codex hook command round-trips `cmd /C`.
+    "Win32_Storage_FileSystem",
+    # Installer: GetLocalTime stamps pre-update backup dir names
+    # (yyyyMMdd-HHmmss, local clock — matches what the settings Backups list
+    # displays) without pulling a chrono/time dependency.
+    "Win32_System_SystemInformation",
+] }
+# Installer + seamless auto-update: Velopack delivers the package
+# (GUI + updater under %LOCALAPPDATA%\AIPulseDaily.Pulse); the app's own
+# bin-sync then deploys into the load-bearing bin\ path (update-plan Axis 0-C).
+velopack = "1.2"
+
+[build-dependencies]
+# Exe icon + FileVersion/ProductVersion resource for both bins.
+# build.rs no-ops gracefully if assets/icon.ico is ever absent.
+winresource = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+
+# Attribution: the GUI terminal widget (view/bindings/theme) is adapted from
+# egui_term (MIT) by Ilya Shvyryalkin — https://github.com/Harzu/egui_term

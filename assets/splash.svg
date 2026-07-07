@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 340" width="600" height="340">
+  <!-- Pulse installer splash: Velopack shows
+       this static PNG while Setup installs (the splashImage arg). Full Logo A
+       mark centered on the app's near-black, wordmark below, a subtle static
+       progress bar (a highlight sitting on a track; motion is out per the
+       plan's static-PNG decision, the bar reads as an install affordance
+       without animating). Palette from src/gui/theme.rs. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0E1017"/>
+      <stop offset="1" stop-color="#0B0D12"/>
+    </linearGradient>
+    <linearGradient id="plate" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#14161F"/>
+      <stop offset="1" stop-color="#0B0D12"/>
+    </linearGradient>
+    <linearGradient id="acc" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#9096FF"/>
+      <stop offset="1" stop-color="#7C83FF"/>
+    </linearGradient>
+    <linearGradient id="shimmer" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#7C83FF" stop-opacity="0"/>
+      <stop offset="0.5" stop-color="#9096FF" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#7C83FF" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.42" r="0.5">
+      <stop offset="0" stop-color="#7C83FF" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#7C83FF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect x="0" y="0" width="600" height="340" fill="url(#bg)"/>
+  <rect x="0" y="0" width="600" height="340" fill="url(#glow)"/>
+
+  <!-- Logo A mark, centered upper area, scale 0.44 of the 256 canvas -->
+  <g transform="translate(232, 44) scale(0.53)">
+    <rect x="8" y="8" width="240" height="240" rx="52" fill="url(#plate)"/>
+    <path d="M 172 60 H 76 Q 52 60 52 84 v 88 Q 52 196 76 196 h 104 Q 204 196 204 172 V 104"
+          fill="none" stroke="#454C66" stroke-width="12" stroke-linecap="round"/>
+    <path d="M 88 102 L 118 128 L 88 154" fill="none" stroke="url(#acc)"
+          stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+    <line x1="136" y1="154" x2="170" y2="154" stroke="#E7E9EF"
+          stroke-width="16" stroke-linecap="round"/>
+    <path d="M 204 44 l 7.5 20.5 L 232 72 l -20.5 7.5 L 204 100 l -7.5 -20.5 L 176 72 l 20.5 -7.5 Z"
+          fill="url(#acc)"/>
+    <circle cx="232" cy="44" r="6" fill="#9096FF" opacity="0.75"/>
+  </g>
+
+  <!-- wordmark -->
+  <text x="300" y="256" text-anchor="middle"
+        font-family="Segoe UI, Arial, sans-serif" font-size="26" font-weight="600"
+        letter-spacing="0.5" fill="#E7E9EF">Pulse</text>
+  <text x="300" y="280" text-anchor="middle"
+        font-family="Segoe UI, Arial, sans-serif" font-size="12"
+        letter-spacing="0.8" fill="#6B7185">Installing&#8230;</text>
+
+  <!-- progress track + a highlight sitting on it (static) -->
+  <rect x="180" y="304" width="240" height="4" rx="2" fill="#1B1F2A"/>
+  <rect x="180" y="304" width="150" height="4" rx="2" fill="url(#shimmer)"/>
+</svg>

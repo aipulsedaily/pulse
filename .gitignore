@@ -1,0 +1,33 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Build / tooling logs
+build.log
+*.log
+
+# Installer build output (publish.ps1 writes under target\publish and
+# target\releases — both already covered by /target/ above)
+*.nupkg
+
+# Staging / local test data (probe runs, staging daemons)
+/tcdata/
+/scratchpad/
+*.corrupt
+
+# Claude Code runtime files (keep .claude/settings.json committed)
+.claude/*
+!.claude/settings.json
+
+# IDE / editor
+.vscode/
+.idea/
+*.iml
+*.swp
+*~
+
+# OS cruft
+Thumbs.db
+desktop.ini
+.DS_Store

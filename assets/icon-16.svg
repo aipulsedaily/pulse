@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- Pulse small-size mark (Logo A simplified, for 16/24 px .ico
+       frames). At taskbar size the frame's rounded corners, the spark's four
+       points, and the underscore all collapse into mush — so the small mark
+       KEEPS the two identity-carrying elements (the bold prompt chevron and a
+       cursor block) and DROPS the frame + spark, with much thicker strokes so
+       they survive a 16x16 rasterization. The near-black plate is retained so
+       it reads on light and dark taskbars alike. Palette matches icon.svg. -->
+  <defs>
+    <linearGradient id="plate16" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#14161F"/>
+      <stop offset="1" stop-color="#0B0D12"/>
+    </linearGradient>
+    <linearGradient id="acc16" x1="0" y1="0" x2="0.8" y2="1">
+      <stop offset="0" stop-color="#9096FF"/>
+      <stop offset="1" stop-color="#7C83FF"/>
+    </linearGradient>
+  </defs>
+
+  <!-- near-black rounded plate (slightly tighter radius reads better small) -->
+  <rect x="8" y="8" width="240" height="240" rx="44" fill="url(#plate16)"/>
+
+  <!-- bold prompt chevron, accent -->
+  <path d="M 74 72 L 128 128 L 74 184" fill="none" stroke="url(#acc16)"
+        stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- solid cursor block, text white -->
+  <rect x="146" y="150" width="60" height="34" rx="8" fill="#E7E9EF"/>
+</svg>
