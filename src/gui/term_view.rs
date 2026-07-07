@@ -533,6 +533,40 @@ pub fn show(
         );
     }
 
+    // ── Grid IME intent (B3). winit DISABLES the window's IME association at
+    // creation on Windows, and egui-winit re-enables it only while some
+    // widget publishes `output.ime` — which natively only TextEdit does. So
+    // without this, no WM_IME_* event is ever synthesized while the grid has
+    // focus: CJK composition can never open over a TUI/raw session and the
+    // `Event::Ime(Commit)` arm in process_input is dead code. Publishing
+    // while the grid owns focus keeps IME enabled and positions the
+    // candidate window at the terminal cursor cell (alacritty behavior).
+    // Preedit stays unhandled — composition is invisible until commit, but
+    // the OS candidate window still renders at the published rect. No
+    // collision with TextEdits: focus is exclusive, so at most one widget
+    // publishes IME intent per frame.
+    if response.has_focus() {
+        let cell_w = backend.size.cell_width.max(1.0);
+        let cell_h = backend.size.cell_height.max(1.0);
+        let grid = backend.term.grid();
+        let cur = grid.cursor.point;
+        let line = (cur.line.0 + grid.display_offset() as i32) as f32;
+        let cursor_rect = Rect::from_min_size(
+            Pos2::new(
+                content_rect.min.x + cell_w * cur.column.0 as f32,
+                content_rect.min.y + cell_h * line,
+            ),
+            Vec2::new(cell_w, cell_h),
+        );
+        ui.ctx().output_mut(|o| {
+            o.ime = Some(egui::output::IMEOutput {
+                rect: grid_rect,
+                cursor_rect,
+                should_interrupt_composition: false,
+            });
+        });
+    }
+
     ui.memory_mut(|m| m.data.insert_temp(widget_id, vs));
     (response, out)
 }

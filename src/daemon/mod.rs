@@ -548,6 +548,17 @@ impl Core {
             self.state.lock().terminal(id).is_some(),
             "terminal {id} deleted"
         );
+        // KNOWN RESIDUAL (wave1 F3, LOW — fix here if this code is touched):
+        // a delete completing between the state check above and the
+        // `block_store_base` call below re-inserts a blocks-map entry for the
+        // deleted id (memory-only, until restart) and `Journal::open`'s
+        // create(true) leaves an empty orphan `<id>.log` (reaped on the next
+        // HEALTHY boot). The double-checked re-ensure below correctly refuses
+        // the journals-map insert, so nothing else leaks. The complete fix is
+        // on THIS side: re-check state immediately before `block_store_base`
+        // (or fold the state check into block_store_base under the blocks
+        // lock), mirroring the journals-map double-check.
+        //
         // First open since daemon start: rehydrate the block sidecar here (the
         // single Journal construction site) so the journal starts life with
         // the persisted compaction base — block offsets stay aligned across
@@ -2156,6 +2167,14 @@ impl Core {
     fn delete_terminal_inner(&self, id: Uuid) {
         self.reconnects.lock().remove(&id);
         self.mutate(|s| s.terminals.retain(|t| t.id != id));
+        // F1: every parked waiter for this id (ALL kinds — Exit included)
+        // fails "deleted" NOW. on_exit early-returns for a deleted id, so
+        // nothing else can ever resolve them; without this sweep a
+        // `pulse-ctl wait`/`run --wait` parks to its full timeout and then
+        // lies "timeout". AFTER the state mutate, so a wait registering
+        // behind us hits not_found — and the post-push `claim_back_if_deleted`
+        // re-check covers a push that lands after this sweep.
+        self.fail_all_waiters_for(id, "deleted", "the terminal was deleted");
         // Bound the removed Session so the kill AND the Session drop (ConPTY
         // close) run outside the sessions mutex.
         let removed = self.sessions.lock().remove(&id);

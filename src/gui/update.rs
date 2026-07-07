@@ -261,8 +261,30 @@ fn engine_loop(shared: Arc<Mutex<EngineShared>>, rx: Receiver<EngineCmd>, ctx: e
     }
 }
 
+/// B6, pure so the table is test-pinned: the state a FAILED check lands in,
+/// plus whether the caller must surface the failure as a toast. Background
+/// failures always restore `prev` (log line only). A manual "Check now"
+/// failure shows CheckFailed inline (Axis 3) ONLY when nothing was already
+/// offered: an Available/Ready `prev` — a surfaced offer, possibly a fully
+/// staged download — survives, because CheckFailed would blank the pill and
+/// self-close the popover for up to 6h while `pending` sits staged and
+/// intact. The restored state no longer says the check failed, so that case
+/// asks for a toast instead.
+fn check_fail_state(manual: bool, prev: UpdateUiState) -> (UpdateUiState, bool) {
+    let offer = matches!(
+        prev,
+        UpdateUiState::Available { .. } | UpdateUiState::Ready { .. }
+    );
+    match (manual, offer) {
+        (true, true) => (prev, true),
+        (true, false) => (UpdateUiState::CheckFailed, false),
+        (false, _) => (prev, false),
+    }
+}
+
 /// One check cycle. Background failures are a log line only; a manual
-/// "Check now" failure may say so inline via `CheckFailed` (Axis 3).
+/// "Check now" failure says so inline via `CheckFailed` — unless it would
+/// eat a surfaced offer (B6, see `check_fail_state`).
 fn check(um: &UpdateManager, shared: &Arc<Mutex<EngineShared>>, ctx: &egui::Context, manual: bool) {
     let prev = shared.lock().ui.clone();
     set_state(shared, ctx, UpdateUiState::Checking);
@@ -300,7 +322,11 @@ fn check(um: &UpdateManager, shared: &Arc<Mutex<EngineShared>>, ctx: &egui::Cont
         Ok(_) => set_state(shared, ctx, UpdateUiState::UpToDate),
         Err(e) => {
             log::warn!("update check failed: {e}");
-            set_state(shared, ctx, if manual { UpdateUiState::CheckFailed } else { prev });
+            let (state, toast) = check_fail_state(manual, prev);
+            if toast {
+                push_msg(shared, ctx, true, "Couldn't check for updates", format!("{e}"));
+            }
+            set_state(shared, ctx, state);
         }
     }
 }
@@ -636,15 +662,18 @@ pub(super) fn copy_backup_into(backup: &Path, data_dir: &Path) -> Result<(), Str
 
 /// What the bottom-of-sidebar row shows: `(label, interactive)`. None = the
 /// row is absent entirely (zero pixels while idle). The pill appears once an
-/// update is READY (auto-download on), or already at AVAILABLE when
-/// auto-download is off (the popover primary then downloads first); the
+/// update is READY, or at AVAILABLE — which with auto-download ON is never a
+/// transient (check() goes straight to Downloading): it is only ever the
+/// resting state after a failed/blocked background download (B4), where the
+/// row IS the quiet retry affordance (its popover primary downloads first).
+/// With auto-download off it is simply the manual-download entry point. The
 /// mid-flight states show quiet stage text.
 pub(super) fn update_row_label(state: &UpdateUiState, auto_download: bool) -> Option<(String, bool)> {
     match state {
         UpdateUiState::Ready { version } => {
             Some((format!("Update ready \u{00b7} v{version}"), true))
         }
-        UpdateUiState::Available { version } if !auto_download => {
+        UpdateUiState::Available { version } => {
             Some((format!("Update available \u{00b7} v{version}"), true))
         }
         UpdateUiState::Downloading { percent } if !auto_download => {
@@ -994,8 +1023,10 @@ mod tests {
     }
 
     /// Axis 5: the sidebar row presentation table — hidden while idle,
-    /// "ready" once staged, "available" only when auto-download is off,
-    /// stage text (non-interactive) mid-flight.
+    /// "ready" once staged, "available" whenever an update rests unstaged
+    /// (B4: with auto-download on that only happens after a failed/blocked
+    /// download, and the row is the retry affordance), stage text
+    /// (non-interactive) mid-flight.
     #[test]
     fn update_row_label_table() {
         use UpdateUiState::*;
@@ -1014,17 +1045,46 @@ mod tests {
                 Some(("Backing up\u{2026}".into(), false))
             );
         }
-        // Available/Downloading surface only on the manual-download path.
-        assert_eq!(update_row_label(&Available { version: "0.2.0".into() }, true), None);
-        assert_eq!(
-            update_row_label(&Available { version: "0.2.0".into() }, false),
-            Some(("Update available \u{00b7} v0.2.0".into(), true))
-        );
+        // Available ALWAYS surfaces (B4 — deliberate flip of the old pin):
+        // with auto-download on it is never a transient, only the resting
+        // state after a failed/blocked background download, and the row is
+        // the quiet retry affordance. Hiding it parked an available update
+        // invisibly for the whole GUI session.
+        for auto in [true, false] {
+            assert_eq!(
+                update_row_label(&Available { version: "0.2.0".into() }, auto),
+                Some(("Update available \u{00b7} v0.2.0".into(), true))
+            );
+        }
+        // Downloading stage text surfaces only on the manual-download path.
         assert_eq!(update_row_label(&Downloading { percent: 43 }, true), None);
         assert_eq!(
             update_row_label(&Downloading { percent: 43 }, false),
             Some(("Downloading\u{2026} 43%".into(), false))
         );
+    }
+
+    /// B6: a failed check must never eat a surfaced offer. Manual failures
+    /// show CheckFailed only from non-offer states; Available/Ready survive
+    /// (with a toast asking the caller to say so); background failures
+    /// always restore whatever was there.
+    #[test]
+    fn check_fail_state_table() {
+        use UpdateUiState::*;
+        let ready = || Ready { version: "0.2.0".into() };
+        let avail = || Available { version: "0.2.0".into() };
+        // Manual + offer: the pill survives, failure surfaces as a toast.
+        assert_eq!(check_fail_state(true, ready()), (ready(), true));
+        assert_eq!(check_fail_state(true, avail()), (avail(), true));
+        // Manual + no offer: inline CheckFailed, no toast (the settings
+        // status line says it).
+        assert_eq!(check_fail_state(true, Idle), (CheckFailed, false));
+        assert_eq!(check_fail_state(true, UpToDate), (CheckFailed, false));
+        assert_eq!(check_fail_state(true, CheckFailed), (CheckFailed, false));
+        // Background: always quiet-restore prev, offer or not.
+        assert_eq!(check_fail_state(false, ready()), (ready(), false));
+        assert_eq!(check_fail_state(false, UpToDate), (UpToDate, false));
+        assert_eq!(check_fail_state(false, Idle), (Idle, false));
     }
 
     /// Axis 6: happy-path backup — small-config set copied + verified,

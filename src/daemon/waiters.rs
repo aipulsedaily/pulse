@@ -178,6 +178,32 @@ impl Core {
         }
     }
 
+    /// F1 residual (delete flavor of L-10): a push landing AFTER delete's
+    /// all-kinds waiter sweep parks forever — delete removed the blocks-map
+    /// entry, so the Prompt/BlockClose/Output re-check conditions below all
+    /// read false, and a deleted terminal emits no further events. The sweep
+    /// runs after the state mutate, so "gone from state" here is
+    /// authoritative: claim the waiter back and fail it "deleted". Returns
+    /// true when handled (the Exit kind needs none of this —
+    /// `recheck_exit_after_push` already reads not-Running for a deleted id
+    /// and resolves Exited{code:None}).
+    fn claim_back_if_deleted(&self, client: &Arc<ClientConn>, req_id: u64, id: Uuid) -> bool {
+        if self.state.lock().terminal(id).is_some() {
+            return false;
+        }
+        if let Some(w) = self.claim_waiter(client, req_id) {
+            self.waiter_reply(
+                &w.client,
+                w.req_id,
+                CtlBody::Err {
+                    code: "deleted".into(),
+                    msg: "the terminal was deleted".into(),
+                },
+            );
+        }
+        true
+    }
+
     /// L-10: close the check→push TOCTOU. The registration-time immediate
     /// check and `push_waiter` share no lock; a resolution firing between
     /// them ran its resolve pass BEFORE this waiter was in the list, parking
@@ -192,6 +218,9 @@ impl Core {
         id: Uuid,
         after_off: u64,
     ) {
+        if self.claim_back_if_deleted(client, req_id, id) {
+            return;
+        }
         let hit = {
             let map = self.blocks.lock();
             map.get(&id)
@@ -221,6 +250,9 @@ impl Core {
         req_id: u64,
         id: Uuid,
     ) {
+        if self.claim_back_if_deleted(client, req_id, id) {
+            return;
+        }
         let at_prompt = {
             let map = self.blocks.lock();
             map.get(&id).is_some_and(|s| s.open.is_none())
@@ -276,6 +308,9 @@ impl Core {
         req_id: u64,
         id: Uuid,
     ) {
+        if self.claim_back_if_deleted(client, req_id, id) {
+            return;
+        }
         let Ok(journal) = self.journal(id) else { return };
         loop {
             let Some(mut w) = self.claim_waiter(client, req_id) else {
@@ -297,6 +332,10 @@ impl Core {
                                 msg: "too many pending waits".into(),
                             },
                         );
+                    } else {
+                        // F1: a delete sweep firing while the waiter was
+                        // CLAIMED here missed it — re-check now it is listed.
+                        self.claim_back_if_deleted(client, req_id, id);
                     }
                     return;
                 }
@@ -348,6 +387,10 @@ impl Core {
                         msg: "too many pending waits".into(),
                     },
                 );
+                return;
+            }
+            // F1: same claimed-window re-check as above before looping.
+            if self.claim_back_if_deleted(client, req_id, id) {
                 return;
             }
         }
@@ -446,6 +489,45 @@ impl Core {
             let mut i = 0;
             while i < ws.len() {
                 if ws[i].id == id && sleep_fails_kind(&ws[i].kind) {
+                    out.push(ws.remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+            self.waiter_count.store(ws.len(), Ordering::Relaxed);
+            out
+        };
+        for w in hits {
+            self.waiter_reply(
+                &w.client,
+                w.req_id,
+                CtlBody::Err {
+                    code: code.into(),
+                    msg: msg.into(),
+                },
+            );
+        }
+    }
+
+    /// DELETE (F1): the terminal is being torn down permanently — every
+    /// waiter for the id, Exit INCLUDED, fails with the structured "deleted"
+    /// cause. Unlike sleep (S11, `fail_waiters_for`) there is no truthful
+    /// later resolution to hold out for: on_exit early-returns for a deleted
+    /// id (its state lookup misses), so no waiter of any kind can ever
+    /// resolve after the delete — it would burn the client's full timeout
+    /// and then lie "timeout". Same drain-outside-the-lock discipline;
+    /// exactly-once holds because this sweep and any racing resolver both
+    /// remove from the list under the waiters lock.
+    pub(super) fn fail_all_waiters_for(&self, id: Uuid, code: &str, msg: &str) {
+        if self.waiter_count.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let hits: Vec<Waiter> = {
+            let mut ws = self.waiters.lock();
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i < ws.len() {
+                if ws[i].id == id {
                     out.push(ws.remove(i));
                 } else {
                     i += 1;

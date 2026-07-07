@@ -2592,6 +2592,13 @@ impl App {
             self.selected = None;
             // The popup's anchor (the selected terminal's strip) died.
             self.history = None;
+            // B1: the auto-select below bypasses select_terminal, so the
+            // cross-terminal panels it would drop are cleared here — search
+            // matches never carry across terminals (a stale list drives the
+            // counter/step/current-highlight against the new grid whenever
+            // history sizes coincide, e.g. two capped terminals).
+            self.search = None;
+            self.blocks_panel = None;
         }
         // The §6.1 empty-state embed dies with the empty state.
         if !self.state.terminals.is_empty()
@@ -3158,7 +3165,34 @@ impl App {
             .terms
             .get(&id)
             .is_some_and(|t| !t.mode().contains(TermMode::ALT_SCREEN));
-        running && no_open && not_alt
+        // B2: the composer's v0.1.1 PRE-SHELL veto, same signals. A restored
+        // password-auth ssh terminal replays only CLOSED records (on_exit
+        // closed the previous lifetime's dangling block), so the record leg
+        // passes while ssh sits at `password:` / the host-key question — one
+        // Re-run click would type the command + Enter into the auth
+        // conversation (and a command starting with `yes` would TRUST the
+        // unverified host key). No hook event in the CURRENT lifetime and no
+        // live prompt latch ⇒ whatever is talking is not the shell ⇒ no
+        // Re-run. On a healthy restored local shell the first prompt render
+        // fires the pre hook (pre_seen > 0) and Re-run re-enables at once.
+        let pre_shell_now = composer::pre_shell(
+            running,
+            !not_alt,
+            self.terms
+                .get(&id)
+                .and_then(|t| t.block_feed.as_ref())
+                .map(|f| f.pre_seen)
+                .unwrap_or(0),
+            self.terms
+                .get(&id)
+                .and_then(|t| t.block_feed.as_ref())
+                .map(|f| f.exec_seen)
+                .unwrap_or(0),
+            self.composers
+                .get(&id)
+                .is_some_and(|c| c.at_prompt_latched()),
+        );
+        running && no_open && not_alt && !pre_shell_now
     }
 
     /// Type the recorded command + Enter into the shell. UTF-8 passthrough

@@ -141,9 +141,17 @@ impl App {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if primary_button(ui, "Delete", true, true).clicked() {
                             // Move selection to a neighbor before it vanishes so
-                            // the user isn't dumped to the empty state.
+                            // the user isn't dumped to the empty state. This
+                            // deliberately bypasses select_terminal (to dodge
+                            // its other side effects), so the two cross-terminal
+                            // panels it would drop must be cleared inline (B1):
+                            // stale search matches otherwise drive the counter,
+                            // Enter-stepping, and the current-match highlight
+                            // on the WRONG terminal.
                             if self.selected == Some(id) {
                                 self.selected = self.neighbor_of(id);
+                                self.search = None;
+                                self.blocks_panel = None;
                             }
                             actions.push(C2D::DeleteTerminal { id });
                             keep = false;

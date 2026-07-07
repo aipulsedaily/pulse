@@ -21,18 +21,60 @@ pub fn path() -> PathBuf {
     data_dir().join("ctl-tokens.json")
 }
 
-/// Missing or corrupt file ⇒ empty set (logged) — never a startup failure.
+/// Load the token file — never a startup failure, but never a silent
+/// first-write hazard either (wave1 F2, the R4-F1 state.json shape):
+/// - NotFound ⇒ quiet empty set (normal first run);
+/// - corrupt or unreadable (AV lock / sharing violation / EACCES) ⇒ LOG +
+///   move the real file aside FIRST, then default. Without the backup, the
+///   next token verb would `save()` the defaulted-empty set over the real
+///   file and every persisted scoped token would be gone permanently.
+///   (If the rename itself fails — e.g. the file is still exclusively
+///   locked — the original survives in place for the next boot.)
 pub fn load() -> TokenFile {
-    match std::fs::read(path()) {
+    load_from(&path())
+}
+
+fn load_from(p: &std::path::Path) -> TokenFile {
+    match std::fs::read(p) {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
             Ok(f) => f,
             Err(e) => {
-                log::error!("ctl-tokens.json corrupt ({e}); starting with no scoped tokens");
+                log::error!(
+                    "ctl-tokens.json corrupt ({e}); starting with no scoped tokens, old file backed up"
+                );
+                backup_bad_file(p);
                 TokenFile::default()
             }
         },
-        Err(_) => TokenFile::default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => TokenFile::default(),
+        Err(e) => {
+            log::error!(
+                "ctl-tokens.json unreadable ({e}); starting with no scoped tokens, backup attempted"
+            );
+            backup_bad_file(p);
+            TokenFile::default()
+        }
     }
+}
+
+/// Move a corrupt/unreadable ctl-tokens.json aside (the
+/// `SharedState::backup_bad_state` pattern). Keep the FIRST bad copy — a
+/// second one falls back to a timestamped name rather than clobbering it.
+fn backup_bad_file(p: &std::path::Path) {
+    let dir = p.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+    let backup = dir.join("ctl-tokens.json.corrupt");
+    let backup = if backup.exists() {
+        dir.join(format!(
+            "ctl-tokens.json.corrupt.{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        ))
+    } else {
+        backup
+    };
+    let _ = std::fs::rename(p, backup);
 }
 
 /// Atomic tmp+rename write (the SharedState::save pattern), so a power cut
@@ -115,5 +157,63 @@ mod tests {
         f.tokens.retain(|t| t.name != "agents");
         assert_eq!(f.tokens.len(), 1);
         assert_eq!(f.tokens[0].name, "ci");
+    }
+
+    /// Wave1 F2: the loader's three-arm hardening (the state.json R4-F1
+    /// shape). NotFound is the quiet first run; a corrupt file is moved
+    /// aside BEFORE defaulting, so a later token verb's whole-file save can
+    /// never clobber the real data; a healthy file just loads.
+    #[test]
+    fn load_from_three_arms() {
+        let dir = std::env::temp_dir().join(format!("tc-ctl-tokens-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("ctl-tokens.json");
+
+        // NotFound ⇒ empty set, NO backup file minted.
+        assert!(load_from(&p).tokens.is_empty());
+        assert!(!dir.join("ctl-tokens.json.corrupt").exists());
+
+        // Healthy ⇒ loads as-is.
+        let mut f = TokenFile::default();
+        f.tokens.push(CtlTokenInfo {
+            name: "keepme".into(),
+            token: mint(),
+            scope: crate::protocol::SCOPE_READ,
+            created_ms: 1,
+        });
+        std::fs::write(&p, serde_json::to_vec(&f).unwrap()).unwrap();
+        assert_eq!(load_from(&p).tokens.len(), 1);
+        assert!(p.exists(), "healthy load never moves the file");
+
+        // Corrupt ⇒ default AND the real bytes are moved aside first.
+        std::fs::write(&p, b"{ not json").unwrap();
+        assert!(load_from(&p).tokens.is_empty());
+        assert!(!p.exists(), "corrupt file moved aside — a save can't clobber it");
+        assert_eq!(
+            std::fs::read(dir.join("ctl-tokens.json.corrupt")).unwrap(),
+            b"{ not json",
+            "backup holds the original bytes"
+        );
+
+        // A SECOND bad copy falls back to a timestamped name, keeping the first.
+        std::fs::write(&p, b"also bad").unwrap();
+        assert!(load_from(&p).tokens.is_empty());
+        assert_eq!(
+            std::fs::read(dir.join("ctl-tokens.json.corrupt")).unwrap(),
+            b"{ not json",
+            "first backup is never clobbered"
+        );
+        let timestamped = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("ctl-tokens.json.corrupt.")
+            })
+            .count();
+        assert_eq!(timestamped, 1, "second bad copy got a timestamped name");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
