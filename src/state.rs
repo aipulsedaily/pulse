@@ -156,6 +156,25 @@ pub fn path_namespace(family: &ShellFamily) -> PathNamespace {
     }
 }
 
+/// Drive-letter translation of a Windows path into WSL's automount namespace:
+/// `C:\Users\z\x.bashrc` → `/mnt/c/Users/z/x.bashrc` (lowercase drive,
+/// backslashes→slashes). None for UNC/relative paths (untranslatable — the
+/// caller degrades: hookless spawn for the bootstrap, `~` for display).
+/// Lives here (not daemon::bootstrap) since v0.1.1: `display_cwd` needs it
+/// and state.rs also compiles into the pulse-ctl bin, which has no daemon
+/// module. Re-exported by daemon::bootstrap for its historical call sites.
+pub fn wsl_mnt_path(p: &Path) -> Option<String> {
+    let s = p.to_str()?;
+    let b = s.as_bytes();
+    if b.len() < 3 || !b[0].is_ascii_alphabetic() || b[1] != b':' || (b[2] != b'\\' && b[2] != b'/')
+    {
+        return None;
+    }
+    let drive = (b[0] as char).to_ascii_lowercase();
+    let rest = s[3..].replace('\\', "/");
+    Some(format!("/mnt/{drive}/{rest}"))
+}
+
 /// Classify what actually spawns. Only `TermKind::Shell` can be a first-class
 /// shell family (Custom keeps full degraded freedom; Claude-kind untouched).
 /// Stem-matched case-insensitively like the historical pwsh check.
@@ -397,6 +416,48 @@ fn default_dead() -> TermStatus {
 }
 
 impl TerminalMeta {
+    /// The ONE effective-cwd display rule (v0.1.1, the "titlebar shows
+    /// `C:\Users\zany` for a Linux session" fix) — every cwd-displaying
+    /// surface (titlebar, dashboard card, `pulse-ctl list`, composer lane
+    /// fallback) goes through here:
+    ///   - Win namespace: tracked `live_cwd`, else the launch cwd (exactly
+    ///     the rule those surfaces already applied);
+    ///   - Posix namespace (WSL/ssh): `live_cwd` verbatim when the hooks
+    ///     have reported one; else an EXPLICIT Windows start dir shows as
+    ///     its automount translation (`/mnt/c/…` — true by wsl.exe `--cd`
+    ///     semantics even for a hookless spawn); else `~` (exactly where
+    ///     `--cd ~` starts the session). NEVER a `C:\` string for a
+    ///     Posix-namespace session.
+    pub fn display_cwd(&self) -> String {
+        let family = shell_family(&self.kind, &self.program, &self.args);
+        if let Some(live) = &self.live_cwd {
+            return live.to_string_lossy().into_owned();
+        }
+        match path_namespace(&family) {
+            PathNamespace::Win => self.cwd.to_string_lossy().into_owned(),
+            PathNamespace::Posix => {
+                let s = self.cwd.to_string_lossy();
+                let t = s.trim();
+                if t.is_empty() || t == "~" {
+                    return "~".into();
+                }
+                if t.starts_with('/') {
+                    return t.to_string(); // POSIX restore cwd, verbatim
+                }
+                // Explicit Windows start dir: only WSL can honor it (wsl.exe
+                // resolves --cd through the automount) — for ssh a Windows
+                // path has no remote meaning, so the honest placeholder is
+                // the remote home.
+                match family {
+                    ShellFamily::WslShell { .. } => {
+                        wsl_mnt_path(Path::new(t)).unwrap_or_else(|| "~".into())
+                    }
+                    _ => "~".into(),
+                }
+            }
+        }
+    }
+
     /// The command line to use for the next launch, applying the resume adapter.
     pub fn launch_command(&self) -> (String, Vec<String>) {
         match &self.kind {
@@ -775,6 +836,71 @@ mod shell_family_tests {
         let old: ShellCfg = serde_json::from_str(r#"{"remote_hooks":false}"#).unwrap();
         assert!(!old.remote_hooks);
         assert!(old.auto_reconnect, "pre-proto-10 cfg keeps reconnect on");
+    }
+
+    /// v0.1.1: the ONE effective-cwd display rule — POSIX-namespace
+    /// sessions (WSL/ssh) never render a `C:\` string; Win namespace keeps
+    /// the live_cwd-else-cwd rule every surface already had.
+    #[test]
+    fn display_cwd_rule() {
+        let mut meta = TerminalMeta {
+            id: Uuid::new_v4(),
+            name: "t".into(),
+            folder: None,
+            kind: TermKind::Shell,
+            program: "wsl.exe".into(),
+            args: vec!["-d".into(), "Ubuntu-24.04".into()],
+            cwd: PathBuf::from("~"),
+            order: 0,
+            auto_restore: true,
+            launched_once: false,
+            status: TermStatus::Dead,
+            last_cols: 0,
+            last_rows: 0,
+            live_cwd: None,
+            inner_cli: None,
+            hooked: true,
+            shell_cfg: None,
+            color_tag: None,
+            asleep: false,
+            reconnecting: false,
+        };
+        // WSL, pre-first-hook: the `--cd ~` truth.
+        assert_eq!(meta.display_cwd(), "~");
+        // Hooks reported: live POSIX cwd verbatim.
+        meta.live_cwd = Some(PathBuf::from("/home/zany/proj"));
+        assert_eq!(meta.display_cwd(), "/home/zany/proj");
+        // Explicit Windows start dir, hookless: the automount translation —
+        // true by wsl.exe --cd semantics — never the raw C:\ string.
+        meta.live_cwd = None;
+        meta.cwd = PathBuf::from("C:\\Users\\zany\\proj");
+        assert_eq!(meta.display_cwd(), "/mnt/c/Users/zany/proj");
+        // Untranslatable (UNC) degrades to ~, never a Windows path.
+        meta.cwd = PathBuf::from("\\\\server\\share");
+        assert_eq!(meta.display_cwd(), "~");
+        // POSIX restore cwd rides verbatim.
+        meta.cwd = PathBuf::from("/tmp");
+        assert_eq!(meta.display_cwd(), "/tmp");
+        // ssh: empty cwd (by design) presents as the remote home; a stray
+        // Windows cwd (raw-API create) does too — /mnt is WSL semantics and
+        // means nothing on a remote host.
+        meta.program = "ssh.exe".into();
+        meta.args = vec!["alice@devbox".into()];
+        meta.cwd = PathBuf::new();
+        assert_eq!(meta.display_cwd(), "~");
+        meta.cwd = PathBuf::from("C:\\Terminal Control");
+        assert_eq!(meta.display_cwd(), "~", "no /mnt story for a remote host");
+        meta.cwd = PathBuf::new();
+        meta.live_cwd = Some(PathBuf::from("/srv/app"));
+        assert_eq!(meta.display_cwd(), "/srv/app");
+        // Win namespace: live_cwd else cwd (the pre-existing rule).
+        meta.program = "powershell.exe".into();
+        meta.args = vec![];
+        meta.live_cwd = None;
+        meta.cwd = PathBuf::from("C:\\proj");
+        assert_eq!(meta.display_cwd(), "C:\\proj");
+        meta.live_cwd = Some(PathBuf::from("C:\\proj\\sub"));
+        assert_eq!(meta.display_cwd(), "C:\\proj\\sub");
     }
 
     /// Bug 1: the claude launch-command resume-branch selection. A pinned

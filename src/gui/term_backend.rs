@@ -86,6 +86,15 @@ pub struct BlockAnchor {
     pub end_line: Option<i32>,
 }
 
+/// Quiescence window for the pending prompt-end upgrade (v0.1.1): conhost
+/// forwards OSCs through the ConPTY pipe immediately but renders text on an
+/// async frame (~15ms), so a 133;B can beat its own prompt text into the
+/// stream — the immediate capture then lands at the row start and the
+/// composer reads the prompt string as typed input (the field typed-text/^C
+/// loop). The reordered text frame lands well within this window on both
+/// fast and slow relay paths.
+const PROMPT_END_QUIESCE: std::time::Duration = std::time::Duration::from_millis(40);
+
 /// Per-backend block-anchoring state: feed-time capture, delta maintenance,
 /// honest decay. `None` on the backend ⇒ that session pays zero cost.
 pub struct BlockFeed {
@@ -118,6 +127,17 @@ pub struct BlockFeed {
     /// dropped (never remapped) on reflow/saturation/alt-resize — a wrong
     /// prompt-end is worse than a missing one (P3 §5.2).
     pub prompt_end: Option<(i32, usize)>,
+    /// v0.1.1 (the ConPTY OSC-vs-text frame race, field: every 133;B on the
+    /// laptop captured the WRONG cell and the composer read the prompt
+    /// string as typed text): the immediate capture above is provisional —
+    /// while this flag is up, the capture is UPGRADED to the live cursor
+    /// cell on the first quiescent moment (no output for
+    /// `PROMPT_END_QUIESCE`), because the reordered prompt-text frame lands
+    /// within that window. Local input sent while pending FREEZES the
+    /// immediate capture instead (waiting past the echo would fold typed
+    /// text into the "prompt" — the dangerous direction). Cleared by
+    /// exec/pre/alt/stale like the capture itself.
+    pending_prompt_end: bool,
     /// Presentational covers riding the grid (P3 seamless): superseded bare
     /// prompt rows blanked by the empty-Enter "more lines" gesture, and
     /// composer-submitted command rows re-styled as `❯ cmd` history so the
@@ -204,6 +224,7 @@ impl BlockFeed {
             pre_seen: 0,
             exec_seen: 0,
             prompt_end: None,
+            pending_prompt_end: false,
             covers: Vec::new(),
             saw_exec_since_pre: false,
             incoming_prompt: None,
@@ -256,6 +277,10 @@ pub struct TermBackend {
     /// The Term's configured scrollback depth (10k normally; small in tests
     /// so saturation is exercisable).
     history_cap: usize,
+    /// Instant of the last LIVE output frame (advance_live) — the quiescence
+    /// clock for the pending prompt-end upgrade (v0.1.1). None until the
+    /// first live frame.
+    last_output_at: Option<std::time::Instant>,
     /// Monotonic generation counter, bumped whenever the parser consumed
     /// bytes (advance / advance_live) or a stuck sync block was force-flushed
     /// (pump_sync). Cheap change-detection for per-frame grid scans: the
@@ -325,6 +350,7 @@ impl TermBackend {
             block_feed: None,
             jump_flash: None,
             history_cap: history,
+            last_output_at: None,
             feed_gen: 0,
             cur_blank_line: None,
         }
@@ -407,6 +433,20 @@ impl TermBackend {
     /// result to `advance` — vte is incremental, so split-feeding at hook
     /// boundaries is byte-identical; the scanner READS only (mirror purity).
     pub fn advance_live(&mut self, bytes: &[u8]) {
+        // Pending prompt-end upgrade (v0.1.1): if the stream was quiet for
+        // the whole quiescence window, the PRE-parse cursor is the settled
+        // one — resolve before these new bytes move it (output after a
+        // settled prompt is either the next command's world or type-ahead
+        // echo; neither belongs in the prompt-end cell).
+        let now = std::time::Instant::now();
+        if self.block_feed.as_ref().is_some_and(|f| f.pending_prompt_end)
+            && self
+                .last_output_at
+                .is_some_and(|t| now.duration_since(t) >= PROMPT_END_QUIESCE)
+        {
+            self.resolve_pending_prompt_end();
+        }
+        self.last_output_at = Some(now);
         self.feed_gen = self.feed_gen.wrapping_add(1);
         if let Some(on) = self.mode_scan.feed(bytes) {
             self.win32_input = on;
@@ -417,6 +457,60 @@ impl TermBackend {
         }
         self.drain_events();
         self.clear_live_selection_on_output();
+    }
+
+    /// Commit the pending prompt-end upgrade: the live cursor cell IS the
+    /// settled prompt end (v0.1.1 — see `BlockFeed::pending_prompt_end`).
+    /// No-op (flag cleared) when the feed went stale or an alt screen owns
+    /// the cursor.
+    fn resolve_pending_prompt_end(&mut self) {
+        let alt = self.term.mode().contains(TermMode::ALT_SCREEN);
+        let cur = self.term.grid().cursor.point;
+        if let Some(bf) = self.block_feed.as_mut() {
+            if !bf.pending_prompt_end {
+                return;
+            }
+            bf.pending_prompt_end = false;
+            if bf.stale || alt {
+                return;
+            }
+            bf.prompt_end = Some((cur.line.0, cur.column.0));
+            bf.incoming_prompt = None;
+        }
+    }
+
+    /// Per-frame poll for the pending prompt-end upgrade (v0.1.1): resolves
+    /// once the output has been quiet for `PROMPT_END_QUIESCE`, returns the
+    /// wakeup deadline while still pending (the caller schedules a repaint —
+    /// an idle terminal produces no output frames to resolve on).
+    pub fn poll_pending_prompt_end(&mut self, now: std::time::Instant) -> Option<std::time::Instant> {
+        if !self
+            .block_feed
+            .as_ref()
+            .is_some_and(|f| f.pending_prompt_end)
+        {
+            return None;
+        }
+        let deadline = self.last_output_at.unwrap_or(now) + PROMPT_END_QUIESCE;
+        if now >= deadline {
+            self.resolve_pending_prompt_end();
+            None
+        } else {
+            Some(deadline)
+        }
+    }
+
+    /// Local input is about to ship to this terminal's PTY (v0.1.1): a
+    /// pending prompt-end upgrade FREEZES on the immediate capture — the
+    /// keystroke's echo arrives as output and would otherwise restart the
+    /// quiescence clock until the "settled" cursor sat AFTER the echoed
+    /// text, folding typed input into the prompt (the fused-submit hazard).
+    /// The immediate capture is exactly today's semantics: correct on
+    /// non-racing machines, honestly dirty on racing ones.
+    pub fn note_input(&mut self) {
+        if let Some(bf) = self.block_feed.as_mut() {
+            bf.pending_prompt_end = false;
+        }
     }
 
     /// Selection lifecycle (repro bug 2c, "immortal staircase"): a selection
@@ -674,6 +768,7 @@ impl TermBackend {
         // cover over an arbitrary row — the "cover at a wrong/transient row"
         // submit artifact. Drop-don't-drift.
         bf.prompt_end = None;
+        bf.pending_prompt_end = false;
         bf.incoming_prompt = None;
         // Defensive ordering: the daemon dedupes and offsets are monotonic —
         // a duplicate/late offset can only come from a replayed spoof.
@@ -691,6 +786,20 @@ impl TermBackend {
     /// input area begins (P3 §5.2).
     fn capture_prompt_end(&mut self) {
         let cur = self.term.grid().cursor.point;
+        // v0.1.1 (H1 fix): the capture is provisional ONLY when it carries the
+        // ConPTY-reorder SIGNATURE — the 133;B arrived before its prompt text,
+        // so the cursor sits at the row start with a blank prefix to its left.
+        // A capture with real prompt text already rendered to its left is the
+        // correct, final cell and must NEVER be upgraded: leaving the pending
+        // flag on a correct capture let async output (a backgrounded job's log
+        // line) move the cursor and the 40ms-quiet upgrade then re-pointed
+        // prompt_end at the post-output cell — converting honest-dirty into
+        // wrongly-clean (armed cover over async output). The upgrade now heals
+        // only the race it was built for.
+        let suspicious = self
+            .row_prefix_text(cur.line.0, cur.column.0)
+            .trim()
+            .is_empty();
         if let Some(bf) = self.block_feed.as_mut() {
             if !bf.stale {
                 bf.prompt_end = Some((cur.line.0, cur.column.0));
@@ -698,6 +807,10 @@ impl TermBackend {
                 // cursor exactly at this captured cell) takes over from the
                 // incoming-prompt blank on the same row, same frame.
                 bf.incoming_prompt = None;
+                // Pend the quiescence upgrade only on the race signature (see
+                // above); a trusted capture is left final. On non-racing
+                // machines this is a no-op — the capture was already correct.
+                bf.pending_prompt_end = suspicious;
             }
         }
     }
@@ -744,6 +857,9 @@ impl TermBackend {
             // landed: the user-reported "input box drops DOWN then flies up"
             // submit flicker. The next 133;B re-captures ~15ms later.
             bf.prompt_end = None;
+            // v0.1.1: a pending upgrade for the SUPERSEDED prompt must never
+            // resolve against the fresh prompt's cursor.
+            bf.pending_prompt_end = false;
             // …and the row the fresh prompt will render on IS the cursor row
             // at this scan (the bootstrap's pre-hook flush-sleep drained the
             // previous command's text frames first). The composer blanks it
@@ -787,6 +903,16 @@ impl TermBackend {
         }
         let cur = self.term.grid().cursor.point;
         cur.line.0 == line && cur.column.0 == col
+    }
+
+    /// The cursor row's text LEFT of the cursor, trim-end'd (v0.1.1): the
+    /// pre-shell auth-prompt detector's input — `user@host's password:` /
+    /// `(yes/no/[fingerprint])?` sit exactly there while ssh is asking.
+    /// Bounded O(cols); render-only consumer (a miss is just a generic
+    /// label).
+    pub fn cursor_row_text(&self) -> String {
+        let cur = self.term.grid().cursor.point;
+        self.row_prefix_text(cur.line.0, cur.column.0)
     }
 
     /// Freshest feed-time cwd (the last `pre` hook payload that carried
@@ -999,6 +1125,9 @@ impl TermBackend {
         if let Some(bf) = self.block_feed.as_mut() {
             if !bf.stale {
                 bf.prompt_end = Some((line, col));
+                // L6 belt: a cold-attach seed is authoritative — never let a
+                // stray outstanding upgrade clobber it at the next quiet gap.
+                bf.pending_prompt_end = false;
             }
         }
     }
@@ -2256,6 +2385,190 @@ mod tests {
         // A later cd updates it.
         b.advance_live(&hook("pre", r#"{"e":0,"n":2,"d":"C:\\proj\\sub"}"#));
         assert_eq!(b.feed_cwd(), Some("C:\\proj\\sub"));
+    }
+
+    /// v0.1.1 quiescence-resolved 133;B (the ConPTY OSC-vs-text reorder,
+    /// field: every capture on the laptop landed at the row start and the
+    /// composer read the prompt string as typed text): the immediate
+    /// capture is provisional; once output quiesces it upgrades to the
+    /// settled cursor — the true prompt end.
+    #[test]
+    fn prompt_end_upgrades_after_reorder() {
+        let mut b = bhist(80, 24, 100);
+        // RACE order: the OSC beats the prompt text into the stream. One
+        // feed — split-feed captures at the OSC boundary internally, so the
+        // immediate capture is the pre-text cursor even though the text is
+        // in the same chunk (and the test can't be flaked by a wall-clock
+        // stall between two calls).
+        b.advance_live(&hook("pre", r#"{"e":0,"n":1,"d":"/home/z"}"#));
+        b.advance_live(b"\x1b]133;B\x07zany@MSI:~$ ");
+        assert_eq!(
+            b.block_feed.as_ref().unwrap().prompt_end,
+            Some((0, 0)),
+            "immediate capture = the wrong cell (row start)"
+        );
+        assert!(
+            !b.cursor_at_prompt_end(),
+            "pre-upgrade the wrong capture reads honestly dirty"
+        );
+        // Quiescence: the upgrade re-reads the settled cursor.
+        let later = std::time::Instant::now() + Duration::from_millis(200);
+        assert_eq!(b.poll_pending_prompt_end(later), None);
+        assert_eq!(b.block_feed.as_ref().unwrap().prompt_end, Some((0, 12)));
+        assert!(b.cursor_at_prompt_end(), "upgraded capture = the true end");
+        // Resolved: later polls are free (no wakeup churn).
+        assert_eq!(b.poll_pending_prompt_end(later), None);
+    }
+
+    /// v0.1.1: a correct-order capture (real prompt text to the cursor's
+    /// left) is NEVER pended — the upgrade only ever heals the reorder race.
+    #[test]
+    fn prompt_end_not_pended_on_correct_order() {
+        let mut b = bhist(80, 24, 100);
+        b.advance_live(&hook("pre", r#"{"e":0,"n":1,"d":"/home/z"}"#));
+        b.advance_live(b"zany@MSI:~$ \x1b]133;B\x07");
+        assert!(b.cursor_at_prompt_end());
+        assert!(
+            !b.block_feed.as_ref().unwrap().pending_prompt_end,
+            "a capture with prompt text to its left is final, not pending"
+        );
+        let pe = b.block_feed.as_ref().unwrap().prompt_end;
+        let later = std::time::Instant::now() + Duration::from_millis(200);
+        assert_eq!(b.poll_pending_prompt_end(later), None);
+        assert_eq!(b.block_feed.as_ref().unwrap().prompt_end, pe);
+        assert!(b.cursor_at_prompt_end());
+    }
+
+    /// v0.1.1 H1 regression: a CORRECT capture followed by ASYNC output (a
+    /// backgrounded job's log line — NO input, so note_input never fires)
+    /// must leave prompt_end put. The old unconditional pend re-pointed it at
+    /// the post-output cursor at the 40ms-quiet moment, turning honest-dirty
+    /// into WRONGLY-CLEAN (armed cover over async output). Now: not pended ⇒
+    /// the async output just moves the cursor off the true end ⇒ dirty, like
+    /// v0.1.0.
+    #[test]
+    fn correct_capture_survives_async_output() {
+        let mut b = bhist(80, 24, 100);
+        b.advance_live(&hook("pre", r#"{"e":0,"n":1,"d":"/home/z"}"#));
+        b.advance_live(b"zany@MSI:~$ \x1b]133;B\x07");
+        assert!(b.cursor_at_prompt_end(), "clean at the true prompt end");
+        let pe = b.block_feed.as_ref().unwrap().prompt_end;
+        // A backgrounded job prints to the tty ~15ms later (no input).
+        b.advance_live(b"Listening on :8080\r\n");
+        // 40ms+ of quiet, then the per-frame poll: it must NOT move prompt_end
+        // onto the post-output cursor.
+        let later = std::time::Instant::now() + Duration::from_millis(200);
+        assert_eq!(b.poll_pending_prompt_end(later), None);
+        assert_eq!(
+            b.block_feed.as_ref().unwrap().prompt_end,
+            pe,
+            "async output must never migrate a correct prompt-end"
+        );
+        assert!(
+            !b.cursor_at_prompt_end(),
+            "the cursor left the end ⇒ dirty (honest), never wrongly-clean"
+        );
+    }
+
+    /// v0.1.1: on a RACE capture (col 0, pended), local input FREEZES the
+    /// upgrade on the immediate capture — resolving past the keystroke echo
+    /// would fold typed text into the "prompt" and read a dirty line as clean
+    /// (the fused-submit hazard, worse than today's dirty ManualOnly).
+    #[test]
+    fn prompt_end_upgrade_freezes_on_input() {
+        let mut b = bhist(80, 24, 100);
+        b.advance_live(&hook("pre", r#"{"e":0,"n":1,"d":"/home/z"}"#));
+        // Race order: OSC before its prompt text ⇒ col-0 capture, pended.
+        b.advance_live(b"\x1b]133;B\x07");
+        assert!(b.block_feed.as_ref().unwrap().pending_prompt_end);
+        // The user types inside the window; the echo follows as output.
+        b.note_input();
+        b.advance_live(b"ls");
+        let later = std::time::Instant::now() + Duration::from_millis(200);
+        assert_eq!(b.poll_pending_prompt_end(later), None);
+        assert_eq!(
+            b.block_feed.as_ref().unwrap().prompt_end,
+            Some((0, 0)),
+            "the immediate (race) capture stands frozen; the echo never joins it"
+        );
+        assert!(!b.cursor_at_prompt_end(), "typed text reads dirty, as before");
+    }
+
+    /// v0.1.1: a fresh `pre` (a new prompt is coming) drops a still-pending
+    /// upgrade for the superseded prompt — it must never resolve against
+    /// the NEXT prompt's cursor.
+    #[test]
+    fn prompt_end_pending_dropped_by_next_pre() {
+        let mut b = bhist(80, 24, 100);
+        b.advance_live(&hook("pre", r#"{"e":0,"n":1,"d":"/home/z"}"#));
+        // Race capture (pending) + text + newline + the NEXT pre, one feed.
+        let mut data = b"\x1b]133;B\x07zany@MSI:~$ \r\n".to_vec();
+        data.extend(hook("pre", r#"{"e":0,"n":2,"d":"/home/z"}"#));
+        b.advance_live(&data);
+        // The old pending must be gone: resolving now would blame prompt 2's
+        // world for prompt 1's cell.
+        let later = std::time::Instant::now() + Duration::from_millis(200);
+        assert_eq!(b.poll_pending_prompt_end(later), None);
+        assert_eq!(
+            b.block_feed.as_ref().unwrap().prompt_end,
+            None,
+            "no capture may exist between a pre and its own 133;B"
+        );
+    }
+
+    /// v0.1.1 item 7 (the floating duplicated-prompt-rows band): six rapid
+    /// empty-Enter prompt cycles over IDENTICAL bare prompt rows, fed in
+    /// the RACE order (OSC before text — the field shape) with scroll in
+    /// between. Every superseded prompt row must carry its spacer cover AT
+    /// ITS OWN ROW (sig verified at the exact row), exactly once, and the
+    /// live prompt row is never covered. Fails without the quiescence
+    /// upgrade (spacers then mint at col-0 cells whose sig is empty and
+    /// never heal).
+    #[test]
+    fn six_identical_prompt_rows_covers_stay_glued() {
+        let mut b = bhist(80, 4, 100); // 4 rows: the cycles scroll history
+        let cycle = |b: &mut TermBackend, n: usize| {
+            b.advance_live(&hook(
+                "pre",
+                &format!(r#"{{"e":0,"n":{n},"d":"/home/z"}}"#),
+            ));
+            // Reorder: the OSC precedes its prompt text (one feed — the
+            // split-feed capture still sees the pre-text cursor).
+            b.advance_live(b"\x1b]133;B\x07zany@MSI:~$ ");
+            let later = std::time::Instant::now() + Duration::from_millis(100);
+            let _ = b.poll_pending_prompt_end(later); // quiescence resolve
+        };
+        cycle(&mut b, 1);
+        for n in 2..=7 {
+            b.advance_live(b"\r\n"); // empty Enter: the prompt is superseded
+            cycle(&mut b, n);
+        }
+        let cur = b.term.grid().cursor.point.line.0;
+        assert!(b.cursor_at_prompt_end(), "the live prompt is cleanly captured");
+        let healthy = b.healthy_covers();
+        assert_eq!(healthy.len(), 6, "one spacer per superseded prompt");
+        let mut lines: Vec<i32> = healthy.iter().map(|c| c.line).collect();
+        lines.sort_unstable();
+        lines.dedup();
+        assert_eq!(lines.len(), 6, "no two covers on one row");
+        assert_eq!(
+            lines,
+            (cur - 6..cur).collect::<Vec<_>>(),
+            "covers glued to the six superseded rows, live row uncovered"
+        );
+        for c in &healthy {
+            assert!(c.line < cur, "the live prompt row is never covered");
+            assert_eq!(
+                c.sig.as_deref(),
+                Some("zany@MSI:~$"),
+                "sig = the bare prompt captured at the TRUE prompt end"
+            );
+            assert_eq!(
+                row_text(&b, c.line),
+                "zany@MSI:~$",
+                "the row under the cover still shows exactly its sig"
+            );
+        }
     }
 
     #[test]

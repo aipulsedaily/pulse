@@ -1107,15 +1107,23 @@ fn execute(cmd: Cmd) -> Result<(), CliErr> {
                         .ok_or_else(|| usage("--kind custom needs --program"))?;
                     (TermKind::Custom, p, args)
                 }
-                _ => (
-                    TermKind::Shell,
-                    program.unwrap_or_else(|| "powershell.exe".into()),
-                    if args.is_empty() {
+                _ => {
+                    let prog = program.unwrap_or_else(|| "powershell.exe".into());
+                    // v0.1.1: `-NoLogo` is a PowerShell flag — injecting it
+                    // program-blind killed every non-pwsh `--kind shell`
+                    // create at birth (`tc create --program wsl.exe` ⇒
+                    // "Invalid command line argument: -NoLogo").
+                    let is_pwsh = std::path::Path::new(&prog)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+                        .is_some_and(|s| s == "powershell" || s == "pwsh");
+                    let args = if args.is_empty() && is_pwsh {
                         vec!["-NoLogo".into()]
                     } else {
                         args
-                    },
-                ),
+                    };
+                    (TermKind::Shell, prog, args)
+                }
             };
             let spec = NewTerminal {
                 name,

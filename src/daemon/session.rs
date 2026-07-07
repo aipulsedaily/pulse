@@ -167,21 +167,28 @@ pub(crate) fn synth_ssh_args(user_args: &[String], remote_cmd: Option<&str>) -> 
 }
 
 /// Synthesize the wsl.exe argv tail (P6a §3.1.1): `--cd <cwd>`, then
-/// `--exec /bin/sh -c <guard>`. `--cd` accepts BOTH Windows and leading-/
-/// Linux paths natively (fresh spawns pass the user's Windows dir, restores
-/// the tracked POSIX live_cwd) — but an EMPTY/whitespace cwd must OMIT the
-/// flag entirely: `wsl --cd ""` is Wsl/E_INVALIDARG and kills the session at
-/// birth (2026-07-04 regression: an ssh last_spawn's empty Windows cwd
-/// reached here verbatim). No `--cd` means "start in the distro home" — the
-/// correct default for a directory-less spawn. `rc_mnt` is the
+/// `--exec /bin/sh -c <guard>`. `--cd` accepts Windows paths, leading-/
+/// POSIX paths, AND `~` — all resolved by wsl.exe itself (fresh explicit
+/// dirs pass the Windows path, restores the tracked POSIX live_cwd, and
+/// v0.1.1 default rows pass `~` = the distro user's LINUX home).
+///
+/// An EMPTY/whitespace cwd emits `--cd ~` (v0.1.1): the old no-flag path
+/// did NOT "start in the distro home" — wsl.exe inherits the parent's
+/// Windows CWD, and portable-pty defaults the child's lpCurrentDirectory to
+/// %USERPROFILE% when no cwd is set (cmdbuilder.rs `cwd.or(home)`), so a
+/// flag-less spawn landed in /mnt/c/Users/<u> on every distro. (`--cd ""`
+/// remains Wsl/E_INVALIDARG — the 2026-07-04 regression — which is why the
+/// empty case must never pass the raw string.) `rc_mnt` is the
 /// /mnt-translated rcfile path, already vetted single-quote-free by the
 /// caller and single-quoted inside the guard ($-expansion-proof); None
 /// degrades to plain `exec bash -i` (hookless, never broken).
 pub(crate) fn synth_wsl_args(cwd: &Path, rc_mnt: Option<&str>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let cwd_str = cwd.to_string_lossy();
-    if !cwd_str.trim().is_empty() {
-        out.push("--cd".into());
+    out.push("--cd".into());
+    if cwd_str.trim().is_empty() {
+        out.push("~".into());
+    } else {
         out.push(cwd_str.into_owned());
     }
     out.push("--exec".into());
@@ -334,7 +341,7 @@ pub fn spawn(
             };
             if meta.cwd.to_string_lossy().trim().is_empty() {
                 log::info!(
-                    "terminal {id}: empty cwd — wsl spawn starts in the distro home (no --cd)"
+                    "terminal {id}: empty cwd — wsl spawn starts in the Linux home (--cd ~)"
                 );
             }
             full_args.extend(synth_wsl_args(&meta.cwd, rc_mnt.as_deref()));
@@ -1058,11 +1065,12 @@ mod path_tests {
     }
 
     /// The EXACT synthesized wsl.exe argv tail (P6a §3.1.1 + the 2026-07-04
-    /// `--cd ""` regression): fresh create with a Windows cwd, restore with a
-    /// tracked POSIX cwd, empty cwd (an ssh last_spawn's inherited SpawnSpec,
-    /// or a raw-API create) ⇒ NO `--cd` at all — `wsl --cd ""` is
-    /// Wsl/E_INVALIDARG and the session dies at birth — and the hookless
-    /// degrade.
+    /// `--cd ""` regression + the v0.1.1 Linux-home default): fresh create
+    /// with a Windows cwd, restore with a tracked POSIX cwd, `~` and
+    /// empty/whitespace cwds ⇒ `--cd ~` (the old no-flag path landed in
+    /// /mnt/c/%USERPROFILE% via the parent-CWD/portable-pty default — there
+    /// was NO path to the Linux home; `--cd ""` remains Wsl/E_INVALIDARG so
+    /// the raw empty string must never ride), and the hookless degrade.
     #[test]
     fn wsl_argv_golden() {
         use super::synth_wsl_args;
@@ -1071,7 +1079,8 @@ mod path_tests {
         let guard = format!(
             "if [ -r '{rc}' ]; then exec bash --rcfile '{rc}' -i; else exec bash -i; fi"
         );
-        // Fresh create: the user's Windows dir rides --cd verbatim.
+        // Fresh create with an explicit dir: the Windows dir rides --cd
+        // verbatim ("open this Windows project in WSL" is a feature).
         assert_eq!(
             synth_wsl_args(Path::new("C:\\Users\\alice"), Some(rc)),
             s(&["--cd", "C:\\Users\\alice", "--exec", "/bin/sh", "-c", &guard])
@@ -1081,15 +1090,21 @@ mod path_tests {
             synth_wsl_args(Path::new("/tmp"), Some(rc)),
             s(&["--cd", "/tmp", "--exec", "/bin/sh", "-c", &guard])
         );
-        // Empty (and whitespace) cwd: --cd OMITTED entirely; the distro
-        // decides the home dir. This is the regression case.
+        // The launcher's default WSL rows: `~` rides verbatim — wsl.exe
+        // resolves it to the distro default user's Linux home.
+        assert_eq!(
+            synth_wsl_args(Path::new("~"), Some(rc)),
+            s(&["--cd", "~", "--exec", "/bin/sh", "-c", &guard])
+        );
+        // Empty (and whitespace) cwd: --cd ~ (defense in depth for raw-API
+        // creates; never the raw empty string, never flag-less).
         assert_eq!(
             synth_wsl_args(Path::new(""), Some(rc)),
-            s(&["--exec", "/bin/sh", "-c", &guard])
+            s(&["--cd", "~", "--exec", "/bin/sh", "-c", &guard])
         );
         assert_eq!(
             synth_wsl_args(Path::new("  "), Some(rc)),
-            s(&["--exec", "/bin/sh", "-c", &guard])
+            s(&["--cd", "~", "--exec", "/bin/sh", "-c", &guard])
         );
         // Untranslatable/quoted/missing rcfile: degraded-hookless bash,
         // never a broken spawn.
@@ -1099,7 +1114,7 @@ mod path_tests {
         );
         assert_eq!(
             synth_wsl_args(Path::new(""), None),
-            s(&["--exec", "/bin/sh", "-c", "exec bash -i"])
+            s(&["--cd", "~", "--exec", "/bin/sh", "-c", "exec bash -i"])
         );
     }
 

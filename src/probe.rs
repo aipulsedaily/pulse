@@ -5468,6 +5468,121 @@ fn case_wsl_composer_semantics() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// v0.1.1 `wsl_hostile_prompt_command` (the Arch/systemd-257 phantom-block
+/// class, reproduced on the default distro — CI never needs Arch): a foreign
+/// PROMPT_COMMAND element appended at RUNTIME lands AFTER `__tc_arm` in the
+/// array — exactly what /etc/profile.d/80-systemd-osc-context.sh (and
+/// starship/direnv-style lazy installs) produce — and fires the armed DEBUG
+/// trap at every prompt render. Without the new-history witness that opened
+/// a never-closing block labeled with stale `history 1` (the field phantom
+/// "exit" block) and busy-gated run/composer forever. Asserts: the latch
+/// survives, no phantom open block exists, the setup line yields exactly ONE
+/// record, and a real round-trip still works.
+fn case_wsl_hostile_prompt_command() -> anyhow::Result<()> {
+    let Some(distro) = wsl_probe_distro() else {
+        return Err(skip("no WSL distro in the Lxss registry".into()));
+    };
+    let log0 = daemon_log_len();
+    let master = master_token()?;
+    let mut c = Conn::open()?;
+    let _ = c.first_snapshot()?;
+    let id = create_wsl_terminal(&mut c, "__probe_wsl_hostile__", &distro)?;
+    c.send(&C2D::Attach { id, cols: 160, rows: 40 })?;
+    let mut ctl = Conn::open_ctl(&master, None)?;
+    let mut rid = 4700u64;
+    await_hooked_prompt(&mut ctl, &mut rid, id, 90)?;
+
+    // Install the hostile shape from inside the running shell: an array
+    // PROMPT_COMMAND whose foreign element runs after our arm. (Wrapped in
+    // a setup function so the element name is NOT a prefix of the history
+    // line — the witness's ignoredups escape must not be tripped by an
+    // engineered name collision no real integration exhibits.)
+    c.send(&C2D::Input {
+        id,
+        bytes: b"tc_hostile_setup() { __probe_foreign() { :; }; PROMPT_COMMAND+=(__probe_foreign); }; tc_hostile_setup\r"
+            .to_vec(),
+    })?;
+    std::thread::sleep(Duration::from_millis(1500));
+    // Render several more prompts: each one runs __probe_foreign at an armed
+    // latch — the witness must swallow it (no exec, latch preserved).
+    for _ in 0..3 {
+        c.send(&C2D::Input { id, bytes: b"\r".to_vec() })?;
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    std::thread::sleep(Duration::from_millis(1200));
+
+    // The setup line is ONE closed record; nothing labeled with the foreign
+    // element, no stale-history duplicates, no open block.
+    let recs = c.await_blocks(id, 20, |recs| {
+        recs.iter()
+            .any(|r| r.cmd.contains("tc_hostile_setup") && r.end_off.is_some())
+    })?;
+    let setup: Vec<_> = recs
+        .iter()
+        .filter(|r| r.cmd.contains("tc_hostile_setup"))
+        .collect();
+    anyhow::ensure!(
+        setup.len() == 1,
+        "stale-history phantom duplicated the setup line: {:?}",
+        setup.iter().map(|r| (&r.cmd, r.end_off)).collect::<Vec<_>>()
+    );
+    anyhow::ensure!(
+        recs.iter().all(|r| r.end_off.is_some()),
+        "phantom never-closing block: {:?}",
+        recs.iter()
+            .filter(|r| r.end_off.is_none())
+            .map(|r| &r.cmd)
+            .collect::<Vec<_>>()
+    );
+
+    // The prompt latch survived the hostile element (an open phantom would
+    // report at_prompt:false)…
+    let (at_prompt, clean) = attach_prompt_state(id, 100, 28)?;
+    anyhow::ensure!(
+        at_prompt,
+        "foreign precmd element must not kill the prompt latch"
+    );
+    anyhow::ensure!(clean, "the idle hostile prompt must still certify clean");
+
+    // …and a real command still round-trips as exactly one block (the old
+    // code busy-gated this behind the phantom).
+    let body = ctl_run_retry(
+        &mut ctl,
+        &mut rid,
+        id,
+        "echo TC_HOSTILE_OK",
+        Some(RunWait {
+            timeout_ms: 30_000,
+            tail_bytes: 4096,
+        }),
+        60,
+    )?;
+    match &body {
+        CtlBody::RunDone { exit, output, .. } => {
+            anyhow::ensure!(*exit == Some(0), "exit {exit:?}");
+            anyhow::ensure!(output.contains("TC_HOSTILE_OK"), "output {output:?}");
+        }
+        other => anyhow::bail!("Run(wait) returned {other:?}"),
+    }
+    let recs = c.await_blocks(id, 20, |recs| {
+        recs.iter()
+            .any(|r| r.cmd.contains("TC_HOSTILE_OK") && r.end_off.is_some())
+    })?;
+    let marker: Vec<_> = recs
+        .iter()
+        .filter(|r| r.cmd.contains("TC_HOSTILE_OK"))
+        .collect();
+    anyhow::ensure!(
+        marker.len() == 1,
+        "exactly one block for the real command, got {:?}",
+        marker.iter().map(|r| &r.cmd).collect::<Vec<_>>()
+    );
+
+    ensure_no_new_panics(log0)?;
+    delete_terminal(&mut c, id);
+    Ok(())
+}
+
 /// P6a P4 `wsl_restore`: the POSIX cwd round-trip across a graceful daemon
 /// restart — a `cd /tmp` inside the distro is hook-tracked into live_cwd
 /// VERBATIM (never Windows-normalized), the restore respawn passes it back
@@ -5729,6 +5844,67 @@ fn assert_ssh_hooked_session(
     let (at_prompt, clean) = attach_prompt_state(id, 100, 28)?;
     anyhow::ensure!(at_prompt, "idle hooked ssh prompt must certify at_prompt");
     anyhow::ensure!(clean, "untouched ssh prompt must certify clean");
+
+    // v0.1.1 banner fidelity (NOTICE, never a hard fail — env-dependent):
+    // if the host has motd content, its first line must have reached the
+    // journal via the rc's pam_motd emulation (the MOTD_SHOWN=pam unset
+    // fix); if wtmp holds a previous login, a "Last login:" line must too.
+    let probe_line = |cmd: &str, tag: &str, ctl: &mut Conn, rid: &mut u64| -> Option<String> {
+        match ctl_run_retry(
+            ctl,
+            rid,
+            id,
+            cmd,
+            Some(RunWait {
+                timeout_ms: 30_000,
+                tail_bytes: 4096,
+            }),
+            60,
+        ) {
+            Ok(CtlBody::RunDone { output, .. }) => output
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix(tag))
+                .map(|v| v.trim().to_string())
+                .find(|v| !v.is_empty()),
+            _ => None,
+        }
+    };
+    // Snapshot the journal BEFORE the probe commands run: the probe echoes
+    // would otherwise plant the very strings the check looks for.
+    let replay = {
+        let mut c2 = Conn::open()?;
+        let _ = c2.first_snapshot()?;
+        String::from_utf8_lossy(&c2.replay(id)?).into_owned()
+    };
+    let motd_first = probe_line(
+        "m=$(cat /run/motd.dynamic /etc/motd 2>/dev/null | head -n 1); echo \"TCMOTD>$m\"",
+        "TCMOTD>",
+        ctl,
+        rid,
+    );
+    // Same NR==2 && NF>=9 guard as the rc's own awk: an empty/rotated wtmp
+    // prints only the "wtmp begins …" trailer (NF 7), which is NOT a
+    // previous login.
+    let prev_login = probe_line(
+        "p=$(last -2 -F -- \"$USER\" 2>/dev/null | awk 'NR==2 && NF>=9 {print $1}'); echo \"TCPREV>$p\"",
+        "TCPREV>",
+        ctl,
+        rid,
+    );
+    if let Some(line) = motd_first {
+        if !replay.contains(&line) {
+            println!();
+            println!(
+                "  NOTICE(ssh banner): host motd first line {line:?} not found in the journal"
+            );
+        }
+    }
+    if prev_login.is_some() && !replay.contains("Last login:") {
+        println!();
+        println!(
+            "  NOTICE(ssh banner): wtmp has a previous login but no \"Last login:\" line reached the journal"
+        );
+    }
     Ok(())
 }
 
@@ -8321,6 +8497,7 @@ pub fn run(case: Option<&str>) -> anyhow::Result<()> {
         ("ctl_read", case_ctl_read),
         ("wsl_hooks", case_wsl_hooks),
         ("wsl_composer_semantics", case_wsl_composer_semantics),
+        ("wsl_hostile_prompt_command", case_wsl_hostile_prompt_command),
         ("wsl_restore", case_wsl_restore),
         ("cmd_hooks", case_cmd_hooks),
         ("cmd_restore", case_cmd_restore),

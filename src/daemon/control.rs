@@ -606,6 +606,9 @@ impl Core {
                     TermKind::Custom => ("custom", None),
                 };
                 let bv = blocks.get(&t.id);
+                // v0.1.1: the shared display rule — POSIX-namespace sessions
+                // (WSL/ssh) never report a `C:\` cwd string.
+                let cwd = t.display_cwd();
                 CtlTerm {
                     id: t.id,
                     name: t.name,
@@ -614,12 +617,7 @@ impl Core {
                     claude_session,
                     inner_cli: t.inner_cli,
                     program: t.program,
-                    cwd: t
-                        .live_cwd
-                        .as_ref()
-                        .unwrap_or(&t.cwd)
-                        .display()
-                        .to_string(),
+                    cwd,
                     status: status.into(),
                     activity: activity.into(),
                     idle_ms,

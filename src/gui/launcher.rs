@@ -251,6 +251,26 @@ fn nonempty_cwd(cwd: &Path) -> PathBuf {
     }
 }
 
+/// Namespace-aware cwd heal (v0.1.1, the "WSL starts in /mnt/c/Users/<u>"
+/// fix): ssh keeps its by-design empty cwd; a WSL tag heals empty to `~`
+/// (the LINUX home — wsl.exe resolves `--cd ~` in-distro, any version, any
+/// default user), never to the WINDOWS home like every other family.
+/// Explicit directories still pass through verbatim for every tag ("open
+/// this Windows project in WSL" via /mnt is a feature).
+fn heal_cwd(kind_tag: &str, cwd: &Path) -> PathBuf {
+    if ssh_tag_host(kind_tag).is_some() {
+        return cwd.to_path_buf();
+    }
+    if wsl_tag_distro(kind_tag).is_some() {
+        return if cwd.as_os_str().is_empty() {
+            PathBuf::from("~")
+        } else {
+            cwd.to_path_buf()
+        };
+    }
+    nonempty_cwd(cwd)
+}
+
 /// First free " 2"/" 3"/… suffix among `taken` (case-exact, D5/§12.1-1).
 pub fn uniquify_name(base: &str, taken: &[&str]) -> String {
     if !taken.contains(&base) {
@@ -349,8 +369,9 @@ pub fn spec_from_spawn(
     };
     // Directory-full spawns only past this point (ssh returned above): an
     // empty persisted cwd (instant-create replaying an ssh-era last_spawn, a
-    // poisoned recent) heals to home instead of reaching wsl.exe as --cd "".
-    let cwd = nonempty_cwd(&spec.cwd);
+    // poisoned recent) heals to home instead of reaching wsl.exe as --cd ""
+    // — v0.1.1: WSL tags heal to the LINUX home (`~`), never the Windows one.
+    let cwd = heal_cwd(&spec.kind_tag, &spec.cwd);
     let name = uniquify_name(&auto_name(&spec.kind_tag, &cwd), taken);
     Some(NewTerminal {
         name,
@@ -458,12 +479,20 @@ pub fn spec_for(
                 program: String::new(),
                 args: Vec::new(),
                 // ssh rows carry no Windows cwd (recents dedupe by
-                // (kind_tag, cwd) — keep it stable/empty per host). Every
-                // OTHER shell inherits last_spawn's dir — healed: an ssh
-                // last_spawn's empty cwd must never ride into a wsl/pwsh/cmd
-                // spawn OR its recorded spec (the --cd "" regression).
+                // (kind_tag, cwd) — keep it stable/empty per host). WSL rows
+                // default to the LINUX home (v0.1.1: `~` — wsl.exe resolves
+                // it in-distro; the old last_spawn inheritance landed every
+                // distro in /mnt/c/Users/<u>, a Windows dir posing as a
+                // Linux world). Every OTHER shell inherits last_spawn's dir
+                // — healed: an ssh last_spawn's empty cwd must never ride
+                // into a pwsh/cmd spawn OR its recorded spec (the --cd ""
+                // regression). Explicit-directory rows (RecentDir/typed
+                // paths) are untouched — "open this Windows project in WSL"
+                // stays a feature.
                 cwd: if ssh_tag_host(&ch.kind_tag).is_some() {
                     PathBuf::new()
+                } else if wsl_tag_distro(&ch.kind_tag).is_some() {
+                    PathBuf::from("~")
                 } else {
                     nonempty_cwd(&last.cwd)
                 },
@@ -476,11 +505,10 @@ pub fn spec_for(
             let nt = spec_from_spawn(spec, folder, taken)?;
             // Re-record the healed cwd (not the persisted one): activating a
             // poisoned empty-cwd recent converges the ring instead of
-            // re-poisoning last_spawn.
+            // re-poisoning last_spawn. v0.1.1: namespace-aware — a WSL
+            // recent's empty cwd heals to `~`, never the Windows home.
             let mut s = spec.clone();
-            if ssh_tag_host(&s.kind_tag).is_none() {
-                s.cwd = nonempty_cwd(&s.cwd);
-            }
+            s.cwd = heal_cwd(&s.kind_tag, &s.cwd);
             Some((nt, s))
         }
         CandKind::RecentDir { cwd } => dir_spec(cwd, last, folder, taken),
@@ -2020,7 +2048,9 @@ mod tests {
         let last = spawn("ssh:192.0.2.14", "");
         assert_eq!(last.cwd, PathBuf::new(), "precondition: ssh spec cwd empty");
 
-        // WSL shell row right after: cwd heals to home, name carries the dir.
+        // WSL shell row right after: the LINUX home (v0.1.1 — `~`, resolved
+        // in-distro by wsl.exe), never the Windows home posing as a Linux
+        // dir, and never the empty ssh cwd.
         let wslrow = Candidate::new(
             CandKind::Shell(ShellChoice {
                 kind_tag: "wsl:Ubuntu-24.04".into(),
@@ -2031,9 +2061,9 @@ mod tests {
             String::new(),
         );
         let (nt, sp) = spec_for(&wslrow, &last, None, &[]).unwrap();
-        assert_eq!(nt.cwd, home, "WSL row must not inherit the empty ssh cwd");
-        assert_eq!(sp.cwd, home, "recorded spec healed too (recents stay valid)");
-        assert_ne!(nt.name, "Ubuntu-24.04 · ", "no dangling separator header");
+        assert_eq!(nt.cwd, PathBuf::from("~"), "WSL rows default to the Linux home");
+        assert_eq!(sp.cwd, PathBuf::from("~"), "recorded spec matches (recents dedupe on ~)");
+        assert_eq!(nt.name, "Ubuntu-24.04 · ~", "honest auto-name");
 
         // PowerShell row: same heal (empty cwd would otherwise spawn the
         // shell in the daemon's own directory).
@@ -2057,18 +2087,26 @@ mod tests {
         assert_eq!(sp.cwd, home);
 
         // Instant-create / suggestion replay of a POISONED persisted wsl spec
-        // (recorded while the bug was live): spawns in home, and activating
-        // it re-records the healed cwd so the ring converges.
+        // (recorded while the bug was live): spawns in the LINUX home
+        // (v0.1.1), and activating it re-records the healed cwd so the ring
+        // converges. An explicit dir still passes through verbatim.
         let poisoned = spawn("wsl:Ubuntu-24.04", "");
         let nt = spec_from_spawn(&poisoned, None, &[]).unwrap();
-        assert_eq!(nt.cwd, home);
+        assert_eq!(nt.cwd, PathBuf::from("~"));
         let sugg = Candidate::new(
             CandKind::Suggestion { spec: poisoned },
             "Ubuntu-24.04 (WSL)".into(),
             String::new(),
         );
         let (_, sp) = spec_for(&sugg, &last, None, &[]).unwrap();
-        assert_eq!(sp.cwd, home, "suggestion re-record heals the ring");
+        assert_eq!(sp.cwd, PathBuf::from("~"), "suggestion re-record heals the ring");
+        let explicit = spawn("wsl:Ubuntu-24.04", "C:\\proj");
+        let nt = spec_from_spawn(&explicit, None, &[]).unwrap();
+        assert_eq!(
+            nt.cwd,
+            PathBuf::from("C:\\proj"),
+            "explicit Windows dirs keep riding /mnt (a feature, not a heal target)"
+        );
 
         // ssh rows themselves keep their by-design empty cwd (the daemon
         // never --cd's an ssh spawn; recents dedupe by (kind_tag, "")).

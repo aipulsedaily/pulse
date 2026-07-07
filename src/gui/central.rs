@@ -204,6 +204,16 @@ impl App {
         let mut comp_active = false;
         let now = Instant::now();
         if hooked {
+            // Pending prompt-end upgrade (v0.1.1 quiescence capture): must
+            // resolve BEFORE the tick/gate read it; an idle terminal needs
+            // the scheduled wakeup (no output frame will arrive to resolve
+            // on).
+            if let Some(b) = self.terms.get_mut(&id) {
+                if let Some(deadline) = b.poll_pending_prompt_end(now) {
+                    ui.ctx()
+                        .request_repaint_after(deadline.saturating_duration_since(now));
+                }
+            }
             let comp_had_focus = self.composers.get(&id).is_some_and(|c| c.has_focus);
             let grid_focused = win_focused && !overlay_open && !comp_had_focus;
             let wake = match (
@@ -464,6 +474,11 @@ impl App {
             if let Some(st) = self.composers.get_mut(&id) {
                 st.on_raw_input(Instant::now());
             }
+            // v0.1.1: freeze a pending prompt-end upgrade — the echo of
+            // these bytes must never be folded into the captured prompt.
+            if let Some(b) = self.terms.get_mut(&id) {
+                b.note_input();
+            }
             // P6b §5.2 observed-raw capture (the deliberate-yield path — with
             // post-submit typeahead, composed keys never reach here): a raw
             // Enter at a hooked cmd prompt is the only executions witness cmd
@@ -680,13 +695,9 @@ impl App {
                 .get(&id)
                 .and_then(|b| b.feed_cwd().map(str::to_owned))
                 .or_else(|| {
-                    self.state.terminal(id).map(|t| {
-                        t.live_cwd
-                            .as_ref()
-                            .unwrap_or(&t.cwd)
-                            .to_string_lossy()
-                            .into_owned()
-                    })
+                    // v0.1.1: the shared display rule — a WSL/ssh lane chip
+                    // must never fall back to a `C:\` string.
+                    self.state.terminal(id).map(|t| t.display_cwd())
                 });
             let mut comp_write = Vec::new();
             let mut spacer_gesture = false;
@@ -760,6 +771,9 @@ impl App {
                 // the viewport back to the live bottom.
                 if let Some(b) = self.terms.get_mut(&id) {
                     b.scroll_to_bottom();
+                    // v0.1.1: composer-authored bytes (submission / chord)
+                    // freeze a pending prompt-end upgrade like any input.
+                    b.note_input();
                     // Empty-Enter "more lines" gesture: mark the row the
                     // composer just left a blank spacer cover the same frame
                     // the armed cover drops, so no raw `PS …>` flashes on it
@@ -1034,13 +1048,9 @@ impl App {
         // is and what it last did. Omitted entirely when both are unknown.
         let mut line_y = rect.min.y + 36.0;
         let meta_line = {
-            let cwd = meta.map(|m| {
-                m.live_cwd
-                    .as_ref()
-                    .unwrap_or(&m.cwd)
-                    .to_string_lossy()
-                    .into_owned()
-            });
+            // v0.1.1: the shared display rule (display_cwd) — POSIX-namespace
+            // sessions never show a `C:\` string.
+            let cwd = meta.map(|m| m.display_cwd());
             let last_cmd = self
                 .blocks
                 .get(&id)

@@ -1543,6 +1543,19 @@ impl App {
         })
     }
 
+    /// v0.1.1: this terminal's derived shell family is Ssh — gates the
+    /// composer's pre-shell raw-conversation labels (password lock line,
+    /// host-key line). Derived like `family_is_cmd`, stamped at composer
+    /// creation.
+    fn family_is_ssh(&self, id: Uuid) -> bool {
+        self.state.terminal(id).is_some_and(|t| {
+            matches!(
+                crate::state::shell_family(&t.kind, &t.program, &t.args),
+                crate::state::ShellFamily::Ssh { .. }
+            )
+        })
+    }
+
     /// Tab completion (#24): the terminal's completion family (path
     /// namespace + quoting rules), derived like `family_is_cmd` and stamped
     /// on the composer at creation. Owns the distro for WSL posix↔local
@@ -1564,6 +1577,7 @@ impl App {
     fn send_cmd_submission(&mut self, id: Uuid, cmd: String) {
         if let Some(b) = self.terms.get_mut(&id) {
             b.scroll_to_bottom();
+            b.note_input(); // v0.1.1: freeze a pending prompt-end upgrade
         }
         if self.ipc.as_ref().is_some_and(|c| c.proto >= 6) {
             self.send(C2D::SubmitCommand {
@@ -1720,6 +1734,7 @@ impl App {
         let Some(b) = self.terms.get_mut(&id) else { return };
         let bracketed = b.mode().contains(TermMode::BRACKETED_PASTE);
         b.scroll_to_bottom();
+        b.note_input(); // v0.1.1: freeze a pending prompt-end upgrade
         let bytes = term_view::paste_bytes(bracketed, text);
         if let Some(st) = self.composers.get_mut(&id) {
             st.on_raw_input(Instant::now());
@@ -2272,6 +2287,7 @@ impl App {
                         // created by an attach to an already-asleep terminal
                         // gates Blocked(Asleep) from its first tick.
                         let is_cmd = self.family_is_cmd(id);
+                        let is_ssh = self.family_is_ssh(id);
                         let fam = self.family_complete(id);
                         let (asleep, reconnecting) = self
                             .state
@@ -2280,6 +2296,7 @@ impl App {
                             .unwrap_or((false, false));
                         let st = self.composers.entry(id).or_default();
                         st.is_cmd = is_cmd;
+                        st.is_ssh = is_ssh;
                         st.fam = fam;
                         st.asleep = asleep;
                         st.reconnecting = reconnecting;
@@ -3163,6 +3180,7 @@ impl App {
         self.send(C2D::Input { id, bytes });
         if let Some(b) = self.terms.get_mut(&id) {
             b.scroll_to_bottom();
+            b.note_input(); // v0.1.1: freeze a pending prompt-end upgrade
         }
     }
 
@@ -4011,6 +4029,7 @@ impl App {
                     if !bytes.is_empty() {
                         if let Some(b) = self.terms.get_mut(&id) {
                             b.scroll_to_bottom();
+                            b.note_input(); // v0.1.1: freeze a pending capture
                         }
                         self.send(C2D::Input { id, bytes });
                     }
@@ -4151,13 +4170,16 @@ impl App {
                 // only. The dashboard has its own header strip, and terminal
                 // actions there would target something invisible.
                 // LOW-8: clone only the four display fields the titlebar
-                // reads, not the whole TerminalMeta (args/program/inner_cli/
-                // shell_cfg/live_cwd…) every frame.
+                // reads, not the whole TerminalMeta every frame. v0.1.1: the
+                // cwd field is the SHARED display rule's output
+                // (display_cwd — live_cwd first, POSIX-honest fallbacks),
+                // not the raw launch cwd: the old `m.cwd` clone showed
+                // `C:\Users\zany` forever for a Linux session.
                 let term_meta = match self.central_view {
                     CentralView::Terminal => self.selected.and_then(|id| {
                         self.state
                             .terminal(id)
-                            .map(|m| (id, m.status, m.asleep, m.cwd.clone(), m.name.clone()))
+                            .map(|m| (id, m.status, m.asleep, m.display_cwd(), m.name.clone()))
                     }),
                     CentralView::Dashboard(_) => None,
                 };
@@ -4336,7 +4358,7 @@ impl App {
                     let span = (right_edge - 4.0 - lui.cursor().min.x - search_w).max(0.0);
                     let name_font = semibold(13.0);
                     let cwd_font = FontId::monospace(11.0);
-                    let cwd_full = middle_ellipsize(&cwd.to_string_lossy(), 52);
+                    let cwd_full = middle_ellipsize(cwd, 52);
                     let name_g = lui.painter().layout_no_wrap(
                         name.clone(),
                         name_font.clone(),

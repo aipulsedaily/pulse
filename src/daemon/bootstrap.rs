@@ -166,6 +166,51 @@ TCEmit 'init' @{ v = 1; pid = $PID }
 ///     handler name-guards `__tc_*` plumbing, `__tc_pre` DISARMS at its top,
 ///     and arming happens in `__tc_arm`, appended LAST in PROMPT_COMMAND
 ///     (after any user hooks, whose own commands must not fire exec either);
+///   - PROMPT_COMMAND is installed ARRAY-AWARE (v0.1.1): systemd ≥ 257 ships
+///     /etc/profile.d/80-systemd-osc-context.sh which turns PROMPT_COMMAND
+///     into a bash ARRAY and appends its own element (Arch/Fedora today,
+///     every distro at systemd ≥ 257 tomorrow; bash-preexec/ble.sh/Atuin do
+///     the same). A string assignment only replaces element [0] — the
+///     surviving foreign elements then run AFTER `__tc_arm` and fire the
+///     armed DEBUG trap at EVERY prompt: a spurious exec labeled with stale
+///     `history 1` (the field "phantom `exit` block" that busy-gated the
+///     composer and `tc run` on stock Arch). The array branch splices ours
+///     around the existing elements (ours-first for `$?`, arm strictly
+///     LAST). It is VERSION-GATED on `BASH_VERSINFO >= 5.1` (M1): only bash
+///     5.1+ executes every element of an array PROMPT_COMMAND — on ≤ 5.0 an
+///     array runs element [0] ONLY, so the array install would drop
+///     `__tc_arm` and the latch would never arm (no exec, ever). Old bash
+///     never ran elements [1..] anyway, so the string branch's
+///     `$PROMPT_COMMAND` (= element [0] there) is the honest flatten. The
+///     string branch splices with a NEWLINE before `__tc_arm` (L4): a
+///     trailing `;`, a trailing `# comment`, or a trailing newline in a user
+///     value can no longer syntax-error the render or comment out the arm —
+///     `__tc_arm` always begins its own line;
+///   - `__tc_debug` additionally requires a NEW-HISTORY WITNESS (v0.1.1):
+///     foreign precmd elements appended at runtime (starship/direnv-style
+///     lazy installs), `bind -x` handlers (fzf), and future systemd
+///     surprises all share one property — they add no history entry. The
+///     entry number is recorded at arm; exec emits only when it changed OR
+///     `history 1` still textually starts with `$BASH_COMMAND`. The witness
+///     PARTICIPATES only when history is usable (`__tc_arm` sets `__tc_wit`:
+///     history option on AND a numeric non-zero HISTSIZE — M2). When it
+///     stands down, `__tc_debug` always emits with the `$BASH_COMMAND`
+///     fallback label and ALWAYS consumes the latch, so `HISTSIZE=0` /
+///     `set +o history` never suppress all blocks nor leave the latch armed
+///     into a running command (the `tc run` stdin-injection hazard). Honest
+///     trades when the witness IS active: an `ignorespace`/`HISTIGNORE`
+///     command loses its block (adds no entry), AND a REPEATED COMPOUND line
+///     under `HISTCONTROL=ignoredups`/`ignoreboth` (stock Ubuntu) is lost —
+///     `if …; then make; fi` / `time make` / `(cd x && make)` fire DEBUG
+///     with the INNER command (`true`/`make`/`cd x`), which is not a prefix
+///     of the recorded line, so the ignoredups escape misses the repeat (M3;
+///     a repeated SIMPLE command IS caught by the prefix escape). This is a
+///     recorded-block loss for those exact repeat shapes, not a phantom: the
+///     n==hn-emit alternative that would catch them REINTRODUCES the phantom
+///     exec class item 1 fixed (a runtime foreign element fires with n==hn
+///     and a non-empty prior line), so the trade is taken deliberately.
+///     Better degraded than phantom. The witness also retires the
+///     stale-`history 1` mislabel permanently;
 ///   - the JSON escaper also folds \n/\r/\t to their escapes — serde_json is
 ///     NOT lenient about raw control chars in strings, and a bracketed-paste
 ///     multi-line command puts a literal newline into `history 1`;
@@ -205,18 +250,37 @@ __tc_pre() {
   printf '\033]9;9;%s\007' "$PWD"
   __tc_wrap_ps1
 }
-__tc_arm() { __tc_at_prompt=1; }
+__tc_histn() {
+  local h; h=$(HISTTIMEFORMAT= builtin history 1 2>/dev/null)
+  h=${h#"${h%%[! ]*}"}
+  printf %s "${h%%[!0-9]*}"
+}
+__tc_arm() {
+  __tc_at_prompt=1
+  if [[ -o history ]] && [[ ${HISTSIZE:-500} =~ ^[0-9]+$ ]] && (( ${HISTSIZE:-500} != 0 )); then
+    __tc_wit=1; __tc_hn=$(__tc_histn)
+  else
+    __tc_wit=0
+  fi
+}
 __tc_debug() {
   case "$BASH_COMMAND" in __tc_*) return ;; esac
   [ -n "$COMP_LINE" ] && return
   [ "$__tc_at_prompt" = 1 ] || return
-  __tc_at_prompt=0
   local c; c=$(HISTTIMEFORMAT= builtin history 1 2>/dev/null); c=${c#*[0-9]  }
+  if [ "$__tc_wit" = 1 ] && [ "$(__tc_histn)" = "$__tc_hn" ]; then
+    case $c in "$BASH_COMMAND"*) ;; *) return ;; esac
+  fi
+  __tc_at_prompt=0
   [ -n "$c" ] || c=$BASH_COMMAND
   c=${c:0:2000}
   __tc_emit exec "{\"c\":\"$(__tc_json_str "$c")\"}"
 }
-PROMPT_COMMAND="__tc_pre${PROMPT_COMMAND:+;$PROMPT_COMMAND};__tc_arm"
+if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) )) && [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == 'declare -a'* ]]; then
+  PROMPT_COMMAND=(__tc_pre "${PROMPT_COMMAND[@]}" __tc_arm)
+else
+  PROMPT_COMMAND="__tc_pre${PROMPT_COMMAND:+;$PROMPT_COMMAND}"$'\n'"__tc_arm"
+fi
 trap '__tc_debug' DEBUG
 __tc_emit init "{\"v\":1,\"pid\":$$,\"shell\":\"bash\",\"home\":\"$(__tc_json_str "$HOME")\",\"user\":\"$(__tc_json_str "$USER")\"}"
 {RESTORE_TRAILING}"#;
@@ -275,21 +339,11 @@ pub fn script_path_cmd(id: Uuid) -> PathBuf {
     bootstrap_dir().join(format!("{id}.cmdprompt"))
 }
 
-/// Drive-letter translation of a Windows path into WSL's automount namespace:
-/// `C:\Users\z\x.bashrc` → `/mnt/c/Users/z/x.bashrc` (lowercase drive,
-/// backslashes→slashes). None for UNC/relative paths (untranslatable — the
-/// caller degrades to a hookless spawn with a log line).
-pub fn wsl_mnt_path(p: &std::path::Path) -> Option<String> {
-    let s = p.to_str()?;
-    let b = s.as_bytes();
-    if b.len() < 3 || !b[0].is_ascii_alphabetic() || b[1] != b':' || (b[2] != b'\\' && b[2] != b'/')
-    {
-        return None;
-    }
-    let drive = (b[0] as char).to_ascii_lowercase();
-    let rest = s[3..].replace('\\', "/");
-    Some(format!("/mnt/{drive}/{rest}"))
-}
+/// Drive-letter translation of a Windows path into WSL's automount
+/// namespace. Lives in `state.rs` since v0.1.1 (the shared `display_cwd`
+/// rule needs it and state.rs also compiles into pulse-ctl); re-exported
+/// here so every daemon-side call site keeps its historical path.
+pub use crate::state::wsl_mnt_path;
 
 /// POSIX single-quote a string for embedding in the bash rcfile:
 /// `'` → `'\''`, everything else literal.
@@ -379,14 +433,36 @@ pub fn ssh_restore_trailing(posix_cwd: &str, resume: &str) -> Option<String> {
 const SSH_SELF_DELETE: &str = "[ -n \"$TC_RC\" ] && rm -f -- \"$TC_RC\"\n";
 
 /// pam_motd emulation for the ssh delivery (P6c + banner-visibility fix):
-/// sshd skips pam_motd when a remote command rides the session, so the rc
-/// prints what pam_motd would have — /run/motd.dynamic (update-motd's cache)
-/// then /etc/motd — before the login chain runs. Honors ~/.hushlogin and an
-/// inherited MOTD_SHOWN; exports MOTD_SHOWN only when something was actually
-/// printed so a distro profile.d motd script (Ubuntu WSL-style) still prints
-/// on hosts where the caches don't exist. Rides INSIDE the base64-delivered
-/// rc, so the outer-shell charset contract does not apply to it.
-const SSH_MOTD_PRELUDE: &str = "if [ -z \"$MOTD_SHOWN\" ] && [ ! -f ~/.hushlogin ] && { [ -s /run/motd.dynamic ] || [ -s /etc/motd ]; }; then\n  cat /run/motd.dynamic /etc/motd 2>/dev/null\n  export MOTD_SHOWN=tc\nfi\n";
+/// sshd skips the whole post-auth banner chain (`check_quietlogin` returns
+/// early) when a remote command rides the session, so the rc prints what
+/// pam_motd would have — /run/motd.dynamic (update-motd's cache) then
+/// /etc/motd — before the login chain runs, all inside the same
+/// `~/.hushlogin` gate sshd itself applies.
+///
+/// v0.1.1 hardening (field: Ubuntu 22.04 showed NO motd in the Pulse lane):
+///   - an inherited `MOTD_SHOWN=pam` is UNSET first — pam 1.4.0's pam_motd
+///     (Ubuntu 20.04/22.04, Debian ≥ bullseye) exports it from the PAM
+///     session even though sshd DISCARDED the display for a remote-command
+///     session; in this lane a remote command ALWAYS rode the session, so an
+///     inherited `pam` value is always a discarded display, never a real
+///     one. Any OTHER inherited value (e.g. a distro's own `update-motd`)
+///     is still honored — only `pam` is known-unreliable here.
+///   - a faithful `Last login: <ctime> from <host>` line is appended from
+///     wtmp (`last -2 -F`, entry 2 = the PREVIOUS login; entry 1 is this
+///     session, already recorded by sshd before the rc runs). The awk `%2s`
+///     keeps ctime's day padding ("Jul  7"); `NR==2 && NF>=9` keeps
+///     rotated/absent wtmp silent; the `$4 ~ /^(Mon|…|Sun)$/` day-of-week
+///     guard (M4) keeps an EMPTY-HOST previous entry (local console/tty
+///     logins leave `last`'s host column blank, shifting every field left)
+///     silent instead of printing a garbled `… - from Tue`. Printed AFTER
+///     the motd — real sshd order.
+///   - exports MOTD_SHOWN=tc only when something was actually printed so a
+///     distro profile.d motd script (Ubuntu WSL-style) still prints on hosts
+///     where the caches don't exist.
+///
+/// Rides INSIDE the base64-delivered rc, so the outer-shell charset contract
+/// does not apply to it (single quotes in the awk program are fine).
+const SSH_MOTD_PRELUDE: &str = "if [ ! -f ~/.hushlogin ]; then\n  [ \"$MOTD_SHOWN\" = pam ] && unset MOTD_SHOWN\n  if [ -z \"$MOTD_SHOWN\" ] && { [ -s /run/motd.dynamic ] || [ -s /etc/motd ]; }; then\n    cat /run/motd.dynamic /etc/motd 2>/dev/null\n    export MOTD_SHOWN=tc\n  fi\n  last -2 -F -- \"$USER\" 2>/dev/null | awk 'NR==2 && NF>=9 && $4 ~ /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)$/ {\n    printf \"Last login: %s %s %2s %s %s\", $4,$5,$6,$7,$8\n    if ($3 != \"\" && $3 != \"-\") printf \" from %s\", $3\n    print \"\" }'\nfi\n";
 
 /// (Re)write the bash rcfile for an ssh spawn: the SAME template as WSL (one
 /// template, two deliveries — `[ -f ~/.bashrc ]` sources the REMOTE user's
@@ -561,18 +637,75 @@ mod tests {
         // Idempotent per-prompt PS1 wrap: 133;A prefix, 133;B suffix.
         assert!(body.contains(r#"PS1="\[\033]133;A\007\]${PS1}\[\033]133;B\007\]""#));
         assert!(body.contains(r"'\[\033]133;A\007\]'*"));
-        // Ours-first (exit-code capture) + arm-LAST (user hooks must not
-        // consume/trip the latch) PROMPT_COMMAND wrap.
+        // ARRAY-AWARE install (v0.1.1, the systemd-257 osc-context clobber):
+        // an array PROMPT_COMMAND keeps every foreign element, spliced
+        // ours-first (exit-code capture) / arm-LAST (foreign elements must
+        // never run after the latch arms). VERSION-GATED on BASH_VERSINFO
+        // >= 5.1 (M1: only 5.1+ executes every array element — on ≤ 5.0 the
+        // array install would drop __tc_arm; the string branch's element-[0]
+        // flatten is the honest fallback there).
         assert!(body.contains(
-            "PROMPT_COMMAND=\"__tc_pre${PROMPT_COMMAND:+;$PROMPT_COMMAND};__tc_arm\""
+            "if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) )) && [[ \"$(declare -p PROMPT_COMMAND 2>/dev/null)\" == 'declare -a'* ]]; then"
+        ));
+        assert!(body.contains(
+            "PROMPT_COMMAND=(__tc_pre \"${PROMPT_COMMAND[@]}\" __tc_arm)"
+        ));
+        // String branch splices __tc_arm after a NEWLINE (L4): a trailing
+        // `;`, `# comment`, or newline in a user value can no longer
+        // syntax-error the render nor comment out the arm.
+        assert!(body.contains(
+            "PROMPT_COMMAND=\"__tc_pre${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"$'\\n'\"__tc_arm\""
         ));
         // One-shot DEBUG-trap latch + the own-plumbing name guard (the ^C
         // spurious-exec fix — probe wsl_composer_semantics pins it live).
         assert!(body.contains("trap '__tc_debug' DEBUG"));
         assert!(body.contains("case \"$BASH_COMMAND\" in __tc_*) return ;; esac"));
-        assert!(body.contains("__tc_arm() { __tc_at_prompt=1; }"));
+        // New-history witness (v0.1.1): __tc_arm decides PARTICIPATION
+        // (__tc_wit) — history usable AND numeric non-zero HISTSIZE (M2), so
+        // HISTSIZE=0 / history-off never suppress all exec (the fallback
+        // path always emits AND consumes the latch). When active, a
+        // no-new-entry DEBUG fire (foreign precmd, bind -x) emits nothing,
+        // with the ignoredups escape (history 1 still starts with
+        // $BASH_COMMAND ⇒ a real repeated SIMPLE command).
+        assert!(body.contains(
+            "if [[ -o history ]] && [[ ${HISTSIZE:-500} =~ ^[0-9]+$ ]] && (( ${HISTSIZE:-500} != 0 )); then"
+        ));
+        assert!(body.contains("__tc_wit=1; __tc_hn=$(__tc_histn)"));
+        assert!(body.contains(
+            "if [ \"$__tc_wit\" = 1 ] && [ \"$(__tc_histn)\" = \"$__tc_hn\" ]; then"
+        ));
+        assert!(body.contains("case $c in \"$BASH_COMMAND\"*) ;; *) return ;; esac"));
+        // The witness-off / miss paths ALWAYS reach the emit (latch consumed
+        // first — never left armed into a running command; the tc-run
+        // injection hazard). The $BASH_COMMAND fallback label survives.
+        assert!(body.contains("[ -n \"$c\" ] || c=$BASH_COMMAND"));
         // No CRLF (bash chokes on \r in constructs).
         assert!(!body.contains('\r'));
+    }
+
+    /// v0.1.1 M3 pin: the compound-repeat block loss under ignoredups is a
+    /// DELIBERATE trade. The tempting "fix" — emit unconditionally when the
+    /// history number is unchanged and `$BASH_COMMAND` is non-empty — would
+    /// REINTRODUCE the phantom-exec class item 1 fixed (a runtime-appended
+    /// foreign PROMPT_COMMAND element fires DEBUG with n==hn and a non-empty
+    /// prior line). This pins the witness to the prefix-escape form so a
+    /// future edit toward the n==hn-emit route trips a test, not a user.
+    #[test]
+    fn history_witness_stays_prefix_escape_not_n_eq_hn_emit() {
+        let body = BASH_TEMPLATE
+            .replace("{MOTD_PRELUDE}", "")
+            .replace("{TOKEN}", "t");
+        // The n==hn branch RETURNS on a prefix miss (drops the block); it
+        // never turns into an emit.
+        assert!(body.contains(
+            "if [ \"$__tc_wit\" = 1 ] && [ \"$(__tc_histn)\" = \"$__tc_hn\" ]; then\n    case $c in \"$BASH_COMMAND\"*) ;; *) return ;; esac\n  fi"
+        ));
+        // The witness-active same-number path must not carry an unconditional
+        // exec emit (the phantom-reintroducing shape).
+        assert!(
+            !body.contains("__tc_hn\" ]; then\n    __tc_emit exec"),
+            "n==hn must not emit unconditionally (phantom-exec reintroduction)"
+        );
     }
 
     /// U4 (cmd half): the PROMPT value golden — token substitution, the
@@ -716,6 +849,37 @@ mod tests {
         // MOTD_SHOWN so profile.d motd scripts never double-print.
         assert!(body.contains("[ ! -f ~/.hushlogin ]"));
         assert!(body.contains("export MOTD_SHOWN=tc"));
+        // v0.1.1: ONLY an inherited `pam` value is discarded (sshd dropped
+        // the display in this remote-command lane — pam 1.4.0 lies on
+        // Ubuntu 20.04/22.04/Debian); any other value (update-motd, tc)
+        // still suppresses. The unset must sit INSIDE the hushlogin gate and
+        // BEFORE the MOTD_SHOWN check.
+        let hush_at = body.find("if [ ! -f ~/.hushlogin ]; then").unwrap();
+        let unset_at = body
+            .find("[ \"$MOTD_SHOWN\" = pam ] && unset MOTD_SHOWN")
+            .unwrap();
+        let shown_gate_at = body.find("[ -z \"$MOTD_SHOWN\" ]").unwrap();
+        assert!(hush_at < unset_at && unset_at < shown_gate_at);
+        assert!(
+            !body.contains("[ \"$MOTD_SHOWN\" = update-motd ]"),
+            "only the pam value is second-guessed"
+        );
+        // v0.1.1: authentic "Last login" from wtmp — previous entry
+        // (`last -2`, NR==2), ctime day padding (%2s), printed AFTER the
+        // motd cat (real sshd order) and still inside the hushlogin gate.
+        let last_at = body.find("last -2 -F -- \"$USER\" 2>/dev/null").unwrap();
+        assert!(body.contains("printf \"Last login: %s %s %2s %s %s\", $4,$5,$6,$7,$8"));
+        // M4: the day-of-week guard keeps an empty-host previous entry
+        // (console/tty logins shift `last`'s fields left) silent instead of
+        // printing a garbled `… - from Tue`.
+        assert!(body.contains(
+            "NR==2 && NF>=9 && $4 ~ /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)$/"
+        ));
+        assert!(motd_at < last_at && last_at < profile_at);
+        // The whole prelude (unset → cat → last) sits inside ONE hushlogin
+        // gate: its closing `fi` comes after the awk block.
+        let fi_at = body[last_at..].find("\nfi\n").map(|i| last_at + i).unwrap();
+        assert!(fi_at < profile_at);
     }
 
     /// Banner-visibility fix (pwsh half): the banner block substitutes at the

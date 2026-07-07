@@ -191,6 +191,63 @@ pub fn gate(i: &GateInputs) -> GateVerdict {
     }
 }
 
+/// PRE-SHELL raw-conversation state (v0.1.1, the ssh password-phase fix): a
+/// hooked terminal whose CURRENT lifetime has produced no hook event yet
+/// (`pre_seen`/`exec_seen` still at their post-Reset origin) and whose
+/// prompt latch is not live is talking to something that is NOT the shell —
+/// ssh auth (password / host-key), a slow login chain, a dead bootstrap.
+/// While pre-shell the composer must never offer `❯ Compose` (no arm
+/// affordance, no AutoArm, no cold-attach heuristic): the field failure was
+/// the strip inviting a mouse-first user to type their ssh password into a
+/// visible plaintext editor. Exit is the first token-checked hook of the
+/// lifetime — the same signal ssh auto-reconnect uses as its success
+/// witness. No timers, no prompt heuristics (per the A-investigation
+/// design): every input is an existing per-lifetime signal.
+pub(crate) fn pre_shell(
+    running: bool,
+    alt: bool,
+    pre_seen: u64,
+    exec_seen: u64,
+    at_prompt_latched: bool,
+) -> bool {
+    running && !alt && pre_seen == 0 && exec_seen == 0 && !at_prompt_latched
+}
+
+/// What the pre-shell conversation is asking RIGHT NOW, read from the grid
+/// cursor row's text (render-only — a miss degrades to the generic label,
+/// never a wrong cover). Anchored at the END of the row text (trim-end'd),
+/// mirroring `(?i)(password|passphrase|passcode)[^:]*:\s*$` and
+/// `\(yes/no(/\[fingerprint\])?\)\?\s*$` without a regex dependency.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum AuthPrompt {
+    /// `…password:` / `Enter passphrase for key '…':` — echo is off; keys go
+    /// straight to ssh.
+    Password,
+    /// `…(yes/no/[fingerprint])?` — the host-key confirmation.
+    HostKey,
+    None,
+}
+
+pub(crate) fn detect_auth_prompt(row: &str) -> AuthPrompt {
+    let t = row.trim_end();
+    if t.ends_with("(yes/no)?") || t.ends_with("(yes/no/[fingerprint])?") {
+        return AuthPrompt::HostKey;
+    }
+    if let Some(body) = t.strip_suffix(':') {
+        let lower = body.to_lowercase();
+        for kw in ["password", "passphrase", "passcode"] {
+            if let Some(i) = lower.rfind(kw) {
+                // The keyword's run must reach the colon with no earlier
+                // colon in between (the `[^:]*:` tail of the pattern).
+                if !lower[i + kw.len()..].contains(':') {
+                    return AuthPrompt::Password;
+                }
+            }
+        }
+    }
+    AuthPrompt::None
+}
+
 /// Submission encoding (§4.1): byte-identical to paste-then-Enter. Bracketed
 /// iff the shell requested DECSET 2004 (PSReadLine 2.0 on PS 5.1 never does —
 /// unconditional brackets would leak literal `ESC[200~` into its buffer);
@@ -455,6 +512,12 @@ pub struct ComposerState {
     /// Blocked(Asleep), on_exited's reason pick, and the `☾ asleep` +
     /// `Wake ▸` lane. Draft is KEPT through sleep (the on_exited contract).
     pub asleep: bool,
+    /// This terminal's shell family is Ssh (v0.1.1 pre-shell state): gates
+    /// the raw-conversation strip labels ("ssh is asking…", the password
+    /// lock line) — the pre-shell ARM VETO applies to every family, but the
+    /// conversational labels only make sense where a real auth phase exists.
+    /// Stamped with `is_cmd` at composer creation (static per terminal).
+    pub is_ssh: bool,
     /// SSH auto-reconnect supervision is active (persisted flag riding every
     /// Snapshot, stamped like `asleep`). Drives the `reconnecting…` lane +
     /// the Cancel affordance in the Run slot. Draft kept throughout.
@@ -466,6 +529,13 @@ pub struct ComposerState {
     /// Last-seen BlockFeed counters, for edge detection.
     last_pre: u64,
     last_exec: u64,
+    /// `pre_seen` at the last activation clear chord (v0.1.1): at most ONE
+    /// `^C` may ship per prompt epoch — a systematically-wrong prompt-end
+    /// capture used to loop click → chord → fresh prompt → wrong capture →
+    /// click… into visible `^C` spam. A repeat activation in the same epoch
+    /// arms without the chord (and without re-reclaiming) and yields
+    /// honestly through the DEMOTE path if the capture stays broken.
+    chord_pre: Option<u64>,
     /// History recall: (walk source, draft saved before recall began).
     recall: Option<(RecallSrc, String)>,
     /// One-frame flag: place the editor caret at the draft's end before the
@@ -534,11 +604,13 @@ impl Default for ComposerState {
             fam: complete::Family::Pwsh,
             tab: None,
             asleep: false,
+            is_ssh: false,
             reconnecting: false,
             at_prompt_since: None,
             episode_used: false,
             last_pre: 0,
             last_exec: 0,
+            chord_pre: None,
             recall: None,
             caret_to_end: false,
             want_focus: false,
@@ -628,11 +700,24 @@ impl ComposerState {
     /// live hooks only. Queued blind submissions fold into the draft (the
     /// world was rewritten — never fire buffered bytes at it; the user sees
     /// and re-confirms them).
+    ///
+    /// v0.1.1 (the ssh password-phase plaintext exposure): the hook-counter
+    /// baselines MUST resync to the fresh backend's origin. Reset replaces
+    /// the TermBackend with a brand-new one whose `pre_seen`/`exec_seen`
+    /// start at 0 (gui\mod.rs D2C::Reset) — comparing the old lifetime's
+    /// counts against 0 made the very FIRST live output frame of the respawn
+    /// (the `Password:` bytes, zero hook OSCs) read as a fresh prompt edge:
+    /// `at_prompt` falsely latched off the password prompt itself, the strip
+    /// offered `❯ Compose`, and a click gave a visible plaintext editor for
+    /// the password.
     pub fn on_reset(&mut self) {
         self.fold_pending_into_draft();
         self.mode = ComposerMode::Raw(RawReason::NoPrompt);
         self.at_prompt_since = None;
         self.episode_used = false;
+        self.last_pre = 0;
+        self.last_exec = 0;
+        self.chord_pre = None;
         self.want_focus = false;
         self.has_focus = false;
         self.submit_hold = None; // the world was rewritten — drop any ghost
@@ -652,6 +737,13 @@ impl ComposerState {
             RawReason::Dead
         });
         self.at_prompt_since = None;
+        // Counter-baseline resync, symmetric with on_reset (v0.1.1): the
+        // next lifetime's backend starts its counters at 0 — stale baselines
+        // from this lifetime must never fake a prompt edge on its first
+        // output frame.
+        self.last_pre = 0;
+        self.last_exec = 0;
+        self.chord_pre = None;
         self.want_focus = false;
         self.has_focus = false;
         self.submit_hold = None;
@@ -937,12 +1029,38 @@ impl ComposerState {
     pub fn activate(&mut self, backend: &TermBackend) -> Vec<u8> {
         let mut out = Vec::new();
         if !backend.cursor_at_prompt_end() {
-            if let Reclaim::Text(t) = backend.reclaim_text() {
-                if !t.is_empty() {
-                    self.push_reclaimed(&t);
+            // v0.1.1 guards (the field `^C`-spam loop: a systematically-wrong
+            // 133;B capture made every activation reclaim the PROMPT STRING
+            // itself and ship a chord, whose fresh prompt was captured wrong
+            // again — six `^C` rows in the screenshot):
+            //   - a capture at column 0 can only describe the prompt text,
+            //     never typed input (prompts render from the row start) —
+            //     neither reclaim nor chord; arm and let the DEMOTE path
+            //     yield honestly if the capture stays broken;
+            //   - at most one chord per prompt epoch (`chord_pre`): repeat
+            //     activations without an intervening fresh `pre` arm without
+            //     the chord and without re-reclaiming (the first click
+            //     already pulled the text).
+            let col0_capture = backend
+                .block_feed
+                .as_ref()
+                .and_then(|f| f.prompt_end)
+                .is_some_and(|(_, col)| col == 0);
+            let pre = backend
+                .block_feed
+                .as_ref()
+                .map(|f| f.pre_seen)
+                .unwrap_or(0);
+            let chord_fresh = self.chord_pre != Some(pre);
+            if !col0_capture && chord_fresh {
+                if let Reclaim::Text(t) = backend.reclaim_text() {
+                    if !t.is_empty() {
+                        self.push_reclaimed(&t);
+                    }
                 }
+                self.chord_pre = Some(pre);
+                out = line_clear_chord(backend, self.is_cmd);
             }
-            out = line_clear_chord(backend, self.is_cmd);
             if self.at_prompt_since.is_some() {
                 self.episode_used = true;
             }
@@ -1848,6 +1966,25 @@ fn draw_keyboard(painter: &egui::Painter, c: Pos2, color: Color32) {
     );
 }
 
+/// Tiny painter padlock (v0.1.1 pre-shell password label; S14: painter
+/// shapes, never a font glyph): filled body + stroked shackle arc.
+fn draw_lock(painter: &egui::Painter, c: Pos2, color: Color32) {
+    let body = Rect::from_center_size(c + Vec2::new(0.0, 2.5), Vec2::new(10.0, 8.0));
+    painter.rect_filled(body, CornerRadius::same(2), color);
+    let r = 3.2;
+    let cy = body.min.y;
+    let n = 10;
+    let mut prev: Option<Pos2> = None;
+    for k in 0..=n {
+        let a = std::f32::consts::PI * (k as f32 / n as f32);
+        let p = Pos2::new(c.x - r * a.cos(), cy - r * a.sin());
+        if let Some(q) = prev {
+            painter.line_segment([q, p], Stroke::new(1.4, color));
+        }
+        prev = Some(p);
+    }
+}
+
 /// Paint the composer's prompt prefix — accent `❯` + dimmed live cwd — on a
 /// covered grid row, returning the x where the command text begins. Shared
 /// by the live editor and the SubmitHold ghost so the two are pixel-identical
@@ -1993,6 +2130,20 @@ pub fn show(
         && !buffering
         && !cmd_multiline;
 
+    // PRE-SHELL veto (v0.1.1): no hook event has been seen in the CURRENT
+    // lifetime and no prompt latch is live — whatever is talking (ssh auth,
+    // a login chain) is not the shell. `arm_available` MUST be false here:
+    // never offer `❯ Compose` over a password prompt, and the cold-attach
+    // heuristic must not apply either (its current-epoch check already fails
+    // after the epoch bump; the veto makes it explicit).
+    let pre_shell_now = pre_shell(
+        inputs.running,
+        inputs.alt,
+        backend.block_feed.as_ref().map(|f| f.pre_seen).unwrap_or(0),
+        backend.block_feed.as_ref().map(|f| f.exec_seen).unwrap_or(0),
+        state.at_prompt_latched(),
+    );
+
     // Manual-activation availability: the gate core passes AND either a live
     // prompt latch or the cold-attach heuristic (§2.2 — a closed record from
     // the CURRENT epoch proves this spawn reached an interactive prompt; the
@@ -2001,7 +2152,7 @@ pub fn show(
     let cold_ok = !recs.is_empty()
         && recs.iter().all(|r| r.end_off.is_some())
         && recs.last().is_some_and(|r| r.epoch == epoch);
-    let arm_available = core_passes && (inputs.at_prompt || cold_ok);
+    let arm_available = core_passes && !pre_shell_now && (inputs.at_prompt || cold_ok);
 
     let strip_resp = ui.interact(
         strip_rect,
@@ -2604,6 +2755,49 @@ pub fn show(
                         );
                     }
                 }
+                // PRE-SHELL raw conversation (v0.1.1): ssh auth / login
+                // chain — no shell exists yet, so the lane narrates the
+                // conversation instead of offering Compose (the arm veto
+                // above keeps `arm_available` false; the strip is inert
+                // except the right cluster, and typing goes to the grid —
+                // exactly where password keys must land). The password line
+                // gets the lock glyph; detection reads the CURSOR row only
+                // and a miss degrades to the generic line (render-only, no
+                // wrong-cover class risk). ssh-family only: a WSL pre-shell
+                // lasts sub-second and a degraded hookless remote shell
+                // should not claim "ssh is asking" forever… it still does
+                // in the hooks-never-arrived case, which is the honest
+                // reading (the terminal IS raw passthrough there).
+                LaneContent::Label if pre_shell_now && state.is_ssh => {
+                    let auth = detect_auth_prompt(&backend.cursor_row_text());
+                    let (label, label_col) = match auth {
+                        AuthPrompt::Password => (
+                            "password \u{2014} keys go straight to ssh, never shown or stored",
+                            super::TEXT_SECONDARY,
+                        ),
+                        AuthPrompt::HostKey => (
+                            "host key check \u{2014} answer yes or no",
+                            super::TEXT_SECONDARY,
+                        ),
+                        AuthPrompt::None => (
+                            "ssh is asking \u{2014} type your answer in the terminal",
+                            super::TEXT_FAINT,
+                        ),
+                    };
+                    let icon_c = Pos2::new(lane_x + 6.0, strip_rect.center().y);
+                    if auth == AuthPrompt::Password {
+                        draw_lock(&painter, icon_c, super::TEXT_FAINT);
+                    } else {
+                        draw_keyboard(&painter, icon_c, super::TEXT_FAINT);
+                    }
+                    painter.text(
+                        Pos2::new(lane_x + 20.0, strip_rect.center().y),
+                        Align2::LEFT_CENTER,
+                        label,
+                        FontId::proportional(12.0),
+                        label_col,
+                    );
+                }
                 LaneContent::Label => {
                 // Steady NoPrompt / UserRaw (and Busy-by-mouse-mode): honest
                 // raw label; the ❯ Compose affordance appears ONLY here — a
@@ -3083,6 +3277,149 @@ mod tests {
     fn hook_bytes(verb: &str, json: &str) -> Vec<u8> {
         let hex: String = json.bytes().map(|b| format!("{b:02x}")).collect();
         format!("\x1b]7717;0;{verb};{hex}\x07").into_bytes()
+    }
+
+    /// v0.1.1 (the ssh password-phase plaintext exposure, root 1b):
+    /// D2C::Reset replaces the backend — its counters restart at 0 — so
+    /// on_reset/on_exited must resync the baselines. Without the resync the
+    /// respawn's FIRST hookless output frame (the `Password:` bytes) read
+    /// as a counter edge and falsely latched `at_prompt`. Fails against the
+    /// pre-fix code.
+    #[test]
+    fn reset_resyncs_hook_counters() {
+        let now = Instant::now();
+        let mut st = ComposerState::default();
+        // The old lifetime saw real hook traffic.
+        st.on_stream_events(3, 2, now);
+        assert!(st.at_prompt_latched());
+        st.on_reset();
+        assert!(!st.at_prompt_latched());
+        // Fresh backend, fresh counters: (0,0) is the ORIGIN, not an edge.
+        st.on_stream_events(0, 0, now);
+        assert!(
+            !st.at_prompt_latched(),
+            "the post-reset counter origin must never latch at_prompt"
+        );
+        // Symmetric on the exit path.
+        let mut st = ComposerState::default();
+        st.on_stream_events(5, 5, now);
+        st.on_exited();
+        st.on_stream_events(0, 0, now);
+        assert!(!st.at_prompt_latched());
+        // A REAL first pre of the new lifetime still latches.
+        st.on_stream_events(1, 0, now);
+        assert!(st.at_prompt_latched());
+    }
+
+    /// v0.1.1 pre-shell definition: no hook event this lifetime + no latch
+    /// ⇒ pre-shell (the arm veto's input); any lifetime signal exits it.
+    /// AutoArm is structurally impossible pre-shell (no latch ⇒ the gate
+    /// blocks NoPrompt) — pinned here so the veto's belt never rots.
+    #[test]
+    fn pre_shell_state_table() {
+        assert!(pre_shell(true, false, 0, 0, false));
+        assert!(!pre_shell(false, false, 0, 0, false), "dead is not pre-shell");
+        assert!(!pre_shell(true, true, 0, 0, false), "alt-screen is its own state");
+        assert!(!pre_shell(true, false, 1, 0, false), "the first pre exits pre-shell");
+        assert!(!pre_shell(true, false, 0, 1, false), "an exec exits pre-shell");
+        assert!(
+            !pre_shell(true, false, 0, 0, true),
+            "a cold-attach latch exits pre-shell"
+        );
+        let mut i = raw_inputs();
+        i.at_prompt = false;
+        assert_eq!(gate(&i), GateVerdict::Blocked(RawReason::NoPrompt));
+    }
+
+    /// v0.1.1: the pre-shell auth-prompt detector fixtures (cursor-row text
+    /// only, end-anchored; misses degrade to the generic label).
+    #[test]
+    fn auth_prompt_detection_fixtures() {
+        use AuthPrompt::*;
+        assert_eq!(detect_auth_prompt("alec@devbox's password: "), Password);
+        assert_eq!(detect_auth_prompt("(user@host) Password:"), Password);
+        assert_eq!(
+            detect_auth_prompt("Enter passphrase for key '/home/z/.ssh/id_ed25519': "),
+            Password
+        );
+        assert_eq!(detect_auth_prompt("PASSCODE:"), Password);
+        assert_eq!(
+            detect_auth_prompt(
+                "Are you sure you want to continue connecting (yes/no/[fingerprint])? "
+            ),
+            HostKey
+        );
+        assert_eq!(detect_auth_prompt("Continue connecting (yes/no)? "), HostKey);
+        // Negatives: shell prompts, echoes, non-anchored mentions.
+        assert_eq!(detect_auth_prompt("[zany@MSI zany]$ "), None);
+        assert_eq!(detect_auth_prompt("zany@MSI:~$ "), None);
+        assert_eq!(detect_auth_prompt("cat password.txt"), None);
+        assert_eq!(
+            detect_auth_prompt("password: extra words"),
+            None,
+            "the colon must anchor the end of the row"
+        );
+        assert_eq!(
+            detect_auth_prompt("time:"),
+            None,
+            "a bare trailing colon without a secret keyword"
+        );
+        assert_eq!(detect_auth_prompt(""), None);
+    }
+
+    /// v0.1.1 (the wrong-capture `^C`-spam loop breaker): the activation
+    /// clear chord ships at most ONCE per prompt epoch, and a column-0
+    /// capture (only the prompt itself can start there) neither reclaims
+    /// nor chords.
+    #[test]
+    fn activate_chord_once_per_prompt_epoch() {
+        let mut b = backend_at_clean_prompt();
+        b.advance_live(b"junk"); // typed junk: cursor off the prompt end
+        assert!(!b.cursor_at_prompt_end());
+        let mut st = ComposerState::default();
+        let chord = st.activate(&b);
+        assert!(!chord.is_empty(), "first activation ships the clear chord");
+        assert_eq!(st.draft, "junk", "reclaimable text pulled into the draft");
+        // Same prompt epoch: no second chord, no duplicate reclaim.
+        st.mode = ComposerMode::Raw(RawReason::UserRaw);
+        assert!(
+            st.activate(&b).is_empty(),
+            "one clear attempt per prompt epoch"
+        );
+        assert_eq!(st.draft, "junk", "no duplicate reclaim");
+        // A fresh pre (new prompt epoch) re-allows exactly one chord.
+        b.advance_live(&hook_bytes("pre", r#"{"e":130,"n":2,"d":"C:"}"#));
+        b.advance_live(b"PS C:\\> \x1b]133;B\x07");
+        b.advance_live(b"junk2");
+        st.mode = ComposerMode::Raw(RawReason::UserRaw);
+        assert!(
+            !st.activate(&b).is_empty(),
+            "a fresh prompt epoch re-arms the chord"
+        );
+    }
+
+    /// v0.1.1: a col-0 prompt-end capture is the ConPTY reorder shape — the
+    /// "typed text" a reclaim would read IS the prompt string. Activation
+    /// must arm silently: no chord, no reclaim.
+    #[test]
+    fn activate_never_chords_a_col0_capture() {
+        let mut b = TermBackend::new(GridSize::default());
+        b.set_stream_pos(0);
+        b.enable_block_scan();
+        // 133;B beats the prompt text into the stream (the race).
+        b.advance_live(b"\x1b]133;B\x07");
+        b.advance_live(b"[zany@MSI zany]$ ");
+        assert!(!b.cursor_at_prompt_end());
+        let mut st = ComposerState::default();
+        assert!(
+            st.activate(&b).is_empty(),
+            "no chord may ship for a col-0 capture"
+        );
+        assert_eq!(
+            st.draft, "",
+            "the prompt string must never be reclaimed as typed input"
+        );
+        assert_eq!(st.mode, ComposerMode::Compose);
     }
 
     /// Restored-render fix: an ACTIVE Compose whose cover certainty breaks
