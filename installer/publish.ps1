@@ -124,7 +124,10 @@ if ($Local) {
     Write-Host "Dry run: pack complete, nothing uploaded. Artifacts in $outDir"
 } else {
     Write-Host "vpk upload github ($Repo)"
-    vpk upload github --repoUrl $Repo --outputDir $outDir --publish --releaseName "Pulse v$version" --tag "v$version"
+    # vpk 1.2 does not read VPK_GITHUB_TOKEN from the environment on upload
+    # (proven by the v0.1.0 run: ArgumentNullException 'token') — pass it.
+    if (-not $env:VPK_GITHUB_TOKEN) { throw "VPK_GITHUB_TOKEN is not set (required for upload; use -NoUpload to rehearse)" }
+    vpk upload github --repoUrl $Repo --outputDir $outDir --publish --releaseName "Pulse v$version" --tag "v$version" --token $env:VPK_GITHUB_TOKEN
     if ($LASTEXITCODE -ne 0) { throw "vpk upload failed ($LASTEXITCODE)" }
     Write-Host "Published v$version to $Repo"
 }
