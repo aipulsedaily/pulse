@@ -464,6 +464,58 @@ const SSH_SELF_DELETE: &str = "[ -n \"$TC_RC\" ] && rm -f -- \"$TC_RC\"\n";
 /// does not apply to it (single quotes in the awk program are fine).
 const SSH_MOTD_PRELUDE: &str = "if [ ! -f ~/.hushlogin ]; then\n  [ \"$MOTD_SHOWN\" = pam ] && unset MOTD_SHOWN\n  if [ -z \"$MOTD_SHOWN\" ] && { [ -s /run/motd.dynamic ] || [ -s /etc/motd ]; }; then\n    cat /run/motd.dynamic /etc/motd 2>/dev/null\n    export MOTD_SHOWN=tc\n  fi\n  last -2 -F -- \"$USER\" 2>/dev/null | awk 'NR==2 && NF>=9 && $4 ~ /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)$/ {\n    printf \"Last login: %s %s %2s %s %s\", $4,$5,$6,$7,$8\n    if ($3 != \"\" && $3 != \"-\") printf \" from %s\", $3\n    print \"\" }'\nfi\n";
 
+/// v0.1.2 WSL welcome banner: which motd prelude a WSL rcfile gets.
+///
+/// Field context: Ubuntu's `/etc/profile.d/update-motd.sh` prints the motd
+/// once a day, gated on the `~/.motd_shown` stamp, and Pulse's boot
+/// auto-restore replays the login chain — so whichever restored shell ran
+/// first each morning silently CONSUMED the daily banner, and a terminal the
+/// user actually created was almost always born to a black screen (banner
+/// gone + prompt row covered by the composer). Product decision: fresh
+/// terminals print the motd EVERY time (default ON, Settings → Terminal),
+/// via a pam_motd-style emulation that never touches the distro's stamp;
+/// restores never show NOR consume it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WslMotd {
+    /// Fresh create with the welcome banner ON: print the distro motd
+    /// (update-motd / run-parts / cached files — exactly what the stock
+    /// once-a-day path shows), honoring `~/.hushlogin` and any inherited
+    /// `MOTD_SHOWN`, then export `MOTD_SHOWN` so the distro's own profile.d
+    /// script neither double-prints nor touches `~/.motd_shown`.
+    Banner,
+    /// Fresh create with the banner OFF: stock distro behavior, unmodified
+    /// (the distro's own once-a-day logic runs — and, with restores no
+    /// longer consuming the stamp, its "first tab of the day" semantics
+    /// actually work under Pulse).
+    Stock,
+    /// Restore/relaunch: pre-set `MOTD_SHOWN` before `/etc/profile` runs so
+    /// update-motd.sh skips WITHOUT touching the once-a-day stamp — a boot
+    /// restore must never eat the banner a fresh terminal would show.
+    Restore,
+}
+
+/// The `Banner` prelude. Order of preference mirrors what Ubuntu's own
+/// update-motd.sh runs: `update-motd --show-only` (regenerates + prints,
+/// works unprivileged — verified on Ubuntu 24.04 WSL), then a raw
+/// `run-parts /etc/update-motd.d`, then the pam_motd cache files. Exports
+/// `MOTD_SHOWN=pulse` ONLY when a source existed, so distros with none keep
+/// their stock profile.d behavior. NEVER touches `~/.motd_shown`.
+const WSL_MOTD_PRELUDE: &str = "if [ ! -f ~/.hushlogin ] && [ -z \"$MOTD_SHOWN\" ]; then\n  if command -v update-motd >/dev/null 2>&1; then\n    update-motd --show-only 2>/dev/null\n    export MOTD_SHOWN=pulse\n  elif [ -d /etc/update-motd.d ] && command -v run-parts >/dev/null 2>&1; then\n    run-parts /etc/update-motd.d 2>/dev/null\n    export MOTD_SHOWN=pulse\n  elif [ -s /run/motd.dynamic ] || [ -s /etc/motd ]; then\n    cat /run/motd.dynamic /etc/motd 2>/dev/null\n    export MOTD_SHOWN=pulse\n  fi\nfi\n";
+
+/// The `Restore` prelude: suppress-without-consuming. Only fills in when
+/// nothing else set it — an inherited real value keeps its meaning.
+const WSL_RESTORE_PRELUDE: &str = "export MOTD_SHOWN=\"${MOTD_SHOWN:-pulse-restore}\"\n";
+
+impl WslMotd {
+    fn prelude(self) -> &'static str {
+        match self {
+            WslMotd::Banner => WSL_MOTD_PRELUDE,
+            WslMotd::Stock => "",
+            WslMotd::Restore => WSL_RESTORE_PRELUDE,
+        }
+    }
+}
+
 /// (Re)write the bash rcfile for an ssh spawn: the SAME template as WSL (one
 /// template, two deliveries — `[ -f ~/.bashrc ]` sources the REMOTE user's
 /// bashrc by construction) plus the /tmp self-delete, and the cd trailing is
@@ -557,15 +609,21 @@ pub fn write_script(id: Uuid, token: &str, banner: bool) -> anyhow::Result<PathB
     Ok(path)
 }
 
-/// (Re)write the bash rcfile for a WSL spawn, embedding `token` and an
-/// optional restore trailing (see `bash_restore_trailing`). LF line endings —
+/// (Re)write the bash rcfile for a WSL spawn, embedding `token`, an
+/// optional restore trailing (see `bash_restore_trailing`), and the v0.1.2
+/// motd prelude for this spawn's lane (see `WslMotd`). LF line endings —
 /// bash rejects CRLF constructs. Same rotate-per-spawn / user-private-ACL /
 /// delete-with-terminal lifecycle as the ps1.
-pub fn write_bashrc(id: Uuid, token: &str, trailing: Option<&str>) -> anyhow::Result<PathBuf> {
+pub fn write_bashrc(
+    id: Uuid,
+    token: &str,
+    trailing: Option<&str>,
+    motd: WslMotd,
+) -> anyhow::Result<PathBuf> {
     std::fs::create_dir_all(bootstrap_dir())?;
     let path = script_path_bash(id);
     let body = BASH_TEMPLATE
-        .replace("{MOTD_PRELUDE}", "")
+        .replace("{MOTD_PRELUDE}", motd.prelude())
         .replace("{TOKEN}", token)
         .replace("{RESTORE_TRAILING}", trailing.unwrap_or(""));
     std::fs::write(&path, body)?;
@@ -609,6 +667,51 @@ mod tests {
         assert_eq!(wsl_mnt_path(Path::new("\\\\server\\share\\f")), None);
         assert_eq!(wsl_mnt_path(Path::new("relative\\f")), None);
         assert_eq!(wsl_mnt_path(Path::new("C:")), None);
+    }
+
+    /// v0.1.2 WSL banner gating: the three lanes render the right prelude,
+    /// none of them can ever touch the distro's once-a-day stamp, and the
+    /// prelude runs BEFORE /etc/profile (that ordering is what lets the
+    /// exported MOTD_SHOWN suppress update-motd.sh without consuming it).
+    #[test]
+    fn wsl_motd_prelude_gating() {
+        // Banner: hushlogin + inherited-MOTD_SHOWN gates, the stock source
+        // chain (update-motd --show-only, run-parts, cache files), and the
+        // export that stops the distro script from double-printing.
+        let banner = WslMotd::Banner.prelude();
+        assert!(banner.starts_with("if [ ! -f ~/.hushlogin ] && [ -z \"$MOTD_SHOWN\" ]; then"));
+        assert!(banner.contains("update-motd --show-only"));
+        assert!(banner.contains("run-parts /etc/update-motd.d"));
+        assert!(banner.contains("cat /run/motd.dynamic /etc/motd"));
+        assert!(banner.contains("export MOTD_SHOWN=pulse"));
+        // Restore: suppress-without-consuming, nothing printed, inherited
+        // values honored (:- default only fills an empty slot).
+        let restore = WslMotd::Restore.prelude();
+        assert_eq!(restore, "export MOTD_SHOWN=\"${MOTD_SHOWN:-pulse-restore}\"\n");
+        // Stock: byte-identical to the pre-v0.1.2 template.
+        assert_eq!(WslMotd::Stock.prelude(), "");
+        // The hard invariant: NO lane writes the once-a-day stamp (that is
+        // the distro script's move, which every non-Stock lane suppresses).
+        for p in [banner, restore] {
+            assert!(!p.contains(".motd_shown"), "prelude must never touch the stamp");
+            assert!(!p.contains("touch "), "prelude must never touch anything");
+        }
+        // Prelude lands before the /etc/profile sourcing for every lane.
+        for motd in [WslMotd::Banner, WslMotd::Restore] {
+            let body = BASH_TEMPLATE
+                .replace("{MOTD_PRELUDE}", motd.prelude())
+                .replace("{TOKEN}", "t")
+                .replace("{RESTORE_TRAILING}", "");
+            let prelude_at = body.find("MOTD_SHOWN").unwrap();
+            let profile_at = body
+                .find("if [ -f /etc/profile ]; then . /etc/profile; fi")
+                .unwrap();
+            assert!(
+                prelude_at < profile_at,
+                "{motd:?} prelude must precede /etc/profile"
+            );
+            assert!(!body.contains('\r'), "bash rejects CRLF");
+        }
     }
 
     /// U4: template/quoting goldens — token substitution, hook grammar bytes,

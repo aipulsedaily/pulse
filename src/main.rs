@@ -69,10 +69,13 @@ fn main() -> anyhow::Result<()> {
         // windows, run from a %TEMP% copy of this exe (the install dir is
         // being deleted/swapped underneath — a process running from
         // `current\` would image-lock it against Update.exe).
-        Some("--uninstall-ui") => gui::lifecycle_ui::run_uninstall(),
+        Some("--uninstall-ui") => gui::lifecycle_ui::run_uninstall(
+            args.get(2).cloned().unwrap_or_default(),
+        ),
         Some("--updating-ui") => gui::lifecycle_ui::run_updating(
             args.get(2).cloned().unwrap_or_default(),
             args.get(3).cloned().unwrap_or_default(),
+            args.get(4).cloned().unwrap_or_default(),
         ),
         // Controller CLI through the main exe (debug/redirected-output use;
         // `pulse-ctl.exe` — a real console binary — is the documented interface).
@@ -266,18 +269,34 @@ pub fn sync_bin_install() {
         // install(). The next boot retries (sidecar was not written).
         log::warn!("bin-sync: daemon still holds daemon.lock; copy may fail");
     }
+    // Bounded-retry copies (v0.1.2, fix f — install()'s exact race): the
+    // quiesced daemon's exe IMAGE lock outlives daemon.lock by milliseconds,
+    // and the post-update boot quiesces then immediately copies over
+    // bin\pulse.exe — a lost race left bin\ (and the daemon) at the OLD
+    // version until the next boot, with only a log line to show for it.
+    let copy_retry = |src: &std::path::Path, dst: &std::path::Path| -> std::io::Result<u64> {
+        let mut last = None;
+        for _ in 0..30 {
+            match std::fs::copy(src, dst) {
+                Ok(n) => return Ok(n),
+                Err(e) => last = Some(e),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        Err(last.expect("at least one attempt"))
+    };
     let copy = || -> std::io::Result<()> {
         let current = std::env::current_exe()?;
         if let Some(dir) = target.parent() {
             std::fs::create_dir_all(dir)?;
         }
         if current != target {
-            std::fs::copy(&current, &target)?;
+            copy_retry(&current, &target)?;
         }
         let ctl_source = current.with_file_name("pulse-ctl.exe");
         let ctl_target = target.with_file_name("pulse-ctl.exe");
         if ctl_source.exists() && ctl_source != ctl_target {
-            std::fs::copy(&ctl_source, &ctl_target)?;
+            copy_retry(&ctl_source, &ctl_target)?;
         } else if !ctl_source.exists() {
             log::warn!("bin-sync: no sibling pulse-ctl.exe; controller CLI not deployed");
         }
@@ -363,7 +382,16 @@ fn uninstall_cleanup() {
     // Branded "Uninstalling… → Uninstalled" window (#34 lifecycle UI),
     // spawned FIRST so it covers the quiesce; it runs from a %TEMP% copy so
     // it survives (and never image-locks) the install-dir deletion.
-    spawn_lifecycle_helper(&["--uninstall-ui"]);
+    // v0.1.2: the REAL install root rides argv — the hook exe runs from
+    // `<root>\current\`, the %TEMP% helper can't self-locate, and the old
+    // hardcoded `AIPulseDaily.Pulse` check watched the wrong dir for any
+    // packId-isolated install (and lied "Uninstalled" at its 30s cap).
+    let root = velopack::locator::auto_locate_app_manifest(
+        velopack::locator::LocationContext::FromCurrentExe,
+    )
+    .map(|l| l.get_root_dir().to_string_lossy().into_owned())
+    .unwrap_or_default();
+    spawn_lifecycle_helper(&["--uninstall-ui", &root]);
     let _ = quiesce_daemon();
     // The Run key is a real-profile global: a TC_DATA_DIR sandbox never
     // wrote one (install_autostart is gated), so never delete it from one.
@@ -406,6 +434,14 @@ pub fn spawn_lifecycle_helper(args: &[&str]) {
         std::fs::copy(&me, &dst)?;
         std::process::Command::new(&dst)
             .args(args)
+            // v0.1.2 field bug A: the spawner usually runs from `current\`
+            // (Start-Menu shortcut and Update.exe relaunches both set
+            // WorkingDirectory=<root>\current), and an inherited CWD is an
+            // open directory handle that blocks Update.exe's `current\`
+            // rename (update) and the root rmdir (uninstall) — the helper's
+            // exe lives in %TEMP%, so Update.exe's process sweep never kills
+            // it and its CWD wins. Pin it to %TEMP% (proven unblocker).
+            .current_dir(std::env::temp_dir())
             .creation_flags(DETACHED_PROCESS)
             .spawn()?;
         Ok(())
@@ -509,6 +545,11 @@ fn install() -> anyhow::Result<()> {
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         std::process::Command::new(&target)
             .arg("--daemon")
+            // v0.1.2 field bug A (hygiene): never let the long-lived daemon
+            // inherit a CWD inside the Velopack `current\` dir — an open CWD
+            // handle there blocks the update swap / uninstall rmdir. The
+            // data dir exists (created above) and outlives every install.
+            .current_dir(state::data_dir())
             .creation_flags(DETACHED_PROCESS)
             .spawn()?;
     }

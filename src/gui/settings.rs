@@ -894,6 +894,19 @@ impl App {
             self.prefs.paste_warn = v;
             self.save_prefs();
         }
+
+        // v0.1.2: the WSL welcome banner. Fresh WSL terminals print the
+        // distro's motd every time (never consuming its once-a-day stamp);
+        // restored terminals never show it. Applies at create time.
+        if let Some(v) = toggle_row(
+            ui,
+            "Show welcome message on new terminals",
+            Some("New WSL terminals print the distro's welcome message. Restored terminals never do."),
+            self.prefs.wsl_welcome_banner,
+        ) {
+            self.prefs.wsl_welcome_banner = v;
+            self.save_prefs();
+        }
     }
 
     fn settings_consent(&mut self, ui: &mut egui::Ui, st: &mut SettingsState) {

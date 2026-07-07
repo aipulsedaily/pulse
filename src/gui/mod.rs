@@ -47,7 +47,7 @@ use settings::*;
 use update::*;
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use alacritty_terminal::term::search::{Match, RegexSearch};
@@ -456,6 +456,13 @@ struct Prefs {
     /// pre-#34 era (or first run) — no toast.
     #[serde(default)]
     last_run_version: Option<String>,
+    /// v0.1.2: show the distro welcome message (motd) on every NEW WSL
+    /// terminal (default ON). Stamped into `ShellCfg.wsl_motd` at create
+    /// time; the daemon's fresh-spawn prelude prints the motd without ever
+    /// touching the distro's once-a-day `~/.motd_shown` stamp, and restores
+    /// never show nor consume it. Settings → Terminal owns the toggle.
+    #[serde(default = "default_true_pref")]
+    wsl_welcome_banner: bool,
 }
 
 fn default_true_pref() -> bool {
@@ -491,6 +498,7 @@ impl Default for Prefs {
             update_skip_version: None,
             update_backup_default: true,
             last_run_version: None,
+            wsl_welcome_banner: true,
         }
     }
 }
@@ -954,14 +962,85 @@ fn load_prefs(path: &std::path::Path) -> Prefs {
     let Ok(bytes) = std::fs::read(path) else {
         return Prefs::default(); // no file yet — first run
     };
-    match serde_json::from_slice(&bytes) {
-        Ok(p) => p,
+    match serde_json::from_slice::<Prefs>(&bytes) {
+        Ok(mut p) => {
+            // v0.1.2 field fix: heal pre-v0.1.1 WSL spawn-row poison at the
+            // persistence boundary (covers instant-create, Suggested rows,
+            // the sidebar preview, AND backup restores — settings.rs reloads
+            // through here). Idempotent; persisted on the next save_prefs.
+            if heal_wsl_profile_cwds(&mut p) {
+                log::info!("gui.json: healed WSL spawn rows pinned to the Windows profile dir (\u{2192} ~)");
+            }
+            p
+        }
         Err(e) => {
             log::error!("gui.json corrupt ({e}); starting from defaults, old file backed up");
             let _ = std::fs::rename(path, path.with_extension("json.corrupt"));
             Prefs::default()
         }
     }
+}
+
+/// v0.1.2: is `cwd` the WINDOWS profile dir a pre-v0.1.1 default recorded
+/// into WSL spawn rows? True for the current user's home (case-insensitive,
+/// separator-normalized, trailing-separator-tolerant) and for any
+/// `<drive>:\Users\<name>` profile ROOT (the same poison from another
+/// account/machine riding a copied gui.json). Deliberately NOT true for
+/// anything deeper (`C:\Users\zany\projects` is a real "open this Windows
+/// project in WSL" pick — a feature).
+fn is_windows_profile_dir(cwd: &Path, home: Option<&Path>) -> bool {
+    fn norm(p: &Path) -> String {
+        let mut s = p.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
+        while s.ends_with('\\') {
+            s.pop();
+        }
+        s
+    }
+    let c = norm(cwd);
+    if c.is_empty() {
+        return false; // empty is heal_cwd's job (spawn-time → ~ already)
+    }
+    if home.is_some_and(|h| norm(h) == c) {
+        return true;
+    }
+    let parts: Vec<&str> = c.split('\\').collect();
+    parts.len() == 3
+        && parts[0].len() == 2
+        && parts[0].as_bytes()[0].is_ascii_alphabetic()
+        && parts[0].as_bytes()[1] == b':'
+        && parts[1] == "users"
+        && !parts[2].is_empty()
+}
+
+/// One-time (idempotent, every load) heal of persisted WSL spawn rows whose
+/// cwd is the WINDOWS profile dir: the pre-v0.1.1 default recorded
+/// `C:\Users\<u>` into `last_spawn`/`recent_spawns` for WSL tags, and
+/// v0.1.1's `heal_cwd` only heals EMPTY cwds — so every instant-create and
+/// Suggested-row spawn kept replaying `/mnt/c/Users/<u>` forever
+/// (self-reinforcing via note_spawn; survives uninstall/reinstall because
+/// the data dir is deliberately kept). Rewrites those rows to `~` (the
+/// LINUX home, resolved in-distro by `wsl --cd ~`). Runtime explicit
+/// directory picks are untouched — this runs only on rows loaded from disk.
+fn heal_wsl_profile_cwds(prefs: &mut Prefs) -> bool {
+    let home = dirs::home_dir();
+    let mut changed = false;
+    {
+        let mut heal = |s: &mut SpawnSpec| {
+            if launcher::wsl_tag_distro(&s.kind_tag).is_some()
+                && is_windows_profile_dir(&s.cwd, home.as_deref())
+            {
+                s.cwd = PathBuf::from("~");
+                changed = true;
+            }
+        };
+        if let Some(last) = prefs.last_spawn.as_mut() {
+            heal(last);
+        }
+        for recent in prefs.recent_spawns.iter_mut() {
+            heal(recent);
+        }
+    }
+    changed
 }
 
 /// ssh-drop §4: the drop batch a consent dialog covers. Continue enqueues
@@ -2008,11 +2087,12 @@ impl App {
     /// and create it (auto-selected via the launcher's pending_create
     /// machinery). NOT a launcher choice: sticky spawn prefs untouched.
     fn duplicate_terminal(&mut self, t: &TerminalMeta) {
-        let nt = {
+        let mut nt = {
             let taken: Vec<&str> =
                 self.state.terminals.iter().map(|s| s.name.as_str()).collect();
             duplicate_spec(t, &taken)
         };
+        self.stamp_wsl_banner(&mut nt);
         let name = nt.name.clone();
         self.send(C2D::CreateTerminal { spec: nt });
         self.pending_create = Some((name, Instant::now()));
@@ -4746,6 +4826,21 @@ impl App {
             .unwrap_or_else(|| launcher::default_spawn(&self.prefs.last_cwd))
     }
 
+    /// v0.1.2: stamp the create-time WSL welcome-banner choice (Settings →
+    /// Terminal pref, default ON) onto a spec about to be sent. Lives on
+    /// `ShellCfg` so the daemon — which owns the spawn — sees it; ctl/probe
+    /// creates never pass through here and stay banner-free (the serde
+    /// default). Non-WSL specs are untouched.
+    fn stamp_wsl_banner(&self, nt: &mut crate::state::NewTerminal) {
+        if matches!(
+            crate::state::shell_family(&nt.kind, &nt.program, &nt.args),
+            crate::state::ShellFamily::WslShell { .. }
+        ) {
+            nt.shell_cfg.get_or_insert_with(Default::default).wsl_motd =
+                self.prefs.wsl_welcome_banner;
+        }
+    }
+
     /// Record a successful create into the sticky prefs: `last_spawn`
     /// overwritten, `recent_spawns` MRU ring of 8 deduped by (kind_tag, cwd).
     fn note_spawn(&mut self, spec: SpawnSpec) {
@@ -4773,7 +4868,8 @@ impl App {
                 self.state.terminals.iter().map(|t| t.name.as_str()).collect();
             launcher::spec_from_spawn(&last, folder, &taken)
         };
-        let Some(nt) = nt else { return };
+        let Some(mut nt) = nt else { return };
+        self.stamp_wsl_banner(&mut nt);
         let name = nt.name.clone();
         self.send(C2D::CreateTerminal { spec: nt });
         self.pending_create = Some((name, Instant::now()));
@@ -4875,7 +4971,8 @@ impl App {
                 }
             }
         };
-        let Some((nt, spawn)) = built else { return };
+        let Some((mut nt, spawn)) = built else { return };
+        self.stamp_wsl_banner(&mut nt);
         let name = nt.name.clone();
         self.send(C2D::CreateTerminal { spec: nt });
         self.pending_create = Some((name, Instant::now()));
@@ -5616,6 +5713,13 @@ pub fn run() -> anyhow::Result<()> {
     // (share_mode 0) probe open fails with a sharing violation whenever any
     // handle exists; skipping just defers rotation to the next solo start.
     let _ = std::fs::create_dir_all(crate::state::data_dir());
+    // v0.1.2 field bug A (defense in depth): shortcut launches and
+    // Update.exe relaunches start the GUI with CWD=<velopack-root>\current\
+    // — an open CWD handle inside the dir Velopack must rename/delete.
+    // Re-home to the data dir so neither this process nor anything it
+    // spawns (helper/daemon are also pinned individually) can block an
+    // update swap or uninstall. No GUI path resolves relative to CWD.
+    let _ = std::env::set_current_dir(crate::state::data_dir());
     {
         use std::os::windows::fs::OpenOptionsExt;
         let sole_holder = std::fs::OpenOptions::new()
@@ -5817,6 +5921,8 @@ mod tests {
         // #34: pre-updater gui.json has no last_run_version — that shape
         // must NOT mint an "Updated to…" toast (None, not Some).
         assert!(p.last_run_version.is_none());
+        // v0.1.2: the WSL welcome banner defaults ON.
+        assert!(p.wsl_welcome_banner);
 
         // (b) Every field non-default → byte-exact round trip.
         let full = Prefs {
@@ -5854,10 +5960,103 @@ mod tests {
             update_skip_version: Some("0.2.0".into()),
             update_backup_default: false,
             last_run_version: Some("0.1.0".into()),
+            wsl_welcome_banner: false,
         };
         let json = serde_json::to_string(&full).unwrap();
         let back: Prefs = serde_json::from_str(&json).unwrap();
         assert_eq!(back, full, "prefs must round-trip losslessly");
+    }
+
+    /// v0.1.2 persisted-row heal: pre-v0.1.1 WSL rows carry the WINDOWS
+    /// profile dir (the old default), which v0.1.1's empty-only heal_cwd
+    /// deliberately preserved — so instant-create and Suggested rows kept
+    /// spawning /mnt/c/Users/<u> forever (the field bug, self-reinforcing
+    /// via note_spawn and surviving reinstalls with the kept data dir).
+    /// The load-boundary heal rewrites exactly those rows to `~`.
+    #[test]
+    fn wsl_profile_cwd_heal() {
+        let wsl = |cwd: &str| SpawnSpec {
+            kind_tag: "wsl:Ubuntu-24.04".into(),
+            program: "wsl.exe".into(),
+            args: vec!["-d".into(), "Ubuntu-24.04".into()],
+            cwd: PathBuf::from(cwd),
+        };
+        let ps = |cwd: &str| SpawnSpec {
+            kind_tag: "powershell".into(),
+            program: "powershell.exe".into(),
+            args: vec![],
+            cwd: PathBuf::from(cwd),
+        };
+        let mut p = Prefs {
+            last_spawn: Some(wsl("C:\\Users\\zany")), // ← the field poison
+            recent_spawns: vec![
+                wsl("C:\\Users\\zany"),          // poison (MRU head)
+                wsl("~"),                        // healthy v0.1.1 row
+                wsl("D:/Users/bob/"),            // poison: other user/drive, fwd slashes, trailing sep
+                wsl("C:\\Users\\zany\\projects"), // explicit project dir — a FEATURE, keep
+                ps("C:\\Users\\zany"),           // Windows shell in the profile dir — legit
+                wsl(""),                         // pre-heal empty era — spawn-time heal owns it
+            ],
+            ..Default::default()
+        };
+        assert!(heal_wsl_profile_cwds(&mut p), "poisoned rows must report a change");
+        assert_eq!(p.last_spawn.as_ref().unwrap().cwd, PathBuf::from("~"));
+        let cwds: Vec<String> = p
+            .recent_spawns
+            .iter()
+            .map(|s| s.cwd.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            cwds,
+            [
+                "~",
+                "~",
+                "~",
+                "C:\\Users\\zany\\projects",
+                "C:\\Users\\zany",
+                "",
+            ]
+        );
+        // Idempotent: the healed shape is a fixed point (second load no-ops).
+        assert!(!heal_wsl_profile_cwds(&mut p), "healed prefs must not re-report");
+
+        // Nothing to heal ⇒ untouched and unreported.
+        let mut clean = Prefs {
+            last_spawn: Some(ps("C:\\Users\\zany")),
+            ..Default::default()
+        };
+        assert!(!heal_wsl_profile_cwds(&mut clean));
+        assert_eq!(clean.last_spawn.as_ref().unwrap().cwd, PathBuf::from("C:\\Users\\zany"));
+    }
+
+    /// The profile-dir shape test itself: home-dir equality is
+    /// case/separator/trailing-insensitive; any `<drive>:\Users\<name>`
+    /// profile ROOT matches; deeper paths and non-profile dirs never do.
+    #[test]
+    fn windows_profile_dir_shapes() {
+        let home = Path::new("C:\\Users\\Zany");
+        let is = |p: &str| is_windows_profile_dir(Path::new(p), Some(home));
+        assert!(is("C:\\Users\\Zany"));
+        assert!(is("c:\\users\\zany"));
+        assert!(is("C:/Users/zany/"));
+        assert!(is("C:\\Users\\zany\\"));
+        // Profile-shaped for OTHER accounts/drives (copied gui.json poison).
+        assert!(is("D:\\Users\\bob"));
+        assert!(is("c:/users/someone.else"));
+        // NOT profile-shaped: deeper paths, roots, POSIX homes, ~.
+        assert!(!is("C:\\Users\\zany\\projects"));
+        assert!(!is("C:\\Users"));
+        assert!(!is("C:\\"));
+        assert!(!is("~"));
+        assert!(!is("/home/zany"));
+        assert!(!is(""));
+        // Home equality works even when home is NOT under \Users (domain
+        // profiles, relocated homes).
+        assert!(is_windows_profile_dir(
+            Path::new("e:/profiles/zany/"),
+            Some(Path::new("E:\\Profiles\\Zany"))
+        ));
+        assert!(!is_windows_profile_dir(Path::new("E:\\Profiles\\Zany"), None));
     }
 
     /// T1: a corrupt gui.json backs up as gui.json.corrupt (state.json

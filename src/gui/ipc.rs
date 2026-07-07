@@ -323,6 +323,14 @@ fn spawn_daemon() -> anyhow::Result<()> {
         .unwrap_or_else(std::env::current_exe)?;
     std::process::Command::new(exe)
         .arg("--daemon")
+        // v0.1.2 field bug A (hygiene): a shortcut/Update.exe-launched GUI
+        // runs with CWD=<velopack-root>\current\, and everything it spawns
+        // inherits that — an open CWD handle inside `current\` blocks the
+        // update swap and the uninstall rmdir (Update.exe's process sweep
+        // only kills exes under the root; the daemon runs from data bin\ and
+        // survives it). Pin the long-lived daemon to the data dir, which
+        // exists before this call and outlives every install.
+        .current_dir(crate::state::data_dir())
         .creation_flags(DETACHED_PROCESS)
         .spawn()?;
     Ok(())

@@ -164,12 +164,49 @@ fn card_chrome(ui: &mut egui::Ui, title: &str, sub: &str, spinning: bool) -> boo
 
 // ─────────────────────────── updating window ───────────────────────────
 
+/// Extract `<version>` from a Velopack `sq.version` manifest (nuspec XML).
+/// Tolerant of attributes/whitespace; the first version element wins (nuspec
+/// has exactly one, inside `<metadata>`).
+fn parse_pack_version(xml: &str) -> Option<String> {
+    let start = xml.find("<version>")? + "<version>".len();
+    let end = xml[start..].find("</version>")?;
+    let v = xml[start..start + end].trim();
+    (!v.is_empty()).then(|| v.to_string())
+}
+
+/// The PACK version currently deployed at a Velopack root (`current\
+/// sq.version`). None while the swap is mid-flight (dir renamed away) or the
+/// root is unknown.
+fn read_pack_version(root: &std::path::Path) -> Option<String> {
+    let xml = std::fs::read_to_string(root.join("current").join("sq.version")).ok()?;
+    parse_pack_version(&xml)
+}
+
+/// v0.1.2 landed verdict: the swap REALLY happened. Primary — the deployed
+/// pack version flipped away from what it was when the card opened (works
+/// even when pack and binary version artifacts differ, e.g. staging feeds);
+/// belt — it equals the announced target.
+fn swap_landed(pack: Option<&str>, initial_pack: Option<&str>, to: &str) -> bool {
+    match pack {
+        Some(v) => v == to || initial_pack.is_some_and(|i| v != i),
+        None => false,
+    }
+}
+
 struct UpdatingUi {
     from: String,
     to: String,
+    /// Velopack root (argv from apply()) — empty when the spawner could not
+    /// locate it; the sidecar poll below then carries the signal alone.
+    root: Option<std::path::PathBuf>,
+    /// Pack version deployed when the card opened (= the FROM pack) — the
+    /// baseline the landed signal diffs against.
+    initial_pack: Option<String>,
     started: Instant,
-    /// Set the moment bin\.version flips to `to` — the visible "Updated"
-    /// beat runs briefly after, then the window closes itself.
+    /// Set the moment the swap lands (pack version flip at the root — the
+    /// real signal — or bin\.version reaching `to`, the secondary
+    /// fully-deployed beat); the visible "Updated" beat runs briefly after,
+    /// then the window closes itself.
     landed: Option<Instant>,
     last_poll: Instant,
 }
@@ -177,13 +214,19 @@ struct UpdatingUi {
 impl eframe::App for UpdatingUi {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
-        // Poll the sidecar at 4Hz — flip means the new GUI booted and
-        // bin-sync deployed, i.e. the update fully landed.
+        // Poll at 4Hz: the root's sq.version flip = Update.exe swapped
+        // `current\` (v0.1.2 — the old bin\.version-only watch never flipped
+        // on a failed apply AND conflated binary with pack versions, so the
+        // card haunted the desktop for its full 90s); bin\.version stays as
+        // the secondary "new GUI booted and bin-sync deployed" signal.
         if self.landed.is_none() && self.last_poll.elapsed() > Duration::from_millis(250) {
             self.last_poll = Instant::now();
+            let pack = self.root.as_deref().and_then(read_pack_version);
             let sidecar = crate::state::data_dir().join("bin").join(".version");
             let deployed = std::fs::read_to_string(sidecar).unwrap_or_default();
-            if deployed.trim() == self.to {
+            if swap_landed(pack.as_deref(), self.initial_pack.as_deref(), &self.to)
+                || deployed.trim() == self.to
+            {
                 self.landed = Some(Instant::now());
             }
             ctx.request_repaint_after(Duration::from_millis(250));
@@ -223,11 +266,18 @@ impl eframe::App for UpdatingUi {
 }
 
 /// Standalone branded window covering the apply→relaunch gap. Spawned by the
-/// update engine right before the daemon quiesce (update.rs::apply).
-pub fn run_updating(from: String, to: String) -> anyhow::Result<()> {
+/// update engine right before the daemon quiesce (update.rs::apply); `root`
+/// is the Velopack install root (may be empty — dev/unlocatable).
+pub fn run_updating(from: String, to: String, root: String) -> anyhow::Result<()> {
+    let root = (!root.trim().is_empty()).then(|| std::path::PathBuf::from(root));
+    // Baseline read BEFORE the swap can start (the helper spawns ahead of
+    // the daemon quiesce, which itself precedes the Update.exe handoff).
+    let initial_pack = root.as_deref().and_then(read_pack_version);
     let app = UpdatingUi {
         from: if from.is_empty() { "?".into() } else { from },
         to: if to.is_empty() { "?".into() } else { to },
+        root,
+        initial_pack,
         started: Instant::now(),
         landed: None,
         last_poll: Instant::now() - Duration::from_secs(1),
@@ -247,8 +297,23 @@ pub fn run_updating(from: String, to: String) -> anyhow::Result<()> {
 
 // ─────────────────────────── uninstall window ───────────────────────────
 
+/// The card's live verdict (v0.1.2): Working while the install dir still
+/// exists inside the time cap; Done the moment it is gone; Failed — honest
+/// copy, never "Uninstalled" — when the cap expires with the dir surviving
+/// (the field shape: a CWD-holder blocked Velopack's rmdir, ARP was already
+/// gone, and the old card lied success next to Setup's refusal dialog).
+#[derive(Clone, Copy, PartialEq)]
+enum UnPhase {
+    Working,
+    Done,
+    Failed,
+}
+
 struct UninstallUi {
     started: Instant,
+    /// The Velopack install root under removal (argv from the uninstall
+    /// hook); None falls back to the packId-default location.
+    root: Option<std::path::PathBuf>,
     /// Two-click confirm for "Delete my data too" (3s arm window).
     delete_armed: Option<Instant>,
     data_deleted: bool,
@@ -258,46 +323,59 @@ struct UninstallUi {
 }
 
 impl UninstallUi {
-    /// Uninstall is finished once Velopack's install dir is gone (checked
-    /// live), with a time cap so a stuck Update.exe can't wedge the window.
-    fn uninstall_done(&self) -> bool {
-        if self.started.elapsed() > Duration::from_secs(30) {
-            return true;
+    /// Live check of the actual install root (v0.1.2: the real root rides
+    /// argv — the old hardcoded `AIPulseDaily.Pulse` watched the wrong dir
+    /// for packId-isolated installs), with a time cap that now reports
+    /// FAILURE instead of declaring success over a surviving dir.
+    fn phase(&self) -> UnPhase {
+        let root = self.root.clone().unwrap_or_else(|| {
+            dirs::data_local_dir()
+                .unwrap_or_default()
+                .join("AIPulseDaily.Pulse")
+        });
+        if !root.exists() {
+            return UnPhase::Done;
         }
-        let base = dirs::data_local_dir().unwrap_or_default();
-        !base.join("AIPulseDaily.Pulse").exists()
+        if self.started.elapsed() > Duration::from_secs(30) {
+            return UnPhase::Failed;
+        }
+        UnPhase::Working
     }
 }
 
 impl eframe::App for UninstallUi {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
-        let done = self.uninstall_done();
+        let phase = self.phase();
+        let done = phase == UnPhase::Done;
         let data_dir = crate::state::data_dir();
-        let (title, sub) = if !done {
-            (
+        let (title, sub) = match phase {
+            UnPhase::Working => (
                 "Uninstalling Pulse\u{2026}".to_string(),
                 "Stopping the background daemon and removing the app.".to_string(),
-            )
-        } else if self.data_deleted {
-            (
+            ),
+            UnPhase::Failed => (
+                "Couldn't finish uninstalling".to_string(),
+                "Some app files are still in place \u{2014} close every Pulse window, \
+                 then run uninstall again."
+                    .to_string(),
+            ),
+            UnPhase::Done if self.data_deleted => (
                 "Uninstalled".to_string(),
                 "The app and its data are gone. Thanks for trying Pulse.".to_string(),
-            )
-        } else if self.delete_failed {
-            (
+            ),
+            UnPhase::Done if self.delete_failed => (
                 "Uninstalled".to_string(),
                 "Some files are still in use \u{2014} close Pulse and try again."
                     .to_string(),
-            )
-        } else {
-            (
+            ),
+            UnPhase::Done => (
                 "Uninstalled".to_string(),
                 format!(
                     "Your sessions and settings were kept at {} \u{2014} reinstalling brings every terminal back.",
                     data_dir.display()
                 ),
-            )
+            ),
         };
         // Disarm quietly after the window lapses.
         if self
@@ -307,10 +385,12 @@ impl eframe::App for UninstallUi {
             self.delete_armed = None;
         }
         let mut close = false;
-        if card_chrome(ui, &title, &sub, !done) {
+        // Spinner only while genuinely working — a Failed card must not
+        // keep animating progress that is not happening.
+        if card_chrome(ui, &title, &sub, phase == UnPhase::Working) {
             close = true;
         }
-        if done {
+        if phase != UnPhase::Working {
             let rect = ui.max_rect();
             // Buttons bottom-right: primary Close, ghost armed
             // delete-my-data (opt-in, never the default).
@@ -340,7 +420,7 @@ impl eframe::App for UninstallUi {
             if presp.clicked() {
                 close = true;
             }
-            if !self.data_deleted {
+            if done && !self.data_deleted {
                 let armed = self.delete_armed.is_some();
                 let label = if armed {
                     "Click again to delete everything"
@@ -374,6 +454,9 @@ impl eframe::App for UninstallUi {
         if close {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
+        // Keep polling outside Done: Working watches for the rmdir, and a
+        // Failed card still flips honest if Velopack's scheduled `rmdir`
+        // lands late (it retries ~3s after the hook).
         if !done {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
@@ -381,10 +464,12 @@ impl eframe::App for UninstallUi {
 }
 
 /// Standalone branded uninstall window, spawned by the `--veloapp-uninstall`
-/// hook (main.rs::uninstall_cleanup) from a %TEMP% copy.
-pub fn run_uninstall() -> anyhow::Result<()> {
+/// hook (main.rs::uninstall_cleanup) from a %TEMP% copy. `root` is the
+/// Velopack install root being removed (may be empty — unlocatable).
+pub fn run_uninstall(root: String) -> anyhow::Result<()> {
     let app = UninstallUi {
         started: Instant::now(),
+        root: (!root.trim().is_empty()).then(|| std::path::PathBuf::from(root)),
         delete_armed: None,
         data_deleted: false,
         delete_failed: false,
@@ -493,5 +578,51 @@ impl App {
         if dismiss || pressed_outside {
             self.welcome_card = false;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v0.1.2 fix (d): the branded update card's landed signal reads the
+    /// PACK version out of `current\sq.version` (a nuspec XML) — pin the
+    /// parse against the real manifest shape Velopack writes.
+    #[test]
+    fn pack_version_parse() {
+        let nuspec = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+            <package xmlns=\"http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd\">\n\
+            <metadata>\n<id>PulseUAI.Sandbox</id>\n<version>9.0.1</version>\n\
+            <title>Pulse</title>\n</metadata>\n</package>";
+        assert_eq!(parse_pack_version(nuspec).as_deref(), Some("9.0.1"));
+        assert_eq!(
+            parse_pack_version("<version>\n 0.1.2 \n</version>").as_deref(),
+            Some("0.1.2")
+        );
+        assert_eq!(parse_pack_version("<version></version>"), None);
+        assert_eq!(parse_pack_version("no manifest here"), None);
+        assert_eq!(parse_pack_version("<version>unterminated"), None);
+    }
+
+    /// The landed verdict: flips on pack==target OR any drift from the
+    /// baseline read at card open (staging feeds pack synthetic versions
+    /// that differ from the BINARY version, so equality-with-target alone
+    /// is not enough and from-version comparison is a trap — the baseline
+    /// diff is what makes it robust). Never lands while the manifest is
+    /// unreadable (mid-swap) or unchanged.
+    #[test]
+    fn swap_landed_verdict() {
+        // Real-release shape: pack versions match the announcement.
+        assert!(swap_landed(Some("0.1.3"), Some("0.1.2"), "0.1.3"));
+        // Baseline drift wins even when the target string differs (synthetic
+        // staging packs).
+        assert!(swap_landed(Some("9.0.2"), Some("9.0.1"), "0.1.3"));
+        // Still the FROM pack ⇒ not landed (the failed-apply relaunch loop).
+        assert!(!swap_landed(Some("9.0.1"), Some("9.0.1"), "9.0.2"));
+        // Mid-swap: current\ renamed away, manifest unreadable.
+        assert!(!swap_landed(None, Some("9.0.1"), "9.0.2"));
+        // No baseline (unreadable at open): only the target match lands.
+        assert!(swap_landed(Some("9.0.2"), None, "9.0.2"));
+        assert!(!swap_landed(Some("9.0.1"), None, "9.0.2"));
     }
 }

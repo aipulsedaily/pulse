@@ -1089,10 +1089,7 @@ fn execute(cmd: Cmd) -> Result<(), CliErr> {
                 }
                 None => None,
             };
-            let cwd = cwd
-                .map(std::path::PathBuf::from)
-                .or_else(|| std::env::current_dir().ok())
-                .unwrap_or_else(|| std::path::PathBuf::from("C:\\"));
+            let cwd_arg = cwd;
             let (kind, program, args) = match kind.as_str() {
                 "claude" => (
                     TermKind::Claude {
@@ -1124,6 +1121,23 @@ fn execute(cmd: Cmd) -> Result<(), CliErr> {
                     };
                     (TermKind::Shell, prog, args)
                 }
+            };
+            // v0.1.2 kind-aware default (field bug): with no `--cwd`, a WSL
+            // shell create used to inherit THIS process's Windows cwd and
+            // land in /mnt/c/... — a Windows dir posing as a Linux world. An
+            // empty cwd lets the daemon emit `--cd ~` (the distro user's
+            // Linux home, session.rs). Every other kind keeps the honest
+            // "create here" default; an explicit `--cwd` always rides
+            // verbatim (open-this-Windows-dir-in-WSL stays a feature).
+            let is_wsl = matches!(
+                crate::state::shell_family(&kind, &program, &args),
+                crate::state::ShellFamily::WslShell { .. }
+            );
+            let cwd = match cwd_arg {
+                Some(c) => std::path::PathBuf::from(c),
+                None if is_wsl => std::path::PathBuf::new(),
+                None => std::env::current_dir()
+                    .unwrap_or_else(|_| std::path::PathBuf::from("C:\\")),
             };
             let spec = NewTerminal {
                 name,

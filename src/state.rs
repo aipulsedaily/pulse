@@ -261,6 +261,15 @@ pub struct ShellCfg {
     /// serde-default (fields are append-only-with-serde-default forever).
     #[serde(default = "default_true")]
     pub auto_reconnect: bool,
+    /// WSL (v0.1.2): print the distro welcome message (motd) on this
+    /// terminal's FIRST spawn — the pam_motd-emulation prelude that never
+    /// touches the distro's once-a-day `~/.motd_shown` stamp. Stamped at
+    /// create time by the GUI from the "Show welcome message on new
+    /// terminals" pref (default ON there); serde-default FALSE so raw-API /
+    /// ctl / probe creates and pre-v0.1.2 rows stay banner-free (automation
+    /// streams must not grow motd bytes uninvited). Restores ignore it.
+    #[serde(default)]
+    pub wsl_motd: bool,
 }
 
 impl Default for ShellCfg {
@@ -269,6 +278,7 @@ impl Default for ShellCfg {
             shell: None,
             remote_hooks: true,
             auto_reconnect: true,
+            wsl_motd: false,
         }
     }
 }
@@ -831,11 +841,17 @@ mod shell_family_tests {
         let d = ShellCfg::default();
         assert!(d.remote_hooks);
         assert!(d.auto_reconnect, "reconnect defaults ON (opt-out field)");
+        assert!(
+            !d.wsl_motd,
+            "v0.1.2: wsl_motd defaults OFF at this layer — the GUI stamps the \
+             pref at create time; ctl/probe creates stay banner-free"
+        );
         let parsed: ShellCfg = serde_json::from_str("{}").unwrap();
         assert_eq!(parsed, d);
         let old: ShellCfg = serde_json::from_str(r#"{"remote_hooks":false}"#).unwrap();
         assert!(!old.remote_hooks);
         assert!(old.auto_reconnect, "pre-proto-10 cfg keeps reconnect on");
+        assert!(!old.wsl_motd, "pre-v0.1.2 cfg loads with the banner opt-in off");
     }
 
     /// v0.1.1: the ONE effective-cwd display rule — POSIX-namespace

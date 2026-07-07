@@ -416,10 +416,18 @@ fn apply(um: &UpdateManager, shared: &Arc<Mutex<EngineShared>>, ctx: &egui::Cont
 
     set_state(shared, ctx, UpdateUiState::Applying { stage: "Restarting\u{2026}".into() });
     // Branded transition window (#34 lifecycle UI): covers the gap between
-    // this GUI exiting and the new one appearing. It watches bin\.version
-    // flip to the target and closes itself; on an apply failure it times out
-    // quietly (the toast below owns the failure story).
-    crate::spawn_lifecycle_helper(&["--updating-ui", env!("CARGO_PKG_VERSION"), &version]);
+    // this GUI exiting and the new one appearing. v0.1.2: it watches the
+    // PACK version in `<root>\current\sq.version` flip (the real swap — the
+    // helper can't self-locate from its %TEMP% copy, so the root rides
+    // argv), with bin\.version as the secondary fully-deployed beat; on an
+    // apply failure it times out quietly (the toast below owns the failure
+    // story).
+    let root = velopack::locator::auto_locate_app_manifest(
+        velopack::locator::LocationContext::FromCurrentExe,
+    )
+    .map(|l| l.get_root_dir().to_string_lossy().into_owned())
+    .unwrap_or_default();
+    crate::spawn_lifecycle_helper(&["--updating-ui", env!("CARGO_PKG_VERSION"), &version, &root]);
     // Let the paint thread observe `Applying` before the daemon goes down —
     // reconnect_if_needed early-returns from that point on (the planner-found
     // race: the 2s loop would resurrect the OLD daemon between quiesce and
@@ -431,12 +439,21 @@ fn apply(um: &UpdateManager, shared: &Arc<Mutex<EngineShared>>, ctx: &egui::Cont
         return;
     }
     log::info!("update: daemon quiesced; handing off to Update.exe (target v{version})");
-    if let Err(e) = um.apply_updates_and_restart(&info) {
-        // The daemon respawns via the reconnect loop once Applying clears.
-        push_msg(shared, ctx, true, "Update failed", e.to_string());
-        set_state(shared, ctx, UpdateUiState::Ready { version });
+    // v0.1.2 (field bug A/B): SILENT handoff. `apply_updates_and_restart`
+    // hardcodes silent=false, which makes Update.exe show its stock
+    // "Installing Update…" progress/error window on EVERY in-app update, on
+    // top of our branded card (the field "two updaters" shot). The wait_exit
+    // variant with silent=true runs the identical pipeline minus the stock
+    // UI; it returns instead of exiting, so we exit ourselves — Update.exe
+    // waits for THIS pid, then swaps `current\` and relaunches the new GUI.
+    match um.wait_exit_then_apply_updates(&info, true /*silent*/, true /*restart*/, Vec::<String>::new()) {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            // The daemon respawns via the reconnect loop once Applying clears.
+            push_msg(shared, ctx, true, "Update failed", e.to_string());
+            set_state(shared, ctx, UpdateUiState::Ready { version });
+        }
     }
-    // On success this process has already exited inside the call.
 }
 
 fn release_notes_url_for(version: &str) -> Option<String> {

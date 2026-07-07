@@ -1379,7 +1379,21 @@ impl Core {
         let bootstrap_path = if hooked {
             let token = bootstrap::mint_token();
             let write_result = if is_wsl {
-                bootstrap::write_bashrc(id, &token, bash_trailing.as_deref())
+                // v0.1.2 WSL welcome banner: fresh creates print the motd
+                // when the creating surface opted in at create time
+                // (ShellCfg.wsl_motd — the GUI stamps its Settings pref;
+                // ctl/probe creates default off). Restores/relaunches
+                // (launched_once) NEVER show it — and must never CONSUME the
+                // distro's once-a-day stamp either, so they pre-set
+                // MOTD_SHOWN instead of running the stock login chain bare.
+                let motd = if meta.launched_once {
+                    bootstrap::WslMotd::Restore
+                } else if meta.shell_cfg.as_ref().is_some_and(|c| c.wsl_motd) {
+                    bootstrap::WslMotd::Banner
+                } else {
+                    bootstrap::WslMotd::Stock
+                };
+                bootstrap::write_bashrc(id, &token, bash_trailing.as_deref(), motd)
             } else if is_ssh {
                 bootstrap::write_bashrc_remote(id, &token, bash_trailing.as_deref())
             } else if is_cmd {
