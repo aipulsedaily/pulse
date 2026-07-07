@@ -61,6 +61,44 @@ pub enum MouseButton {
     // over a MOUSE_MODE app is BY DESIGN a local selection (the mouse-first
     // copy path), and the old branch could only ever fire for a press the
     // app never received.
+    /// xterm wheel-up (button 4 ⇒ code 64): press-only events shipped to
+    /// MOUSE_MODE apps — claude's transcript scrolling rides these.
+    WheelUp = 64,
+    /// xterm wheel-down (button 5 ⇒ code 65).
+    WheelDown = 65,
+}
+
+/// Where a mouse-wheel gesture over the grid must go. Pure — unit-tested as
+/// a decision table (the "wheel sends arrow keys into claude" field bug).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WheelRoute {
+    /// The app claimed the mouse (DECSET 1000/1002/1003): ship xterm wheel
+    /// button events (64/65) and let the app scroll itself. claude keeps
+    /// ?1003h any-event tracking on and scrolls its own transcript this way
+    /// — alacritty and Windows Terminal both route mouse-mode FIRST.
+    Report,
+    /// True full-screen alt-screen app that did NOT claim the mouse, with
+    /// alternate-scroll on (DECSET 1007, default-on): wheel becomes arrow
+    /// keys (htop without mouse mode, less). The alt grid has no scrollback
+    /// by construction, so there is never a viewport to scroll here.
+    Arrows,
+    /// Scroll Pulse's own scrollback locally; the app sees nothing.
+    Viewport,
+}
+
+/// Decision table for wheel routing — the exact precedence alacritty
+/// (input.rs `scroll_terminal`) and Windows Terminal use:
+/// mouse-report wins, then the alt-screen arrows fallback, else the local
+/// viewport. Shift is the universal "scroll locally" override on both
+/// forwarding branches.
+pub fn wheel_route(mode: TermMode, shift: bool) -> WheelRoute {
+    if mode.intersects(TermMode::MOUSE_MODE) && !shift {
+        WheelRoute::Report
+    } else if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) && !shift {
+        WheelRoute::Arrows
+    } else {
+        WheelRoute::Viewport
+    }
 }
 
 pub struct EventProxy(mpsc::Sender<Event>);
@@ -1800,22 +1838,46 @@ impl TermBackend {
         bf.last_history = h;
     }
 
-    /// Scroll the viewport; in alt-screen apps translate the wheel into
-    /// arrow-key sequences (pushed to `out`).
-    pub fn scroll(&mut self, delta: i32, out: &mut Vec<u8>) {
+    /// Scroll the LOCAL viewport only (Shift+PageUp/PageDown paging — the
+    /// caller gates alt-screen). Wheel gestures route through `wheel()`,
+    /// which owns the mouse-report / arrow-key forwarding decision.
+    pub fn scroll(&mut self, delta: i32, _out: &mut Vec<u8>) {
+        if delta != 0 {
+            self.term.grid_mut().scroll_display(Scroll::Delta(delta));
+        }
+    }
+
+    /// A wheel gesture of `delta` lines (positive = up) at grid point `at`,
+    /// routed per `wheel_route`. Field bug this fixes: claude (alt-screen +
+    /// ?1003h any-event tracking, no wheel-report path here) fell through to
+    /// the alternate-scroll branch and received UP/DOWN ARROWS instead of
+    /// the wheel events it scrolls its transcript with.
+    pub fn wheel(&mut self, delta: i32, modifiers: Modifiers, at: Point, out: &mut Vec<u8>) {
         if delta == 0 {
             return;
         }
-        if self
-            .mode()
-            .contains(TermMode::ALTERNATE_SCROLL | TermMode::ALT_SCREEN)
-        {
-            let cmd = if delta > 0 { b'A' } else { b'B' };
-            for _ in 0..delta.abs() {
-                out.extend_from_slice(&[0x1b, b'O', cmd]);
+        match wheel_route(self.mode(), modifiers.shift) {
+            WheelRoute::Report => {
+                // Press-only, one event per line (xterm wheel semantics —
+                // wheel buttons never emit a release).
+                let btn = if delta > 0 {
+                    MouseButton::WheelUp
+                } else {
+                    MouseButton::WheelDown
+                };
+                for _ in 0..delta.abs() {
+                    self.mouse_report(btn, modifiers, at, true, out);
+                }
             }
-        } else {
-            self.term.grid_mut().scroll_display(Scroll::Delta(delta));
+            WheelRoute::Arrows => {
+                let cmd = if delta > 0 { b'A' } else { b'B' };
+                for _ in 0..delta.abs() {
+                    out.extend_from_slice(&[0x1b, b'O', cmd]);
+                }
+            }
+            WheelRoute::Viewport => {
+                self.term.grid_mut().scroll_display(Scroll::Delta(delta));
+            }
         }
     }
 
@@ -3810,6 +3872,137 @@ mod tests {
         out.clear();
         b.mouse_report(MouseButton::Middle, mods, at, true, &mut out);
         assert_eq!(out, b"\x1b[<1;1;1M");
+    }
+
+    // ── wheel routing (the "wheel sends arrows into claude" field fix) ──
+
+    /// Decision table: mouse-report wins, then the alt-screen arrows
+    /// fallback, else the local viewport — alacritty's (input.rs
+    /// `scroll_terminal`) and Windows Terminal's exact precedence. Shift is
+    /// the universal local-scroll override on both forwarding branches.
+    #[test]
+    fn wheel_route_decision_table() {
+        use TermMode as M;
+        let base = M::default();
+        assert!(
+            base.contains(M::ALTERNATE_SCROLL),
+            "alacritty default has alternate-scroll ON — the arrows branch \
+             needs no app opt-in, which is why every alt-screen app hit it"
+        );
+        let table: &[(TermMode, bool, WheelRoute)] = &[
+            // Plain shell, no claims: local scrollback.
+            (base, false, WheelRoute::Viewport),
+            // Full-screen TUI without mouse mode (htop default, less):
+            // arrows — the alt grid has no scrollback to scroll.
+            (base | M::ALT_SCREEN, false, WheelRoute::Arrows),
+            // Alt-screen app that RESET alternate scroll (?1007l): silence,
+            // never arrows.
+            (
+                (base - M::ALTERNATE_SCROLL) | M::ALT_SCREEN,
+                false,
+                WheelRoute::Viewport,
+            ),
+            // The claude shape: alt-screen + ?1003h any-event tracking
+            // (+?1006 SGR, irrelevant to routing) — the app claimed the
+            // mouse, wheel events go to it, NOT arrows.
+            (
+                base | M::ALT_SCREEN | M::MOUSE_MOTION | M::SGR_MOUSE,
+                false,
+                WheelRoute::Report,
+            ),
+            // Any MOUSE_MODE flavor claims the wheel, alt-screen or not
+            // (vim mouse=a is DRAG; click-only apps are REPORT_CLICK).
+            (base | M::MOUSE_REPORT_CLICK, false, WheelRoute::Report),
+            (base | M::ALT_SCREEN | M::MOUSE_DRAG, false, WheelRoute::Report),
+            // Shift overrides BOTH forwarding branches back to local.
+            (
+                base | M::ALT_SCREEN | M::MOUSE_MOTION | M::SGR_MOUSE,
+                true,
+                WheelRoute::Viewport,
+            ),
+            (base | M::ALT_SCREEN, true, WheelRoute::Viewport),
+            (base, true, WheelRoute::Viewport),
+        ];
+        for &(mode, shift, want) in table {
+            assert_eq!(
+                wheel_route(mode, shift),
+                want,
+                "mode={mode:?} shift={shift}"
+            );
+        }
+    }
+
+    /// Byte-level goldens through `TermBackend::wheel` with modes set by
+    /// real DECSET sequences (not hand-built flags).
+    #[test]
+    fn wheel_goldens_by_session_shape() {
+        let at = Point::new(Line(0), Column(0));
+        let none = Modifiers::NONE;
+        let shift = Modifiers::SHIFT;
+
+        // claude: ?1049h alt + ?1003h any-event + ?1006h SGR. Wheel up/down
+        // = SGR wheel buttons 64/65, press-only, one per line; the local
+        // viewport never moves; arrows never appear.
+        let mut b = TermBackend::new(GridSize::default());
+        b.advance(b"\x1b[?1049h\x1b[?1003h\x1b[?1006h");
+        let mut out = Vec::new();
+        b.wheel(1, none, at, &mut out);
+        assert_eq!(out, b"\x1b[<64;1;1M", "wheel-up = SGR button 64 press");
+        out.clear();
+        b.wheel(-2, none, at, &mut out);
+        assert_eq!(
+            out, b"\x1b[<65;1;1M\x1b[<65;1;1M",
+            "wheel-down = one button-65 event per line"
+        );
+        assert_eq!(b.term.grid().display_offset(), 0);
+        // Shift+wheel goes local (silent no-op on the historyless alt grid).
+        out.clear();
+        b.wheel(3, shift, at, &mut out);
+        assert!(out.is_empty(), "shift-wheel never reaches a mouse-mode app");
+
+        // Legacy mouse app (?1000h, no SGR): X10-encoded wheel bytes.
+        let mut b = TermBackend::new(GridSize::default());
+        b.advance(b"\x1b[?1000h");
+        let mut out = Vec::new();
+        b.wheel(1, none, at, &mut out);
+        assert_eq!(
+            out,
+            vec![0x1b, b'[', b'M', 32 + 64, 33, 33],
+            "legacy wheel-up is code 96 at the hovered cell"
+        );
+
+        // htop/less shape: alt-screen, NO mouse mode — the arrows fallback
+        // stays byte-identical to the old behavior.
+        let mut b = TermBackend::new(GridSize::default());
+        b.advance(b"\x1b[?1049h");
+        let mut out = Vec::new();
+        b.wheel(2, none, at, &mut out);
+        assert_eq!(out, b"\x1bOA\x1bOA");
+        out.clear();
+        b.wheel(-1, none, at, &mut out);
+        assert_eq!(out, b"\x1bOB");
+
+        // Alt-screen app that reset alternate scroll (?1007l): silence.
+        let mut b = TermBackend::new(GridSize::default());
+        b.advance(b"\x1b[?1049h\x1b[?1007l");
+        let mut out = Vec::new();
+        b.wheel(1, none, at, &mut out);
+        assert!(out.is_empty(), "?1007l means no arrows");
+        assert_eq!(b.term.grid().display_offset(), 0, "alt grid has no history");
+
+        // Plain shell with history: wheel scrolls Pulse's scrollback, the
+        // app sees nothing (bytes empty), and wheel-down comes back.
+        let mut b = bhist(40, 4, 100);
+        for i in 0..10 {
+            b.advance_live(format!("line{i}\r\n").as_bytes());
+        }
+        let mut out = Vec::new();
+        b.wheel(2, none, at, &mut out);
+        assert!(out.is_empty(), "local scrolling writes no PTY bytes");
+        assert_eq!(b.term.grid().display_offset(), 2);
+        b.wheel(-1, none, at, &mut out);
+        assert!(out.is_empty());
+        assert_eq!(b.term.grid().display_offset(), 1);
     }
 
     // ── QOL: Select all (§3.2) ────────────────────────────────────────

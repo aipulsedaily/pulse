@@ -912,6 +912,32 @@ pub struct LauncherOut {
     pub new_folder: bool,
 }
 
+/// A row chosen in the footer folder-target popup. The popup (and the whole
+/// footer lane) renders in BOTH hosts — overlay and the §6.1 empty-state
+/// embed (field fix: the zero-terminal first run had no folder affordance).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FolderPick {
+    /// "(no folder)" — new terminals land ungrouped.
+    None_,
+    /// An existing folder becomes the spawn target.
+    Folder(Uuid),
+    /// "New folder…" — the App opens Modal::NewFolder (works with zero
+    /// terminals; the created folder arrives via the next Snapshot and
+    /// shows in the sidebar immediately).
+    New,
+}
+
+/// Apply a folder-popup pick to the launcher state. Pure — shared by the
+/// overlay and the embed, unit-tested (§12.1).
+pub fn apply_folder_pick(st: &mut LauncherState, pick: FolderPick, out: &mut LauncherOut) {
+    match pick {
+        FolderPick::None_ => st.folder = None,
+        FolderPick::Folder(id) => st.folder = Some(id),
+        FolderPick::New => out.new_folder = true,
+    }
+    st.folder_menu = false;
+}
+
 enum RowRef {
     Typed,
     Cand(u32),
@@ -1322,8 +1348,12 @@ pub fn view(ui: &mut egui::Ui, st: &mut LauncherState, vc: &ViewCtx) -> Launcher
         }
     }
 
-    // ── footer lane (28px, §4.2) — overlay only; the embed has no folders UI ──
-    if !vc.embedded {
+    // ── footer lane (28px, §4.2) — overlay AND the §6.1 empty-state embed.
+    // The embed used to skip it entirely, leaving the zero-terminal first
+    // run with no way to create or target a folder (field report). Same
+    // quiet grammar in both hosts; only the Esc hint differs (the embed
+    // never closes on Esc).
+    {
         ui.add_space(4.0);
         let (frect, _) = ui.allocate_exact_size(Vec2::new(width, 28.0), Sense::hover());
         let p = ui.painter().clone();
@@ -1356,7 +1386,11 @@ pub fn view(ui: &mut egui::Ui, st: &mut LauncherState, vc: &ViewCtx) -> Launcher
         p.text(
             Pos2::new(frect.max.x - 12.0, frect.center().y),
             Align2::RIGHT_CENTER,
-            "Enter creates  \u{00b7}  Esc",
+            if vc.embedded {
+                "Enter creates"
+            } else {
+                "Enter creates  \u{00b7}  Esc"
+            },
             FontId::proportional(11.0),
             TEXT_FAINT,
         );
@@ -1554,12 +1588,7 @@ fn folder_menu(
             .show(ui, |ui| {
                 ui.set_width(200.0);
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
-                enum Pick {
-                    None_,
-                    Folder(Uuid),
-                    New,
-                }
-                let mut pick: Option<Pick> = None;
+                let mut pick: Option<FolderPick> = None;
                 let row = |ui: &mut egui::Ui, key: usize, label: &str, dim: bool| -> bool {
                     let (rect, resp) = ui
                         .allocate_exact_size(Vec2::new(200.0, 24.0), Sense::click());
@@ -1582,30 +1611,18 @@ fn folder_menu(
                     resp.clicked()
                 };
                 if row(ui, 0, "(no folder)", st.folder.is_some()) {
-                    pick = Some(Pick::None_);
+                    pick = Some(FolderPick::None_);
                 }
                 for (i, f) in folders.iter().enumerate() {
                     if row(ui, i + 1, &f.name, false) {
-                        pick = Some(Pick::Folder(f.id));
+                        pick = Some(FolderPick::Folder(f.id));
                     }
                 }
                 if row(ui, usize::MAX, "New folder\u{2026}", true) {
-                    pick = Some(Pick::New);
+                    pick = Some(FolderPick::New);
                 }
-                match pick {
-                    Some(Pick::None_) => {
-                        st.folder = None;
-                        st.folder_menu = false;
-                    }
-                    Some(Pick::Folder(id)) => {
-                        st.folder = Some(id);
-                        st.folder_menu = false;
-                    }
-                    Some(Pick::New) => {
-                        out.new_folder = true;
-                        st.folder_menu = false;
-                    }
-                    None => {}
+                if let Some(pick) = pick {
+                    apply_folder_pick(st, pick, out);
                 }
             });
     });
@@ -2216,5 +2233,40 @@ mod tests {
         let d = default_spawn("C:\\");
         assert_eq!(d.kind_tag, "powershell");
         assert_ne!(d.cwd, PathBuf::from("C:\\"));
+    }
+
+    /// Field fix: the §6.1 empty-state EMBED carries the full folder flow.
+    /// "New folder…" raises `new_folder` (App opens Modal::NewFolder — works
+    /// with zero terminals), an existing folder becomes the spawn target,
+    /// "(no folder)" clears it; every pick closes the popup. Same pure path
+    /// the overlay uses — one grammar, both hosts.
+    #[test]
+    fn embed_folder_flow_picks() {
+        let mut st = LauncherState::new(None, true, Vec::new(), Vec::new());
+        assert!(st.embedded, "fixture is the empty-state embed");
+
+        // New folder… from the embed with zero terminals.
+        st.folder_menu = true;
+        let mut out = LauncherOut::default();
+        apply_folder_pick(&mut st, FolderPick::New, &mut out);
+        assert!(out.new_folder, "embed pick must open Modal::NewFolder");
+        assert!(!st.folder_menu, "pick closes the popup");
+        assert_eq!(st.folder, None, "target unchanged until the user picks one");
+
+        // Target an existing folder, then clear it.
+        let fid = Uuid::new_v4();
+        st.folder_menu = true;
+        let mut out = LauncherOut::default();
+        apply_folder_pick(&mut st, FolderPick::Folder(fid), &mut out);
+        assert_eq!(st.folder, Some(fid));
+        assert!(!out.new_folder && !st.folder_menu);
+        st.folder_menu = true;
+        apply_folder_pick(&mut st, FolderPick::None_, &mut LauncherOut::default());
+        assert_eq!(st.folder, None);
+        assert!(!st.folder_menu);
+
+        // Esc layering in the embed: an open folder popup consumes the Esc
+        // (CloseFolderMenu) — the embed itself still never closes.
+        assert_eq!(esc_act(true, false, false), EscAct::CloseFolderMenu);
     }
 }

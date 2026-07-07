@@ -844,7 +844,21 @@ fn process_input(
                     MouseWheelUnit::Page => delta.y * backend.size.rows as f32,
                 };
                 if lines != 0.0 {
-                    backend.scroll(lines as i32, &mut out.write);
+                    // Routed per wheel_route (term_backend): MOUSE_MODE apps
+                    // (claude keeps ?1003h on) get xterm wheel events at the
+                    // hovered cell; hookless full-screen TUIs keep the
+                    // alternate-scroll arrow fallback; everything else
+                    // scrolls Pulse's local scrollback. The wheel event
+                    // carries no position — resolve the live hover pos, fall
+                    // back to the last motion-tracked cell.
+                    let at = ctx
+                        .pointer_hover_pos()
+                        .map(|p| {
+                            let rel = p - content_rect.min;
+                            backend.selection_point(rel.x, rel.y)
+                        })
+                        .unwrap_or(vs.mouse_grid);
+                    backend.wheel(lines as i32, wheel_mods, at, &mut out.write);
                 }
             }
             egui::Event::PointerButton {
