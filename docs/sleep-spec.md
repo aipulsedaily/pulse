@@ -120,7 +120,7 @@ launch() clears the flag in the SAME `mutate` that sets Running (S3).
 |---|---|---|
 | Hooked shell at idle prompt (quiet ≥3 s, no open block) | pass | instant: flag → drain (returns in ~1 tick) → kill → Asleep |
 | Claude-kind terminal, REPL idle (alt-screen, quiet) | pass | instant — THE headline case; alt-screen alone never gates (S7) |
-| Open block running (`ping -t`, build, …) | gated | GUI: confirm modal naming the cmd; Ctl: refuse `busy` unless `--force`. On proceed: the block closes dangling exit=None at on_exit — the reboot-mid-command shape |
+| Open block running (`ping -t`, build, …) | gated | GUI: confirm modal naming the cmd; Ctl: refuse `busy` unless `--force`. On proceed: the block closes dangling exit=None at on_exit — the reboot-mid-command shape. §17.5 refinement: an open block whose session sits QUIET on the ALT SCREEN does NOT gate — that is the "quiet TUI at rest" pass row below, and the block exists only because of how the TUI was launched (typed at a hooked prompt / `tc run claude`) |
 | Claude mid-response (output flowing) | gated | same as above; on proceed the stream cuts — `--resume` recovers the conversation to the last jsonl-persisted message; the in-flight turn may be partial (documented, §12) |
 | Quiet alt-screen TUI (vim at rest) | pass | dies exactly as a reboot would kill it today; the folder modal lists the terminal by name/OSC title first (S7/S8) |
 | ssh session | pass/gated by same rules | kill = deliberate link drop; wake = fresh `ssh` + one-shot rc (auth prompt renders honestly if keys/agent absent) — mechanically Dead+Restart, semantically "user shelved it" (§12) |
@@ -324,12 +324,14 @@ tc wake  --folder <name>
 ### 7.2 Top bar + central
 - Bar action slot (mod.rs ~3005): presented Asleep → accent "Wake" ghost button (exact
   Restore pattern, sends RestartTerminal); Sleeping → disabled dim "sleeping…" text.
-- Central grid: UNCHANGED (S12) — frozen last frame stays selectable/copyable/searchable;
-  the wake resync replaces it. Claude-kind asleep terminals therefore keep showing the
-  conversation TUI frame until wake (better than Dead's post-mortem primary-grid view —
-  an accepted, deliberate asymmetry).
+- Central grid (§17 supersedes the S12 wording): on the sleep's Exited the GUI
+  re-attaches through the dead-attach path — serialized scrollback underlay + the
+  pre-kill frame sidecar replayed on the alt grid — so the frozen conversation frame
+  survives the TUI's own graceful-exit wipe, GUI restarts, and reboots alike. A subtle
+  whole-grid dim wash (term_view, `ViewOpts.asleep`) marks the frame as not-live;
+  selection/copy keep working on it.
 - Dashboard tiles: presented Asleep renders the moon in the tile's dot slot; preview =
-  the frozen backend grid (free).
+  the frozen backend grid (free — with §17 the claude cards preview the real frame).
 
 ### 7.3 Composer / strip
 - `RawReason::Asleep` (composer.rs Raw enum): set from drain_ipc when the presented
@@ -362,8 +364,9 @@ tc wake  --folder <name>
   `history_run_allowed` (needs Running) — the button renders dim; no new rule.
 - GUI reconnect while terminals asleep: apply_snapshot attaches all (dead-attach
   machinery), ReplayAnchors re-mint covers — the reopened view of an asleep terminal is
-  the standard reconstructed history (alt-screen tails reconstruct the primary grid via
-  the alt-cut machinery; the frozen TUI frame is a live-GUI-session-only bonus).
+  the standard reconstructed history, and for alt-screen sessions the §17 frame sidecar
+  replays the frozen TUI frame on top (hints are skipped under the overlay, exactly
+  like the live alt-screen attach arm).
 
 ---
 
@@ -524,7 +527,7 @@ design — the flood-CPU precedent); the §9 numbers live in this spec, not in p
 | Blind `SetAutoRestore` on an asleep terminal | allowed; persists; still skipped while asleep (documented: asleep wins, auto_restore applies after wake — inv. 6) |
 | GUI reconnect / restart with asleep terminals | dead-attach machinery: serialize_dead replay (alt-cut safe) + Blocks full + ReplayAnchors covers — full history view, search, copy (§7.5) |
 | History popup / BlockText / ReadTail on asleep | journal-backed, session-free — verified zero-change (§7.5) |
-| Asleep terminal's frozen alt-frame vs reopen | live GUI keeps the TUI frame until wake; a reopened GUI shows the reconstructed primary grid (existing alt-cut contract) — asymmetry documented, not a bug |
+| Asleep terminal's frozen alt-frame vs reopen | SUPERSEDED by §17: the pre-kill frame sidecar serves the SAME frozen alt frame to the live GUI (Exited re-attach), a reopened GUI, and a post-reboot attach — the v1 asymmetry is gone. Missing/corrupt sidecar degrades to the old reconstructed-primary view |
 | NeedsYou/burst at sleep instant | cleared (S13); never latches again while asleep (no output can arrive) |
 | Multi-GUI | flag rides Snapshot — all clients converge; sleep from GUI A dims the row in GUI B |
 | cmd/wsl family sleep | family-agnostic: drain+kill+launch are family-blind; wake re-injects PROMPT env / rcfile per family (launch() synthesis) |
@@ -605,3 +608,81 @@ the normal suite + probe bar.
 12. **DO NOT assert RSS bands in probes** — process absence is the deterministic
     reclaim proxy; RSS numbers live in this spec with their methodology (§9), machine-
     dependent by design.
+
+---
+
+## 17. Freeze-frame addendum (sleep-freeze pass)
+
+Field finding (staging-proven, byte-verified): the sleep kill is NOT a freeze for
+graceful alt-screen apps. The ConPTY console-close runs claude's exit handler, which
+emits `?1049l`, a "Resume this session with: claude --resume <id>" hint, and a
+full-screen erase — all ingested into the mirror and the journal BEFORE EOF. The erase
+blanks even the primary screen's rows IN PLACE (nothing scrolls into history), so **no
+journal re-parse can ever recover the conversation frame** — every "reconstruct harder"
+design is dead on arrival, and the S12 "frozen last frame" a live GUI kept was in fact
+the WIPED grid. Hard-killed TUIs (htop) never run exit handlers; the existing
+alt-cut/alt_frame_fix machinery already preserves their frames.
+
+### 17.1 Capture (daemon, `sleep_terminals` step 4.5)
+Between the shared drain and the kill — the only moment the pre-wipe frame exists,
+GUI-attached or headless — each ALT-SCREEN target's mirror grid is serialized
+(`serialize::capture_alt_frame`: absolute per-row CUP, auto-wrap off, cursor +
+visibility restored) and written to `journals/<id>.frame`. Primary-screen sessions get
+no frame (their journal reconstruction is already faithful — v1 scope). Capture runs on
+the sleep worker thread (zero awake-path cost; folder sleeps pay ms-class serial
+captures), and ANY failure logs and proceeds: the frame is decoration; the journal
+stays the source of truth.
+
+Immediately after the capture the dying session's live fanout is MUTED
+(`Session.mute_fanout`): the teardown bytes (the wipe + conhost's `?9001l ?1004l`
+trailer) still hit the journal — mirror purity, DO-NOT 1/7 — but no longer repaint
+attached GUIs, whose last live frame therefore IS the freeze-frame.
+
+### 17.2 Sidecar format (`journals/<id>.frame`)
+`"PFRZ"` · version u8 · cols u16 · rows u16 · flags u8 (bit0 = alt) · len u32 ·
+ANSI payload · crc32 (LE throughout; `daemon/frame.rs`). 2 MB payload cap. Written
+atomically (tmp + rename). ANY mismatch — magic/version/len/cap/truncation/crc — reads
+as absent and deletes the file: the reader can never crash, block, or serve garbage.
+
+### 17.3 Serving — one path for live-sleep, GUI reopen, and reboot
+The dead-attach arm (Attach handler): when `meta.asleep` and a valid alt frame exists,
+replay = `serialize_dead` underlay + `?1049h` + frame bytes. Live-TUI semantics: the
+scrollback exists under the alt grid, the frame floats on it, replay-anchor hints are
+skipped (their rows point into the hidden primary — same rule as the live alt-screen
+arm). The GUI, on a sleep's `Exited`, swaps in a fresh backend and re-sends `Attach`
+(the D2C::Reset pattern) — zero new wire variants, zero proto bump, multi-GUI coherent.
+Resize-while-asleep policy: the frame replays at CAPTURED geometry; foreign sizes clip
+(absolute rows clamp, no re-flow) — live-TUI parity. Wake is v1: the frame file is
+removed in launch()'s success mutate and the successor TUI repaints from scratch (brief
+blank accepted; overlay-until-first-output is the phase-2 polish).
+
+### 17.4 Lifecycle + privacy
+Removed on wake success (launch mutate), terminal delete (`delete_terminal_inner`), and
+by the existing boot orphan-reap (uuid-leading predicate covers `*.frame` /
+`*.frame.tmp`). Overwritten on every sleep; kept if the wake spawn FAILS (the view
+stays honest). Privacy: the journal already persists strictly more screen content than
+the frame, and the frame's retention is shorter (dies at wake) — no new consent
+surface.
+
+### 17.5 Busy-gate refinement (the `tc run claude` friction bug)
+`sleep_busy_evidence` (daemon) and `sleep_gate_evidence` (GUI) exempt an open block
+when the session is on the ALT SCREEN **and** output-quiet (≥ SLEEP_QUIET_MS). A TUI
+launched as a command (typed `claude`, `tc run claude`, vim, htop) holds its block open
+for its whole run, which made the S7 gate contradict this spec's own pass rows ("REPL
+idle — THE headline case", "quiet alt-screen TUI at rest"). Streaming TUIs still gate
+on output; primary-screen commands (`ping -t`, builds) still gate on their block.
+`--force` semantics are unchanged.
+
+### 17.6 UX
+Subtle whole-grid dim wash over the frozen frame while presented Asleep/Sleeping
+(term_view `ViewOpts.asleep`, ~16% black — readable frame first) on top of the existing
+moon + dimmed name. Dashboard preview cards read the frame through the normal backend
+(free). No banner, no seam text.
+
+### 17.7 Probes
+- **P-S4 `sleep_freeze_frame`**: a hooked shell raw-types a synthetic alt TUI that
+  stays running (open block) → no-force sleep PASSES (17.5) → `.frame` exists and holds
+  the row text → a fresh attach replay contains the serialized underlay THEN `?1049h` +
+  the frame rows → wake → frame file gone, hooked prompt back.
+- **P-S5 `frame_corrupt_degrade`**: corrupt/truncate the sidecar → attach falls back to
+  the plain serialize_dead replay, the file is removed, no error surfaces, wake works.

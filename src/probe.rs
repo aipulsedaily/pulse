@@ -147,6 +147,16 @@
 //!                 sleep off ONE drain window (wall-clock bound); WakeFolder
 //!                 staggers both prompts back; a dead non-asleep member is
 //!                 untouched both ways
+//!   sleep_freeze_frame  SLEEP P-S4 (§17): a quiet alt-screen TUI with an
+//!                 OPEN block sleeps no-force (the tc-run-claude gate fix);
+//!                 the pre-kill frame lands in journals/<id>.frame (crc,
+//!                 alt-flagged, row text intact); a fresh attach replays
+//!                 underlay THEN ?1049h + frame with hints skipped; wake
+//!                 removes the sidecar and restores a hooked prompt
+//!   frame_corrupt_degrade  SLEEP P-S5 (§17): a primary sleep writes NO
+//!                 frame; a planted corrupt/truncated sidecar degrades an
+//!                 attach to the plain reconstruction (no ?1049h), is
+//!                 removed on first read, and never blocks the wake
 //!   banner        (#31) the version-faithful PS/cmd startup banner reproduces
 //!                 once per real spawn and dedupes on restore — the user's
 //!                 journal collapses from many banners to one
@@ -2804,12 +2814,45 @@ struct AttachView {
 }
 
 fn attach_view(id: Uuid, cols: u16, rows: u16, secs: u64) -> anyhow::Result<AttachView> {
+    attach_view_inner(id, cols, rows, secs, true)
+}
+
+/// attach_view for attaches that may legitimately send NO ReplayAnchors —
+/// the frame-overlay path skips hints by design (sleep-spec §17.3). Once
+/// Replay/StreamPos/Blocks are in, a ~2s grace window catches a straggler
+/// anchors frame (returned so the caller can assert about it); the window
+/// closing empty returns hints=[].
+fn attach_view_tolerant(id: Uuid, cols: u16, rows: u16, secs: u64) -> anyhow::Result<AttachView> {
+    attach_view_inner(id, cols, rows, secs, false)
+}
+
+fn attach_view_inner(
+    id: Uuid,
+    cols: u16,
+    rows: u16,
+    secs: u64,
+    require_hints: bool,
+) -> anyhow::Result<AttachView> {
     let mut c = Conn::open()?;
     let _ = c.first_snapshot()?;
     c.send(&C2D::Attach { id, cols, rows })?;
     let (mut replay, mut saw_sp, mut recs) = (None, false, None);
     let deadline = Instant::now() + Duration::from_secs(secs);
+    // Anchors-straggler grace (tolerant mode): armed when the rest is in.
+    let mut grace: Option<Instant> = None;
     loop {
+        if !require_hints {
+            if grace.is_none() && replay.is_some() && saw_sp && recs.is_some() {
+                grace = Some(Instant::now() + Duration::from_secs(2));
+            }
+            if grace.is_some_and(|g| Instant::now() >= g) {
+                return Ok(AttachView {
+                    replay: replay.expect("checked above"),
+                    recs: recs.expect("checked above"),
+                    hints: Vec::new(),
+                });
+            }
+        }
         anyhow::ensure!(
             Instant::now() < deadline,
             "no ReplayAnchors within {secs}s (replay={} streampos={saw_sp} blocks={})",
@@ -8149,6 +8192,234 @@ fn case_sleep_waiters_folder() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// P-S4 `sleep_freeze_frame` (sleep-spec §17): the freeze-frame pipeline
+/// end-to-end on a synthetic quiet alt-screen TUI that STAYS RUNNING (open
+/// block — the `tc run claude` shape). (1) The S7 refinement lets the
+/// no-force sleep pass despite the open block; (2) the pre-kill capture
+/// lands in journals/<id>.frame, crc-valid, alt-flagged, holding the TUI's
+/// row text; (3) a fresh attach replay carries the serialized underlay THEN
+/// `?1049h` + the frame bytes, with ReplayAnchors hints skipped under the
+/// overlay; (4) wake removes the sidecar, restores a hooked prompt, and the
+/// dangling block closed exit=None.
+fn case_sleep_freeze_frame() -> anyhow::Result<()> {
+    ensure_isolated_daemon("sleep_freeze_frame")?;
+    let log0 = daemon_log_len();
+    let master = master_token()?;
+    let mut legacy = Conn::open()?;
+    let _ = legacy.first_snapshot()?;
+    let id = create_probe_terminal(&mut legacy, "__probe_sleep_frz__")?;
+    let mut c = Conn::open_ctl(&master, None)?;
+    let mut rid = 6300u64;
+
+    // A synthetic idle TUI: enter the alt screen, print rows, park. Runs via
+    // a temp script so no escape bytes need to survive prompt quoting.
+    let script = std::env::temp_dir().join("tc_probe_freeze_tui.ps1");
+    std::fs::write(
+        &script,
+        concat!(
+            "$e=[char]27\n",
+            "[Console]::Write(\"$e[?1049h$e[2J$e[H\")\n",
+            "[Console]::Write(\"FRZ ROW ONE`r`nFRZ ROW TWO`r`n\")\n",
+            "[Console]::Write(\"$e[5;3HFRZ DEEP CELL\")\n",
+            "Start-Sleep 120\n",
+        ),
+    )?;
+    match ctl_run_retry(
+        &mut c,
+        &mut rid,
+        id,
+        &format!(
+            "powershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
+            script.display()
+        ),
+        None,
+        25,
+    )? {
+        CtlBody::RunStarted { .. } => {}
+        other => anyhow::bail!("TUI Run returned {other:?}"),
+    }
+    // Alt screen live in the daemon mirror, rows drawn, block open.
+    {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            rid += 1;
+            let alt_live = match c.ctl(rid, CtlRequest::ReadScreen { id }, 10)? {
+                CtlBody::Screen { lines, alt_screen, .. } => {
+                    alt_screen && lines.iter().any(|l| l.contains("FRZ ROW ONE"))
+                }
+                other => anyhow::bail!("ReadScreen returned {other:?}"),
+            };
+            let block_open = ctl_read_blocks(&mut c, &mut rid, id)?
+                .iter()
+                .any(|r| r.cmd.contains("tc_probe_freeze_tui") && r.end_off.is_none());
+            if alt_live && block_open {
+                break;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "synthetic TUI never settled (alt={alt_live} open={block_open})"
+            );
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+
+    // §17.5: quiet ≥ SLEEP_QUIET_MS ⇒ the open block does NOT gate. Busy
+    // retries only ride out the quiet window (the TUI parks for 120s, so a
+    // REGRESSED gate stays busy past the deadline and still fails here).
+    std::thread::sleep(Duration::from_millis(3200));
+    {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            rid += 1;
+            match c.ctl(
+                rid,
+                CtlRequest::Sleep { id, force: false, force_self: false },
+                20,
+            )? {
+                CtlBody::Done => break,
+                CtlBody::Err { code, .. } if code == "busy" && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                other => anyhow::bail!(
+                    "no-force sleep of a quiet alt-screen TUI must pass (S7 refinement): {other:?}"
+                ),
+            }
+        }
+    }
+    await_listing_status(&mut c, &mut rid, id, "asleep", 10)?;
+
+    // The frame sidecar: present, decodable, alt-flagged, rows intact.
+    let fpath = crate::daemon::frame::path(id);
+    let f = crate::daemon::frame::decode(&std::fs::read(&fpath)?)
+        .ok_or_else(|| anyhow::anyhow!("frame sidecar failed to decode"))?;
+    anyhow::ensure!(f.alt, "frame must be alt-flagged");
+    anyhow::ensure!(f.cols >= 2 && f.rows >= 2, "frame geometry {}x{}", f.cols, f.rows);
+    let ftext = String::from_utf8_lossy(&f.bytes).into_owned();
+    for needle in ["FRZ ROW ONE", "FRZ ROW TWO", "FRZ DEEP CELL"] {
+        anyhow::ensure!(ftext.contains(needle), "frame lost {needle:?}: {ftext:?}");
+    }
+
+    // Attach replay: underlay first, then ?1049h + the frame; hints skipped.
+    let vb = attach_view_tolerant(id, 120, 30, 20)?;
+    let rtext = String::from_utf8_lossy(&vb.replay).into_owned();
+    let alt_pos = rtext
+        .find("\x1b[?1049h")
+        .ok_or_else(|| anyhow::anyhow!("asleep attach replay carries no alt overlay"))?;
+    anyhow::ensure!(alt_pos > 0, "the overlay must FOLLOW a serialized underlay");
+    let frame_pos = rtext
+        .rfind("FRZ DEEP CELL")
+        .ok_or_else(|| anyhow::anyhow!("frame rows missing from the replay"))?;
+    anyhow::ensure!(
+        frame_pos > alt_pos,
+        "frame rows must land after the alt enter (frame {frame_pos} vs alt {alt_pos})"
+    );
+    anyhow::ensure!(
+        vb.hints.is_empty(),
+        "hints must be skipped under a frame overlay (rows point into the hidden primary)"
+    );
+
+    // Wake: sidecar gone, hooked prompt back, dangling block closed honest.
+    rid += 1;
+    match c.ctl(rid, CtlRequest::Wake { id }, 20)? {
+        CtlBody::Done => {}
+        other => anyhow::bail!("Wake returned {other:?}"),
+    }
+    await_hooked_prompt(&mut c, &mut rid, id, 15)?;
+    anyhow::ensure!(
+        !fpath.exists(),
+        "frame sidecar must be removed by the wake's success path"
+    );
+    let recs = ctl_read_blocks(&mut c, &mut rid, id)?;
+    let tui = recs
+        .iter()
+        .find(|r| r.cmd.contains("tc_probe_freeze_tui"))
+        .ok_or_else(|| anyhow::anyhow!("TUI block lost across sleep/wake"))?;
+    anyhow::ensure!(
+        tui.end_off.is_some() && tui.exit.is_none(),
+        "dangling TUI block should close exit=None (end {:?}, exit {:?})",
+        tui.end_off,
+        tui.exit
+    );
+    ensure_no_new_panics(log0)?;
+    let _ = std::fs::remove_file(&script);
+    delete_terminal(&mut legacy, id);
+    Ok(())
+}
+
+/// P-S5 `frame_corrupt_degrade` (sleep-spec §17.2): a primary-screen sleep
+/// writes NO frame; a planted garbage sidecar and a truncated-real-encode
+/// sidecar each degrade the asleep attach to the plain serialize_dead replay
+/// (no `?1049h`), are REMOVED on first read, and never surface an error or
+/// block the wake.
+fn case_frame_corrupt_degrade() -> anyhow::Result<()> {
+    ensure_isolated_daemon("frame_corrupt_degrade")?;
+    let log0 = daemon_log_len();
+    let master = master_token()?;
+    let mut legacy = Conn::open()?;
+    let _ = legacy.first_snapshot()?;
+    let id = create_probe_terminal(&mut legacy, "__probe_frame_corrupt__")?;
+    let mut c = Conn::open_ctl(&master, None)?;
+    let mut rid = 6400u64;
+
+    // Idle primary-screen sleep: no frame by design (v1 scope). The fresh
+    // spawn's boot output can hold the quiet window open — ride it out.
+    std::thread::sleep(Duration::from_millis(3200));
+    {
+        let deadline = Instant::now() + Duration::from_secs(25);
+        loop {
+            rid += 1;
+            match c.ctl(
+                rid,
+                CtlRequest::Sleep { id, force: false, force_self: false },
+                20,
+            )? {
+                CtlBody::Done => break,
+                CtlBody::Err { code, .. } if code == "busy" && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                other => anyhow::bail!("idle Sleep refused: {other:?}"),
+            }
+        }
+    }
+    await_listing_status(&mut c, &mut rid, id, "asleep", 10)?;
+    let fpath = crate::daemon::frame::path(id);
+    anyhow::ensure!(
+        !fpath.exists(),
+        "a primary-screen sleep must not write a frame sidecar"
+    );
+
+    // Plant garbage; the attach must degrade cleanly and remove it.
+    std::fs::write(&fpath, b"PFRZ this is not a frame at all")?;
+    let vb = attach_view_tolerant(id, 120, 30, 20)?;
+    anyhow::ensure!(
+        !vb.replay.windows(8).any(|w| w == b"\x1b[?1049h"),
+        "corrupt sidecar must not produce an alt overlay"
+    );
+    anyhow::ensure!(!fpath.exists(), "corrupt sidecar removed on first read");
+
+    // Truncated REAL encode (torn write shape): same degrade.
+    let enc = crate::daemon::frame::encode(80, 24, true, b"\x1b[1;1HFRZ FAKE")
+        .expect("tiny payload under cap");
+    std::fs::write(&fpath, &enc[..enc.len() - 2])?;
+    let vb2 = attach_view_tolerant(id, 120, 30, 20)?;
+    anyhow::ensure!(
+        !vb2.replay.windows(8).any(|w| w == b"\x1b[?1049h"),
+        "truncated sidecar must not produce an alt overlay"
+    );
+    anyhow::ensure!(!fpath.exists(), "truncated sidecar removed on first read");
+
+    // The wake is untouched by any of it.
+    rid += 1;
+    match c.ctl(rid, CtlRequest::Wake { id }, 20)? {
+        CtlBody::Done => {}
+        other => anyhow::bail!("Wake returned {other:?}"),
+    }
+    await_hooked_prompt(&mut c, &mut rid, id, 15)?;
+    ensure_no_new_panics(log0)?;
+    delete_terminal(&mut legacy, id);
+    Ok(())
+}
+
 /// CLAUDE-SESSION BEACON end-to-end (attribution Layer 3, `claude_beacon`):
 /// the staged fake claude prints the tcbeacon OSC to /dev/tty inside the
 /// WSL stand-in — the exact byte path a consent-installed remote hook
@@ -8514,6 +8785,8 @@ pub fn run(case: Option<&str>) -> anyhow::Result<()> {
         ("sleep_roundtrip", case_sleep_roundtrip),
         ("sleep_busy_gate", case_sleep_busy_gate),
         ("sleep_waiters_folder", case_sleep_waiters_folder),
+        ("sleep_freeze_frame", case_sleep_freeze_frame),
+        ("frame_corrupt_degrade", case_frame_corrupt_degrade),
     ];
 
     let selected: Vec<_> = match case {

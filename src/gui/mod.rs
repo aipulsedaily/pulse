@@ -1591,19 +1591,31 @@ impl App {
     /// from the GUI's own mirrored state (blocks list + activity stamp);
     /// None = the sleep is instant and friction-free.
     fn sleep_gate_evidence(&self, id: Uuid) -> Option<SleepEvidence> {
+        let quiet = self
+            .activity
+            .get(&id)
+            .is_none_or(|s| s.last_output.elapsed() >= SLEEP_QUIET_WINDOW);
         if let Some(cmd) = self
             .blocks
             .get(&id)
             .and_then(|b| b.recs.iter().rev().find(|r| r.end_off.is_none()))
             .map(|r| r.cmd.clone())
         {
-            return Some(SleepEvidence::OpenBlock(cmd));
+            // Sleep-freeze S7 refinement (mirrors the daemon's
+            // sleep_busy_evidence): an open block whose grid sits QUIET on
+            // the ALT SCREEN is an idle TUI at rest (claude typed at a
+            // prompt, vim, htop) — the spec's own friction-free pass row.
+            // The block only exists because of HOW the TUI was launched.
+            let alt_quiet = quiet
+                && self
+                    .terms
+                    .get(&id)
+                    .is_some_and(|b| b.mode().contains(TermMode::ALT_SCREEN));
+            if !alt_quiet {
+                return Some(SleepEvidence::OpenBlock(cmd));
+            }
         }
-        if self
-            .activity
-            .get(&id)
-            .is_some_and(|s| s.last_output.elapsed() < SLEEP_QUIET_WINDOW)
-        {
+        if !quiet {
             return Some(SleepEvidence::OutputFlowing);
         }
         None
@@ -2415,6 +2427,44 @@ impl App {
                     if let Some(st) = self.composers.get_mut(&id) {
                         st.asleep = asleep;
                         st.on_exited();
+                    }
+                    // SLEEP freeze-frame: a sleep's Exited means the daemon
+                    // world (journal + frame sidecar) is now the durable
+                    // asleep view — re-attach through the dead-attach path,
+                    // swapping the live-parsed grid for the serialized
+                    // scrollback underlay + the frozen alt frame. Fanout was
+                    // muted at the kill, so the old grid already shows the
+                    // pre-wipe frame; the swap is content-equivalent (and it
+                    // heals any pre-mute drain tail) — one message, zero new
+                    // wire variants, every GUI re-attaches itself. Fresh
+                    // backend exactly like the D2C::Reset arm (atomic swap);
+                    // composer latches were gated by on_exited above.
+                    if asleep && self.terms.contains_key(&id) {
+                        let boot_size = self
+                            .state
+                            .terminals
+                            .iter()
+                            .find(|t| t.id == id)
+                            .filter(|t| t.last_cols >= 2 && t.last_rows >= 2)
+                            .map(|t| GridSize {
+                                cols: t.last_cols.min(1000),
+                                rows: t.last_rows.min(1000),
+                                ..GridSize::default()
+                            })
+                            .unwrap_or_default();
+                        let mut backend =
+                            TermBackend::with_scrollback(boot_size, self.prefs.scrollback_lines);
+                        if let Some((layout, cell)) = self.last_grid {
+                            let _ = backend.resize_to(self.layout_for(id, layout), cell);
+                        }
+                        let (cols, rows) = (backend.size.cols, backend.size.rows);
+                        self.terms.insert(id, backend);
+                        // Search matches indexed the replaced grid — drop
+                        // honestly (the r2-M1 shrink's rule).
+                        if self.selected == Some(id) {
+                            self.search = None;
+                        }
+                        self.send(C2D::Attach { id, cols, rows });
                     }
                 }
                 D2C::ReplayAnchors { id, items } => {

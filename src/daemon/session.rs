@@ -118,6 +118,15 @@ pub struct Session {
     /// in the reader→ingest channel. Happens-before for the journaled bytes
     /// rides the journal mutex that flush_all also takes.
     pub in_flight: Arc<AtomicU64>,
+    /// SLEEP freeze-frame: set by `sleep_terminals` between the frame capture
+    /// and the kill. The reader keeps JOURNALING every byte (mirror purity —
+    /// the teardown wipe is real conhost output), but live fanout stops, so
+    /// attached clients keep the frozen frame on screen instead of parsing
+    /// the dying TUI's graceful-exit wipe (claude's `?1049l` + erase) and the
+    /// ConPTY mode-reset trailer. Dies with the Session; a wake's successor
+    /// session starts un-muted. One relaxed load per ingest batch — nothing
+    /// on the awake path.
+    pub mute_fanout: Arc<AtomicBool>,
 }
 
 /// Claude-Code SESSION-LINEAGE markers that must never reach a spawned
@@ -500,6 +509,8 @@ pub fn spawn(
     let in_flight = Arc::new(AtomicU64::new(0));
     let reader_in_flight = in_flight.clone();
     let ingest_in_flight = in_flight.clone();
+    let mute_fanout = Arc::new(AtomicBool::new(false));
+    let ingest_mute = mute_fanout.clone();
     let spawned_at = Instant::now();
 
     let (event_tx, event_rx) = mpsc::channel();
@@ -642,8 +653,13 @@ pub fn spawn(
                         // ingest returns the chunk's absolute stream offset
                         // (pre-append), anchoring block events to journal
                         // coordinates.
-                        let chunk_off =
-                            ingest_core.ingest(id, &ingest_term, &mut parser, chunk);
+                        let chunk_off = ingest_core.ingest(
+                            id,
+                            &ingest_term,
+                            &mut parser,
+                            chunk,
+                            ingest_mute.load(Ordering::Relaxed),
+                        );
                         // Block hooks are scanned per ingested chunk so each
                         // event's offset is exact even if a daemon-authored
                         // append (seam bytes) lands between chunks. Handled
@@ -751,6 +767,7 @@ pub fn spawn(
         prompt,
         last_output,
         in_flight,
+        mute_fanout,
     })
 }
 

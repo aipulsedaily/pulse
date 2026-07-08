@@ -13,6 +13,7 @@ pub mod claude_registry;
 pub(crate) mod bootstrap;
 mod control;
 mod ctl_tokens;
+pub(crate) mod frame;
 mod journal;
 pub mod perf;
 pub mod procinfo;
@@ -614,12 +615,19 @@ impl Core {
     /// Returns the absolute stream offset (see `Journal::absolute_len`) at
     /// which `bytes` begins — read BEFORE the append — so the caller can
     /// anchor block events to journal coordinates.
+    /// `mute` (SLEEP freeze-frame): journal + mirror as always, but skip the
+    /// live fanout — set on the dying session between the pre-kill frame
+    /// capture and the kill, so attached clients keep the frozen frame
+    /// instead of parsing the TUI's graceful-exit wipe. The bytes are still
+    /// in the journal; the Exited re-attach replay reflects them (under the
+    /// frame overlay), so nothing is ever lost.
     pub fn ingest(
         &self,
         id: Uuid,
         term: &FairMutex<Term<EventProxy>>,
         parser: &mut ImmediateProcessor,
         bytes: &[u8],
+        mute: bool,
     ) -> u64 {
         let Ok(journal) = self.journal(id) else { return 0 };
         let mut j = journal.lock();
@@ -630,7 +638,9 @@ impl Core {
         });
         let new_base = perf::time(&perf::APPEND_NS, || j.append(bytes));
         let new_error = j.take_new_error();
-        self.fanout(id, bytes);
+        if !mute {
+            self.fanout(id, bytes);
+        }
         drop(j);
         if perf::on() {
             perf::INGEST_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
@@ -1578,6 +1588,12 @@ impl Core {
                         // Fresh spawn window (claude re-pin evidence base).
                         self.spawn_times.lock().insert(id, (now_ms(), None));
                         self.sessions.lock().insert(id, s);
+                        // SLEEP freeze-frame: waking IS launching — the frame
+                        // sidecar dies in the SAME success path that clears
+                        // the asleep flag (a failed spawn keeps both, so the
+                        // view stays honest). The successor TUI repaints from
+                        // scratch; v1 accepts the brief blank.
+                        frame::remove(id);
                     }
                     None => {
                         drop(state);
@@ -2208,6 +2224,7 @@ impl Core {
         blocks::BlockStore::delete_sidecar(id);
         remote_probe::delete_sidecar(id);
         bootstrap::delete_script(id);
+        frame::remove(id);
         Journal::delete(id);
     }
 
@@ -2440,6 +2457,11 @@ impl Core {
                 // D14 family verdict, read BEFORE the journal lock (state
                 // must never be taken under a journal lock).
                 let cmd_family = arcs.is_some() && self.is_cmd_family(id);
+                // SLEEP freeze-frame: the asleep flag, read before the
+                // journal lock for the same reason. Only a DEAD session can
+                // present Asleep, so the live arm never pays the read.
+                let asleep = arcs.is_none()
+                    && self.state.lock().terminal(id).is_some_and(|t| t.asleep);
                 // Restored-history hints (proto 7): inputs snapshotted under
                 // the journal lock, computed AFTER it drops (the mapping
                 // parse is milliseconds — too long for the lock), enqueued at
@@ -2466,6 +2488,12 @@ impl Core {
                     // — at 2MB apiece, a GUI boot attaching ~20 dead
                     // terminals paid the read twice each.
                     let mut dead_tail: Option<Vec<u8>> = None;
+                    // SLEEP freeze-frame overlay engaged: the serialized
+                    // scrollback underlay is topped with `?1049h` + the
+                    // pre-kill frame — live-TUI semantics, so hints (whose
+                    // rows point into the now-hidden primary grid) are
+                    // skipped, exactly like the live alt-screen arm.
+                    let mut frame_overlay = false;
                     let mut bytes = match &arcs {
                         Some((term, preface, _, _, _)) => {
                             let t = term.lock();
@@ -2479,7 +2507,19 @@ impl Core {
                         None => {
                             let tail = j.tail();
                             match serialize::serialize_dead(&tail, eff_cols, eff_rows) {
-                                Some(b) => {
+                                Some(mut b) => {
+                                    // Asleep + a valid frame sidecar: replay
+                                    // the frozen alt frame over the underlay.
+                                    // Missing/corrupt frame (frame::read
+                                    // removes corrupt files) = exactly the
+                                    // pre-freeze behavior.
+                                    if asleep {
+                                        if let Some(f) = frame::read(id).filter(|f| f.alt) {
+                                            b.extend_from_slice(b"\x1b[?1049h");
+                                            b.extend_from_slice(&f.bytes);
+                                            frame_overlay = true;
+                                        }
+                                    }
                                     dead_tail = Some(tail);
                                     b
                                 }
@@ -2540,7 +2580,7 @@ impl Core {
                     // grid MOVES into the hint job — no clone; and the dead
                     // arm's already-read tail is reused instead of re-read.
                     let rframe = replay_frame(id, &bytes);
-                    if !raw_tail_replay && full.as_ref().is_some_and(|(e, _)| *e > 0) {
+                    if !raw_tail_replay && !frame_overlay && full.as_ref().is_some_and(|(e, _)| *e > 0) {
                         let tail = dead_tail.take().unwrap_or_else(|| j.tail());
                         if !tail.is_empty() {
                             let tail_base = j.absolute_len() - tail.len() as u64;
@@ -3196,6 +3236,64 @@ impl Core {
         //    DO-NOT 1). Idle terminals return in ~one 25ms tick.
         let set: HashSet<Uuid> = targets.iter().copied().collect();
         self.drain_targets(Some(&set), Duration::from_millis(2000));
+        // 4.5 FREEZE-FRAME capture + fanout mute (sleep-freeze). The kill is
+        //     not a freeze: claude's graceful exit handler runs on the ConPTY
+        //     console-close and WIPES the alt screen into the journal before
+        //     EOF (`?1049l` + resume hint + full-screen erase — verified
+        //     byte-for-byte), so the post-drain/pre-kill mirror is the ONLY
+        //     witness of the frame the user was looking at. Alt-screen
+        //     targets get their grid serialized to journals/<id>.frame
+        //     (atomic, crc-guarded, 2MB-capped — pure decoration over the
+        //     journal: any failure logs and the sleep proceeds unchanged).
+        //     Then the session's live fanout is MUTED: the teardown bytes
+        //     (the wipe + conhost's mode-reset trailer) still hit the journal
+        //     (mirror purity, DO-NOT 1/7) but no longer repaint attached
+        //     GUIs — their last live frame IS the freeze-frame, and the
+        //     Exited re-attach serves the same frame from disk. All on this
+        //     sleep worker thread: zero cost anywhere while awake; folder
+        //     sleeps pay ms-class serial captures before the one kill pass.
+        {
+            use alacritty_terminal::grid::Dimensions;
+            let arcs: Vec<_> = {
+                let sessions = self.sessions.lock();
+                targets
+                    .iter()
+                    .filter_map(|id| {
+                        sessions
+                            .get(id)
+                            .map(|s| (*id, s.term.clone(), s.mute_fanout.clone()))
+                    })
+                    .collect()
+            };
+            for (id, term, mute) in arcs {
+                let captured = {
+                    let t = term.lock();
+                    serialize::is_alt_screen(&t).then(|| {
+                        (
+                            t.columns() as u16,
+                            t.screen_lines() as u16,
+                            serialize::capture_alt_frame(&t),
+                        )
+                    })
+                };
+                mute.store(true, Ordering::Relaxed);
+                match captured {
+                    Some((cols, rows, bytes)) => match frame::write(id, cols, rows, true, &bytes) {
+                        Ok(()) => log::info!(
+                            "sleep: froze alt frame for {id} ({} bytes at {cols}x{rows})",
+                            bytes.len()
+                        ),
+                        Err(e) => log::warn!(
+                            "sleep: freeze-frame capture failed for {id}: {e} (journal restore unaffected)"
+                        ),
+                    },
+                    // Primary-screen sessions: the journal reconstruction is
+                    // already faithful (v1 scope) — just make sure no stale
+                    // frame from an earlier alt-screen sleep can shadow it.
+                    None => frame::remove(id),
+                }
+            }
+        }
         // 5. Kill. Session drop closes the ConPTY → conhost dies →
         //    attached clients terminate (measured: whole tree gone <2.5s;
         //    no explicit tree sweep — DO-NOT 8). A session that died on its
@@ -3219,6 +3317,15 @@ impl Core {
     /// modal copy names): an OPEN block (command/TUI running), else output
     /// within SLEEP_QUIET_MS. Quiet alt-screen does NOT gate — the idle
     /// claude REPL is the headline target (DO-NOT 9).
+    ///
+    /// Sleep-freeze refinement (the "`tc run claude` always gates busy"
+    /// friction bug): an open block whose session sits QUIET on the ALT
+    /// SCREEN is the spec's own pass row ("quiet alt-screen TUI: dies exactly
+    /// as a reboot would") — the block is open precisely BECAUSE the TUI was
+    /// launched as a command (typed at a hooked prompt or via `tc run`), and
+    /// gating on the launch spelling contradicted S7's headline case. A
+    /// streaming TUI still gates (output within the quiet window); a
+    /// primary-screen command (build, `ping -t`) still gates on its block.
     pub(crate) fn sleep_busy_evidence(&self, id: Uuid) -> Option<String> {
         let open_cmd = {
             let map = self.blocks.lock();
@@ -3227,7 +3334,14 @@ impl Core {
                 .map(|r| r.cmd.clone())
         };
         if let Some(cmd) = open_cmd {
-            return Some(format!("{cmd} is running"));
+            // Same nesting as DebugDump: term is a leaf under sessions.
+            let alt_quiet = self.sessions.lock().get(&id).is_some_and(|s| {
+                now_ms().saturating_sub(s.last_output.load(Ordering::Relaxed)) >= SLEEP_QUIET_MS
+                    && serialize::is_alt_screen(&s.term.lock())
+            });
+            if !alt_quiet {
+                return Some(format!("{cmd} is running"));
+            }
         }
         let quiet_ms = self
             .sessions
@@ -4223,7 +4337,7 @@ mod sync_tests {
         let live_id = Uuid::new_v4();
         let dead_id = Uuid::new_v4();
         let live: HashSet<Uuid> = [live_id].into_iter().collect();
-        for ext in ["log", "blocks.json", "log.tmp", "probe.json"] {
+        for ext in ["log", "blocks.json", "log.tmp", "probe.json", "frame", "frame.tmp"] {
             assert!(
                 is_orphan_artifact(&format!("{dead_id}.{ext}"), &live),
                 "unknown-uuid .{ext} is an orphan"

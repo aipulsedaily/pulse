@@ -3,6 +3,14 @@
 
 use super::*;
 
+/// Sleep-freeze: whether the grid gets the asleep dim wash. Asleep proper
+/// AND the sub-second Sleeping transient (dimming starts at the click —
+/// feedback); Running/Dead grids are never washed (a dead terminal reads as
+/// "restorable history", not "shelved").
+pub(super) fn asleep_wash(p: PresentedStatus) -> bool {
+    matches!(p, PresentedStatus::Asleep | PresentedStatus::Sleeping)
+}
+
 impl App {
     pub(super) fn central(&mut self, root: &mut egui::Ui) {
         egui::CentralPanel::default()
@@ -392,6 +400,7 @@ impl App {
             copy_on_select: self.prefs.copy_on_select,
             paste_warn: self.prefs.paste_warn,
             drop_label,
+            asleep: asleep_wash(presented_now),
         };
         // Card split (P3 §7): hooked terminals draw the grid above a
         // CONSTANT 36px composer strip; hookless terminals keep today's
@@ -1165,5 +1174,20 @@ impl App {
             return Some(CardAction::Select);
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Dim-wash gating (sleep-freeze): asleep states only — never a live or
+    /// plainly-dead grid.
+    #[test]
+    fn asleep_wash_gates_on_presented_status() {
+        assert!(asleep_wash(PresentedStatus::Asleep));
+        assert!(asleep_wash(PresentedStatus::Sleeping));
+        assert!(!asleep_wash(PresentedStatus::Running));
+        assert!(!asleep_wash(PresentedStatus::Dead));
     }
 }

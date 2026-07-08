@@ -327,7 +327,15 @@ pub struct ViewOpts {
     /// §4.7: an OS drag hovers the window (or an ssh refusal lingers) —
     /// paint the accent wash + this centered label over the grid.
     pub drop_label: Option<String>,
+    /// Sleep-freeze: the terminal is presented Asleep (or the sub-second
+    /// Sleeping transient) — paint the subtle whole-grid dim wash over the
+    /// frozen frame. See `asleep_wash` (central.rs) for the gate.
+    pub asleep: bool,
 }
+
+/// The asleep wash's strength: subtle by directive — the frozen frame stays
+/// first-class readable; the wash only cools it. 40/255 ≈ 16% black.
+const ASLEEP_DIM_ALPHA: u8 = 40;
 
 #[allow(clippy::too_many_arguments)]
 pub fn show(
@@ -513,6 +521,19 @@ pub fn show(
         cover_line,
         shift_moving,
     );
+
+    // ── Asleep dim wash (sleep-freeze): one subtle whole-grid darkening
+    // while the terminal is presented Asleep/Sleeping, so a glance reads
+    // "not live" without costing the frozen frame its readability (the moon
+    // + dimmed name carry the state; this only cools the pixels). A single
+    // rect_filled — no strokes, no banner, no icon (doctrine).
+    if opts.asleep {
+        painter.with_clip_rect(grid_rect).rect_filled(
+            grid_rect,
+            CornerRadius::ZERO,
+            Color32::from_black_alpha(ASLEEP_DIM_ALPHA),
+        );
+    }
 
     // ── Drop-target wash (QOL §4.7): a whole-surface accent tint + one
     // centered text line while an OS drag hovers (or an ssh refusal

@@ -267,6 +267,48 @@ pub(super) fn alt_frame_fix(
     fix
 }
 
+/// SLEEP freeze-frame capture: render the live mirror's ALT grid as bytes
+/// replayable INSIDE an already-entered alternate screen (the dead-attach arm
+/// emits `?1049h` first, then this). Unlike `alt_frame_fix` (which flattens
+/// the frame into primary scrollback), this reproduces the frame ON the alt
+/// grid with live-TUI semantics — and it must be captured BEFORE the sleep
+/// kill: claude's graceful exit handler wipes the alt screen into the journal
+/// on console-close, so the mirror between drain and kill is the frame's only
+/// witness (see daemon::frame).
+///
+/// Every non-blank row is positioned ABSOLUTELY (CUP) with auto-wrap off:
+/// replayed at the captured size this is exact; a SMALLER attacher clips
+/// rows/columns at its edges (never re-flows — the clip-on-resize policy,
+/// matching what a live TUI's raw frames would do before a repaint); a larger
+/// one leaves background beyond the captured geometry. The cursor is restored
+/// last, with its visibility (TUIs usually hide it) and the mirror's wrap
+/// mode re-asserted.
+pub fn capture_alt_frame(term: &Term<EventProxy>) -> Vec<u8> {
+    let recs = render_lines(term);
+    let mut out: Vec<u8> = Vec::with_capacity(8 * 1024);
+    // The alt grid has no scrollback, so recs are exactly the screen rows.
+    out.extend_from_slice(b"\x1b[0m\x1b[?7l");
+    for (i, rec) in recs.iter().enumerate() {
+        if rec.blank {
+            continue; // a fresh alt grid is already blank
+        }
+        out.extend_from_slice(format!("\x1b[{};1H", i + 1).as_bytes());
+        out.extend_from_slice(&rec.bytes);
+        out.extend_from_slice(b"\x1b[0m");
+    }
+    let cur = term.grid().cursor.point;
+    out.extend_from_slice(
+        format!("\x1b[{};{}H", cur.line.0.max(0) + 1, cur.column.0 + 1).as_bytes(),
+    );
+    if term.mode().contains(TermMode::LINE_WRAP) {
+        out.extend_from_slice(b"\x1b[?7h");
+    }
+    if !term.mode().contains(TermMode::SHOW_CURSOR) {
+        out.extend_from_slice(b"\x1b[?25l");
+    }
+    out
+}
+
 /// Scratch-parse raw journal bytes into a throwaway Term.
 ///
 /// GEOMETRY FIDELITY (the "prompt overwriting a mid-table row" corruption):
@@ -1267,6 +1309,72 @@ mod tests {
             "later session swallowed by the unexited alt region: {t3:?}"
         );
         assert!(t3.contains("session one"), "{t3:?}");
+    }
+
+    /// SLEEP freeze-frame: `capture_alt_frame` replayed after `?1049h`
+    /// reproduces the alt grid at the captured size (rows on their absolute
+    /// lines, cursor + visibility restored) and CLIPS at a smaller attacher —
+    /// no re-flow, no wrap, no panic (the clip-on-resize policy).
+    #[test]
+    fn capture_alt_frame_roundtrip_and_clip() {
+        use alacritty_terminal::term;
+        let mut raw = b"PS C:\\> claude\r\n".to_vec();
+        raw.extend_from_slice(b"\x1b[?1049h\x1b[?25l");
+        raw.extend_from_slice(b"\x1b[3;5H\x1b[1mHELLO CONVERSATION\x1b[0m");
+        // A row wider than the small client below (col-clip fixture).
+        raw.extend_from_slice(
+            format!("\x1b[5;1H{}", "W".repeat(60)).as_bytes(),
+        );
+        raw.extend_from_slice(b"\x1b[24;1H> input box");
+        // A live-mirror stand-in: raw parse, NO alt closure (scratch_term
+        // would exit the alt screen — that is its job, not this test's).
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut mirror = Term::new(
+            term::Config::default(),
+            &TermSize::new(80, 24),
+            super::super::session::EventProxy::new(tx),
+        );
+        let mut parser = super::super::ImmediateProcessor::new();
+        parser.advance(&mut mirror, &raw);
+        assert!(is_alt_screen(&mirror), "fixture must end on the alt screen");
+        let frame = capture_alt_frame(&mirror);
+        assert!(
+            frame.ends_with(b"\x1b[?25l"),
+            "hidden cursor must be re-asserted"
+        );
+
+        // Same-size replay over a serialized underlay.
+        let mut replay = b"underlay scrollback row\r\n\x1b[?1049h".to_vec();
+        replay.extend_from_slice(&frame);
+        let (screen, _, _, _) = client_grid(&replay, 80, 24);
+        assert!(
+            screen[2].contains("HELLO CONVERSATION"),
+            "row 3 content: {screen:?}"
+        );
+        assert!(screen[23].contains("> input box"), "bottom row: {screen:?}");
+
+        // Smaller attacher: rows/cols clip in place — the deep row clamps to
+        // the bottom, the wide row truncates at the right edge instead of
+        // wrapping onto the next row.
+        let (small, _, _, _) = client_grid(&replay, 40, 10);
+        assert!(
+            small[2].contains("HELLO CONVERS"),
+            "top rows keep their lines: {small:?}"
+        );
+        assert!(
+            small[4].starts_with(&"W".repeat(40)) && small[4].len() <= 40,
+            "wide row clips at the edge: {:?}",
+            small[4]
+        );
+        assert!(
+            !small[5].contains('W'),
+            "auto-wrap must be off during the frame (no reflow): {:?}",
+            small[5]
+        );
+        assert!(
+            small[9].contains("> input box"),
+            "deep rows clamp to the bottom row: {small:?}"
+        );
     }
 
     /// Alt-screen cut safety (Bug 4, the "claude fragments fused with shell
