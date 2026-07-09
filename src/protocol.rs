@@ -17,6 +17,11 @@ use crate::state::{BlockRec, Folder, InnerCli, NewTerminal, SharedState};
 
 pub const MAX_FRAME: u32 = 32 * 1024 * 1024;
 
+/// This build's protocol generation — the single source for `DaemonInfo::
+/// proto` and `C2D::Hello2::proto`. History lives at the `proto:` field in
+/// `daemon::run` (src\daemon\mod.rs).
+pub const PROTO: u32 = 12;
+
 /// Client -> Daemon
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum C2D {
@@ -170,6 +175,21 @@ pub enum C2D {
     /// APPENDED at the enum's end (proto 10): bincode encodes variants
     /// positionally.
     SetAutoReconnect { id: Uuid, on: bool },
+
+    /// Generation-carrying GUI handshake (the alternative first frame to
+    /// `Hello`; same master token ⇒ FULL rights). `proto` is the CLIENT's
+    /// protocol generation, which the daemon needs for the width-mismatch
+    /// garble fix: a proto ≥ 12 client re-attaches itself on `D2C::Reset`
+    /// (announcing its real grid so ConPTY is resized BEFORE the replay is
+    /// serialized), so the daemon must suppress its own blind-size Replay
+    /// push in the restore resync for such clients — and must NOT for
+    /// legacy clients, which would otherwise stare at a blank grid forever.
+    /// Clients send this only to a proto ≥ 12 daemon (an older daemon fails
+    /// to decode the unknown variant and drops the connection).
+    ///
+    /// APPENDED at the enum's end (the C2D tail; proto 11 → 12): bincode
+    /// encodes variants positionally.
+    Hello2 { token: String, proto: u32 },
 }
 
 /// One session's dimensions as written by `C2D::DebugDump`. The three pairs

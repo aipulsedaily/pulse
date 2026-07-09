@@ -1,0 +1,38 @@
+# meta-lint allowlist - "<rule> <path-prefix>" per line, '#' starts a comment.
+# Every entry must say WHY the hit is legitimate. Keep entries as narrow as
+# possible (a specific file, not a directory) so new violations nearby still
+# get caught. Justifications deliberately avoid quoting the guarded strings.
+#
+# ---- privacy: test fixtures that predate the anonymization sweep -----------
+# These four files carry shell-prompt and profile-dir test fixtures shaped
+# like the original dev machine's prompts/paths. They have shipped publicly
+# since v0.1.0 and exercising the real prompt shapes is the point of the
+# tests, so they are grandfathered. Any NEW file gets no exemption.
+privacy src/gui/composer.rs      # auth-prompt + cwd-heuristic test fixtures use real prompt shapes
+privacy src/gui/mod.rs           # WSL cwd-poison tests + profile-dir doc comments use the original home dir
+privacy src/gui/term_backend.rs  # OSC 133 prompt-capture tests replay the original shell prompt
+privacy src/state.rs             # display_cwd tests + doc comment use the original home dir
+#
+# ---- brand: legitimate pre-rebrand references -------------------------------
+# src/main.rs holds the one-time legacy-data-dir migration (LEGACY_DATA_DIR_NAME,
+# LEGACY_RUN_KEY_VALUE and friends) - it MUST name the old brand to find and
+# migrate old installs.
+brand src/main.rs                # rebrand migration constants: must reference the legacy names
+brand src/daemon/mod.rs          # legacy shutdown window-class name, kept for compat with old daemons
+brand src/daemon/serialize.rs    # serialization test fixture replays a prompt line from the dev dir
+brand src/gui/composer.rs        # composer tests use the repo's actual dev directory as the cwd
+brand src/gui/launcher.rs        # pathish-query test uses the repo's actual dev directory
+brand src/state.rs               # sanitize-path doc example + test use the repo's actual dev directory
+# Historical phase specs were written pre-rebrand and are kept verbatim as
+# design history; docs/README.md and docs/controller-api.md are current docs
+# and stay guarded (hence file-level entries, not a docs/ blanket).
+brand docs/p2-blocks-ui-spec.md        # historical spec, pre-rebrand
+brand docs/p3-composer-v1-spec.md      # historical spec, pre-rebrand
+brand docs/p4-composer-v2-spec.md      # historical spec, pre-rebrand
+brand docs/p5-controller-api-spec.md   # historical spec, pre-rebrand
+brand docs/p6-shells-spec.md           # historical spec, pre-rebrand
+brand docs/qol-spec.md                 # historical spec, pre-rebrand
+brand docs/remote-cli-resume-spec.md   # historical spec, pre-rebrand
+brand docs/selector-ui-spec.md         # historical spec, pre-rebrand
+brand docs/sleep-spec.md               # historical spec, pre-rebrand
+brand docs/ssh-drop-spec.md            # historical spec, pre-rebrand

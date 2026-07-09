@@ -930,6 +930,20 @@ impl TermBackend {
             .is_some_and(|f| !f.stale && f.prompt_end.is_some())
     }
 
+    /// The captured prompt end is PROVISIONAL — a 133;B landed ahead of its
+    /// prompt text (the ConPTY OSC-vs-text reorder), so `prompt_end` currently
+    /// points at the col-0 capture and a quiescence upgrade is pending to move
+    /// it to the settled cell. A submission must never PIN its cover column
+    /// against a provisional cell: the echo lands at the real (post-upgrade)
+    /// prompt end, so a col-0 pin's `row_has_text_at(row, 0, cmd)` conversion
+    /// check fails and the row leaks raw (the rapid-fire flip-flop). Callers
+    /// that commit a cover column (submit / pump_pending) gate on this.
+    pub fn prompt_end_pending(&self) -> bool {
+        self.block_feed
+            .as_ref()
+            .is_some_and(|f| !f.stale && f.pending_prompt_end)
+    }
+
     /// True when the live grid cursor sits exactly at the captured prompt
     /// end — i.e. PSReadLine's input buffer is visibly empty (P3 §5.2). Two
     /// integer compares; hookless sessions (`block_feed` None) return false.

@@ -26,6 +26,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Repo-hygiene meta-lint (privacy tripwires, encoding, old-brand, release
+  # placeholders, large/generated files). Mirrors the .githooks pre-commit
+  # hook so a locally bypassed hook (--no-verify) still fails the PR gate.
+  # Pure greps/file checks - finishes in seconds, no toolchain needed.
+  meta-lint:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Meta-lint (full tree)
+        shell: pwsh
+        run: ./scripts/meta-lint.ps1 --all
+
   test:
     runs-on: windows-latest
     timeout-minutes: 60

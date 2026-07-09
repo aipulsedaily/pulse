@@ -120,14 +120,51 @@ gh pr create --repo aipulsedaily/pulse --base main
 
 PRs run against the checklist in the PR template.
 
+## Pre-commit meta-lint (one-time setup)
+
+The repo ships its git hooks in `.githooks/`. After cloning, run once:
+
+```sh
+git config core.hooksPath .githooks
+# or: powershell -NoProfile -File scripts/bootstrap-hooks.ps1
+```
+
+From then on every commit runs `scripts/meta-lint.ps1 --staged` — pure greps
+and file checks, finishes in well under 5 seconds, no cargo involved. It
+blocks commits that would reintroduce past incidents:
+
+- **privacy** — personal names, LAN IPs, and hostname tripwires anywhere in
+  staged lines (an anonymization sweep has been un-done by a stray comment
+  before).
+- **encoding** — UTF-8 BOM or mojibake in `rs/toml/md/yml/ps1` files (a
+  PowerShell re-save once corrupted `Cargo.toml` right before a tag).
+- **brand** — pre-rebrand product names in `src/`, `docs/`, or `README.md`
+  outside the allowlisted migration/spec sites.
+- **placeholder** — unreplaced release placeholders, and `dbg!` / `todo!` /
+  `unimplemented!` in `src/`.
+- **large** — files over 5 MB, or `tcdata/` / `scratchpad/` / `*.log` paths.
+- **commit-msg** — attribution trailers (`Co-Authored-By`, "Generated with",
+  robot-emoji lines) are rejected; this repo ships commits with zero AI
+  attribution.
+
+A version bump in `Cargo.toml` prints a non-blocking reminder that the release
+tag must match (the release workflow hard-asserts it).
+
+False positive on a legitimate line? Add an inline `lint-allow: <rule>`
+comment on that line, or a justified `<rule> <path-prefix>` entry in
+`scripts/meta-lint-allowlist.txt`. Bypassing with `git commit --no-verify`
+only defers the failure: CI runs the identical script with `--all` on every
+push and PR.
+
 ## Pull requests
 
 - Keep changes focused and match the surrounding style.
 - `cargo test --release` green and `cargo clippy --all-targets` clean.
 - Describe what you changed and how you verified it.
 
-CI runs the same gates on every PR (`.github/workflows/ci.yml`): clippy with
-warnings denied, plus the full test suite, on `windows-latest`.
+CI runs the same gates on every PR (`.github/workflows/ci.yml`): the meta-lint
+above (full-tree mode), clippy with warnings denied, plus the full test suite,
+on `windows-latest`.
 
 ## Releases (maintainers)
 

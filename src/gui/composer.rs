@@ -99,15 +99,16 @@ const SPACER_QUEUE_CAP: usize = 3;
 
 /// Post-submit typeahead window (the fast-typing fix): after a composer
 /// submission, if the fresh `pre` has NOT come back within this long, the
-/// submitted command is long-running — everything typed since the submit
-/// (queued commands + the live draft) FLUSHES to the PTY in order as shell
-/// type-ahead (PSReadLine/readline buffer it natively) and the composer
-/// yields Raw(Busy). Under it, typed keys stay buffered in the editor: the
-/// common fast-typing case re-latches in 50–150ms and the draft is already
-/// in place. Tunable. (A SubmitHold ghost MAY outlive this window since Bug
-/// 1b: an echo delayed past the flush keeps the hold pinned — mode flips to
-/// Raw(Busy) while the lane stays Frozen on the held text, which is the
-/// honest reading of "submitted, not yet echoed".)
+/// submitted command is long-running and the WINDOW closes — since the
+/// permanent-editor fix the composer STAYS Compose (the old behavior here,
+/// flushing the buffer raw and yielding Raw(Busy), was the measured re-arm
+/// gap: the editor was hidden for the whole command minus 300ms, and slow
+/// ssh links blinked it on every submit). Typing keeps buffering visibly in
+/// the draft; queued Enters dispatch at the next provably-clean prompt via
+/// `pump_pending`. Only the all-spacer abandon rule still fires at this
+/// threshold (held-Enter contract). Tunable. (A SubmitHold ghost MAY
+/// outlive this window since Bug 1b: an echo delayed past it keeps the hold
+/// pinned — the honest reading of "submitted, not yet echoed".)
 const POST_SUBMIT_FLUSH: Duration = Duration::from_millis(300);
 
 /// A post-submit window whose resolution tick arrives this much later than
@@ -126,13 +127,13 @@ const PENDING_CAP: usize = 16;
 /// the daemon's own CMD_QUIET precedent (`cmd_prompt_evidence`).
 const HEUR_QUIET: Duration = Duration::from_millis(300);
 
-/// D2: the post-submit typeahead flush threshold DURING a heuristic episode.
+/// D2: the post-submit window-close threshold DURING a heuristic episode.
 /// Resolution (c)'s "shell is back at a prompt" signal is a fresh heuristic
 /// latch, which structurally takes echo + output + the 300ms quiet window
 /// (≈400-500ms for instant commands) — the integrated 300ms threshold would
-/// always lose and dump buffered typing raw. Typing into a genuinely
-/// long-running inner command buffers up to this long before flushing as
-/// type-ahead; the editor keeps the keys visible the whole time.
+/// always close too early. Since the permanent-editor fix this threshold
+/// only CLOSES the window (Compose held, draft + queue keep buffering
+/// visibly; the old raw flush is gone on this lane too).
 const HEUR_FLUSH: Duration = Duration::from_millis(1000);
 
 /// Per-terminal composer mode. Raw is the default and the fallback.
@@ -362,6 +363,29 @@ pub(crate) fn nested_shell_line(cursor_row: &str) -> NestedShellLine {
     } else {
         NestedShellLine::Generic
     }
+}
+
+/// PERMANENT-EDITOR exception (the one auto-yield left): a RUNNING command
+/// asking a question on the primary screen — `password:` / passphrase (git
+/// credential, sudo, ssh inside a script), `(yes/no)?` host-key checks, and
+/// apt/pacman-style `(y/n)` / `[Y/n]` confirms — must get the keys, so the
+/// busy-Compose editor steps aside for it. Cursor-row-anchored and
+/// render-only like `detect_auth_prompt`/`nested_shell_line` (which it
+/// reuses): a false negative degrades to the click-to-grid escape hatch, a
+/// false positive degrades to the old always-yield busy behavior — both are
+/// exactly yesterday's UX, never a wrong cover.
+pub(crate) fn inline_interactive_prompt(cursor_row: &str) -> bool {
+    if detect_auth_prompt(cursor_row) != AuthPrompt::None {
+        return true;
+    }
+    let t = cursor_row.trim_end().to_ascii_lowercase();
+    // End-anchored y/n confirm shapes (mirroring the auth classifier's
+    // suffix discipline — mid-row "password" text can never match).
+    [
+        "(y/n)?", "(y/n)", "(y/n):", "[y/n]", "[y/n]?", "[y/n]:",
+    ]
+    .iter()
+    .any(|suf| t.ends_with(suf))
 }
 
 /// D2: grid-observed shell-prompt shape at the cursor (the heuristic
@@ -801,8 +825,9 @@ pub struct ComposerState {
     pending_history_cover: Option<(i32, usize, Option<String>, String)>,
     /// Outbox: composer-authored bytes to send to the PTY right after `tick`
     /// (the sanctioned send path, drained by the app). Carries the typeahead
-    /// buffer FLUSH (alt-screen/mouse flip, the busy threshold, demotion
-    /// mid-buffer) — byte order is preserved against any Enter still queued.
+    /// buffer FLUSH (alt-screen/mouse flip, demotion mid-buffer — the busy
+    /// threshold no longer flushes: permanent editor) — byte order is
+    /// preserved against any Enter still queued.
     pending_clear: Option<Vec<u8>>,
     /// Outbox (P6b §5.2): a Cmd-family submission the app must ship as
     /// `C2D::SubmitCommand{write:true}` instead of Input bytes — the daemon
@@ -847,6 +872,23 @@ pub struct ComposerState {
     /// must NEVER run the detector — this flag is the false-positive scope).
     /// Cleared on any tokened marker edge, reset, exit, or all recs closing.
     heur_episode: bool,
+    /// Optimistic heuristic COVER (flicker fix, decoupled from the 300ms arm)
+    /// — OPTIMISTIC-WITH-REVOCATION. The `feed_gen` at which the classifier
+    /// STARTED reading the cursor row as a prompt this pass-run (Some ⇒ the
+    /// row is being covered). The cover paints the SAME frame the classifier
+    /// first passes (no confirm delay — the user could see the one-frame
+    /// confirm), then REVOKES the next tick iff feed_gen bumped since (output
+    /// arrived ⇒ the row was streaming, not at rest). The ARM (`heur`) is
+    /// untouched and still waits the full HEUR_QUIET.
+    heur_cover_gen: Option<u64>,
+    /// This pass-run was revoked as streaming (feed_gen bumped after we
+    /// covered): stay uncovered until the classifier FAILS (ending the run),
+    /// so continuous prompt-shaped streaming can't re-flicker the cover on
+    /// every other frame.
+    heur_cover_revoked: bool,
+    /// The row the optimistic cover blanks THIS frame (set by
+    /// `maintain_heur_cover` in tick, read by `heur_cover_optimistic`).
+    heur_cover_row: Option<i32>,
 }
 
 impl Default for ComposerState {
@@ -881,6 +923,9 @@ impl Default for ComposerState {
             alt_since: None,
             heur: None,
             heur_episode: false,
+            heur_cover_gen: None,
+            heur_cover_revoked: false,
+            heur_cover_row: None,
         }
     }
 }
@@ -929,6 +974,86 @@ impl ComposerState {
         }
         let h = self.heur.as_ref()?;
         Some(h.line - (backend.history_size() - h.history) as i32)
+    }
+
+    /// The prompt-shape classifier + cursor-anchor + on-screen check, shared
+    /// by the arm mint and the optimistic cover (one definition of "the
+    /// cursor row reads as a nested-shell prompt right now").
+    fn cursor_row_is_prompt(&self, backend: &TermBackend) -> Option<i32> {
+        let (prefix, gap) = backend.cursor_prefix_gap();
+        if !looks_like_shell_prompt(&prefix, gap) {
+            return None;
+        }
+        let line = backend.cursor_line();
+        (line >= 0 && line < backend.size.rows as i32).then_some(line)
+    }
+
+    /// Optimistic heuristic COVER row (flicker fix), decoupled from the
+    /// HEUR_QUIET arm. The row `maintain_heur_cover` decided to blank THIS
+    /// frame (optimistic-with-revocation — covered the frame the classifier
+    /// first passed, revoked the next frame if it turned out to be streaming).
+    /// Scoped to an established heuristic episode with the strip editor up
+    /// (Compose) and the arm latch not yet live (`heur_cover_line` owns the
+    /// row once it mints). Presentation only — never gates submission.
+    fn heur_cover_optimistic(&self, _backend: &TermBackend) -> Option<i32> {
+        self.heur_cover_row
+    }
+
+    /// Maintain the optimistic cover (called from `tick`, before the gate
+    /// reads inputs). OPTIMISTIC-WITH-REVOCATION: the cover paints the SAME
+    /// frame the classifier first reads the cursor row as a prompt (frame N —
+    /// no confirm delay, which the user could see as a one-frame dual-prompt
+    /// on every re-mint), then REVOKES on the next tick iff `feed_gen` bumped
+    /// since (output arrived ⇒ the row was actually streaming, not at rest).
+    /// After a revoke the run stays uncovered until the classifier FAILS, so
+    /// continuous prompt-shaped streaming cannot re-flicker the cover on
+    /// every other frame. Tradeoff (documented): a false cover blanks a
+    /// streaming row for at most ONE frame (mild, self-heals, and only when
+    /// output is prompt-shaped and rest-check-parked) vs the previous
+    /// GUARANTEED one-frame dual-prompt on every genuine re-mint (what the
+    /// user reported seeing). The ARM (`heur`) is unaffected — a false cover
+    /// can never submit into a running command (the arm keeps the 300ms).
+    fn maintain_heur_cover(&mut self, backend: &TermBackend, running: bool) {
+        self.heur_cover_row = None;
+        // Only in an established nested-shell episode, editor up, primary
+        // screen, feed live, and the arm latch not already live.
+        let mode = backend.mode();
+        let eligible = self.heur_episode
+            && self.mode == ComposerMode::Compose
+            && running
+            && backend.feed_live()
+            && !mode.contains(TermMode::ALT_SCREEN)
+            && !mode.intersects(TermMode::MOUSE_MODE)
+            && !self.heur_live(backend);
+        let prompt_row = eligible.then(|| self.cursor_row_is_prompt(backend)).flatten();
+        let Some(row) = prompt_row else {
+            // Classifier fails / not eligible ⇒ the pass-run ends: clear the
+            // covering state AND the streaming-suppress flag so the NEXT
+            // fresh prompt (a new fail→pass transition) covers again.
+            self.heur_cover_gen = None;
+            self.heur_cover_revoked = false;
+            return;
+        };
+        if self.heur_cover_revoked {
+            return; // streaming pass-run: stay uncovered until it fails
+        }
+        match self.heur_cover_gen {
+            // Fresh pass-run, first sight ⇒ COVER this very frame (frame N).
+            None => {
+                self.heur_cover_gen = Some(backend.feed_gen);
+                self.heur_cover_row = Some(row);
+            }
+            // Still at rest (no output batch since we covered) ⇒ keep it.
+            Some(g) if g == backend.feed_gen => {
+                self.heur_cover_row = Some(row);
+            }
+            // feed_gen bumped after we covered ⇒ output arrived ⇒ the row was
+            // streaming ⇒ REVOKE (uncover this frame) and suppress re-cover.
+            Some(_) => {
+                self.heur_cover_gen = None;
+                self.heur_cover_revoked = true;
+            }
+        }
     }
 
     /// D2 episode gate: heuristic detection is ALLOWED to run this frame.
@@ -1035,16 +1160,15 @@ impl ComposerState {
             self.busy_since = Some(now);
             self.last_activity = Some(now);
             match self.mode {
-                // Never yank focus from a typing user; a held draft stays
-                // editable too (submit is gate-disabled until the next pre).
-                // The post-submit typeahead buffer keeps Compose regardless
-                // of focus: the exec edge for the JUST-submitted command is
-                // the normal first event of every window — yielding here
-                // would drop the buffered keys/queue to the grid raw (the
-                // fast-typing fall-through this buffer exists to kill).
-                ComposerMode::Compose
-                    if self.has_focus || !self.draft.is_empty() || self.buffering() => {}
-                _ => self.mode = ComposerMode::Raw(RawReason::Busy),
+                // PERMANENT EDITOR: an exec edge never demotes an existing
+                // Compose — the editor is stationary furniture through the
+                // whole busy span (submit is gate-disabled, Enter queues,
+                // the busy chip narrates). An external SubmitCommand under
+                // an armed composer keeps the box too; a grid-typed exec
+                // already went Raw via `on_raw_input` before its bytes
+                // shipped, so no armed box can shadow raw typing here.
+                ComposerMode::Compose => {}
+                ComposerMode::Raw(_) => self.mode = ComposerMode::Raw(RawReason::Busy),
             }
         }
         if pre_seen != self.last_pre {
@@ -1241,9 +1365,15 @@ impl ComposerState {
     /// (a) alt-screen or MOUSE_MODE flipped on: the submitted command is a
     ///     full-screen/interactive app and the buffered keys belong to IT —
     ///     flush in order within this same frame and yield raw;
-    /// (b) no fresh pre within POST_SUBMIT_FLUSH: long-running command —
-    ///     flush as shell type-ahead and yield Raw(Busy). Exception: an
-    ///     all-spacer buffer just abandons (never blind-fire bare `\r` at a
+    /// (b) no fresh pre within POST_SUBMIT_FLUSH: long-running command — the
+    ///     WINDOW closes but the EDITOR STAYS (permanent-editor fix: the
+    ///     measured re-arm gap was exactly this yield — cmd duration minus
+    ///     300ms of hidden editor on every slow command, an 80ms blink per
+    ///     submit on slow ssh links). Typing keeps accumulating visibly in
+    ///     the draft, queued Enters dispatch at the next provably-clean
+    ///     prompt via `pump_pending` (never into the running command), and
+    ///     the busy chip in the hint slot narrates the run. Exception kept:
+    ///     an all-spacer buffer abandons (never blind-fire bare `\r` at a
     ///     shell that stopped prompting — the held-Enter contract).
     fn resolve_post_submit(&mut self, backend: &TermBackend, now: Instant) {
         let Some(w) = self.post_submit else { return };
@@ -1281,23 +1411,20 @@ impl ComposerState {
                 now,
             );
         } else if age >= flush_after {
-            if self.pending.is_empty() && self.draft.trim().is_empty() {
-                // Nothing buffered: the command is simply long-running —
-                // yield to Raw(Busy) with no bytes. Typing from here on is
-                // native shell type-ahead through the grid, exactly the
-                // pre-typeahead behavior for a busy shell.
-                self.post_submit = None;
-                self.mode = ComposerMode::Raw(RawReason::Busy);
-                self.want_focus = false;
-                self.has_focus = false;
-                self.last_activity = Some(now);
-            } else if self.pending.iter().all(|p| p.is_empty())
+            // PERMANENT EDITOR (rearm-latency fix): the threshold no longer
+            // yields the editor and no longer flushes typed text raw — the
+            // command is simply long-running. The window closes, Compose
+            // (and focus) hold: the draft keeps buffering visibly, queued
+            // Enters wait for `pump_pending`'s provably-clean prompt (the
+            // never-submit-into-a-running-command invariant, untouched), and
+            // the busy-Compose steady state is DEMOTE-healthy (tick). Only
+            // the held-Enter contract survives from the old branch: an
+            // all-spacer buffer is abandoned, never blind-fired at a shell
+            // that stopped prompting.
+            if !self.pending.is_empty()
+                && self.pending.iter().all(|p| p.is_empty())
                 && self.draft.trim().is_empty()
             {
-                // Held-Enter contract: an all-spacer buffer is abandoned,
-                // never blind-fired. Compose stays armed at the (still
-                // latched) prompt; the demotion clock handles a shell that
-                // truly stopped prompting.
                 if trace_enabled() {
                     log::info!(
                         "[composer] spacer queue abandoned: no fresh prompt within {flush_after:?} ({} pending)",
@@ -1305,10 +1432,8 @@ impl ComposerState {
                     );
                 }
                 self.pending.clear();
-                self.post_submit = None;
-            } else {
-                self.flush_to_pty(RawReason::Busy, now);
             }
+            self.post_submit = None;
         }
     }
 
@@ -1335,7 +1460,22 @@ impl ComposerState {
         // Provably clean fresh prompt: the integrated latch + captured
         // prompt-end pair, or (D2) a live heuristic latch — the exact same
         // state a hand-typed submit dispatches from in each mode.
-        let ready = (self.at_prompt_since.is_some() && backend.cursor_at_prompt_end())
+        //
+        // The prompt end must be SETTLED, not provisional (rapid-fire cover
+        // fix): during the ConPTY reorder window a 133;B captures prompt_end
+        // at col 0 with the cursor also at col 0, so `cursor_at_prompt_end`
+        // is briefly true there. Dispatching in that window pins the
+        // SubmitHold at col 0; the echo lands at the real prompt-end column,
+        // so the hold's `row_has_text_at(row, 0, cmd)` conversion fails and
+        // the completed command's row leaks the raw prompt (the field
+        // flip-flop). Waiting for the settled cell costs at most
+        // PROMPT_END_QUIESCE (40ms, only in the reorder case) — imperceptible
+        // for a blind-queued dispatch, and the dispatch still fires the frame
+        // the prompt settles. The heuristic latch has no 133;B, so it is
+        // never provisional.
+        let ready = (self.at_prompt_since.is_some()
+            && backend.cursor_at_prompt_end()
+            && !backend.prompt_end_pending())
             || self.heur_live(backend);
         if !ready {
             return None;
@@ -1602,9 +1742,14 @@ impl ComposerState {
         if backend.feed_live()
             && !self.draft.trim().is_empty()
             && self.at_prompt_since.is_some()
-            && !backend.has_prompt_end()
+            && (!backend.has_prompt_end() || backend.prompt_end_pending())
             && self.pending_has_room()
         {
+            // Queue when there is no captured prompt end yet (Bug 1a) OR the
+            // capture is still PROVISIONAL (ConPTY reorder — col-0 cell,
+            // upgrade pending): pinning a SubmitHold at a provisional cell
+            // leaks the row raw (rapid-fire cover fix). pump_pending
+            // dispatches the frame the cell settles, full cover certainty.
             if trace_enabled() {
                 log::info!(
                     "[composer] submit in prompt-render window: queued (pending={})",
@@ -1778,6 +1923,12 @@ impl ComposerState {
             self.heur = None;
         }
         let heur_wake = self.maybe_mint_heur(backend, recs, running, now);
+        // Optimistic cover (flicker fix): maintained every tick, decoupled
+        // from the mint. Same-frame on classifier-pass, revoked next tick if
+        // the row was streaming — no self-scheduled repaint needed (the
+        // cover is shown the same frame; a revoke is driven by the output
+        // batch that bumped feed_gen, which repaints on its own).
+        self.maintain_heur_cover(backend, running);
         let inputs = self.gate_inputs(backend, recs, running, now);
         // Bug C: strip-hide hysteresis clock — stamp the ALT_SCREEN rising
         // edge, clear on the falling edge (a re-entry restarts the full
@@ -1885,6 +2036,29 @@ impl ComposerState {
                     });
                     self.want_focus = false;
                     self.has_focus = false;
+                } else if !inputs.at_prompt
+                    && (inputs.open_block || self.busy_since.is_some())
+                    && inline_interactive_prompt(&backend.cursor_row_text())
+                {
+                    // Inline-prompt auto-yield (permanent editor's ONE
+                    // exception): the running command is asking a question
+                    // on the primary screen (password / host-key / y-n) —
+                    // the keys belong to IT. Yield like a deliberate blur:
+                    // nothing fires, the queue folds into the visible draft
+                    // (never lost, never blind-run), and the gate re-arms
+                    // clean at the next fresh prompt. One bounded cursor-row
+                    // read per busy-Compose frame (the pre-shell labels'
+                    // cost class).
+                    if trace_enabled() {
+                        log::info!(
+                            "[composer] inline interactive prompt while busy → editor yields raw"
+                        );
+                    }
+                    self.fold_pending_into_draft();
+                    self.mode = ComposerMode::Raw(RawReason::Busy);
+                    self.want_focus = false;
+                    self.has_focus = false;
+                    self.last_activity = Some(now);
                 } else {
                     // Certainty-loss demotion (restored-render fix): Compose
                     // whose current-prompt cover can no longer be justified
@@ -1898,9 +2072,24 @@ impl ComposerState {
                     // clear chord re-certifies through a real re-prompt).
                     // A live SubmitHold or post-submit window bridges its
                     // own span by design (each ≤ 300ms, self-resolving).
+                    //
+                    // PERMANENT EDITOR: busy-Compose is a legitimate steady
+                    // state — an open block, or the feed-time busy span
+                    // between the exec edge and the returning pre
+                    // (`busy_since` is exactly that span, covering the
+                    // Blocks round-trip gap), is HEALTHY. No cover paints
+                    // here (`cover_line_for` requires the latch), so there
+                    // are never two competing input surfaces on the prompt
+                    // row; typing during busy accumulates in the draft and
+                    // can no longer DEMOTE the box into hidden-until-click
+                    // (the measured G-trap). DEMOTE keeps firing for the
+                    // restored-broken-cover case at an idle prompt
+                    // (at_prompt latched, cursor dirty, busy_since None).
                     let healthy = self.submit_hold.is_some()
                         || self.post_submit.is_some()
-                        || (inputs.at_prompt && inputs.cursor_clean);
+                        || (inputs.at_prompt && inputs.cursor_clean)
+                        || inputs.open_block
+                        || self.busy_since.is_some();
                     if healthy {
                         self.compose_broken_since = None;
                     } else {
@@ -2228,6 +2417,32 @@ pub fn cover_line_for(
                 .flatten()
         })
         .or_else(|| {
+            // Optimistic SETTLE-WINDOW cover (flicker fix): a provisional
+            // 133;B (ConPTY OSC-vs-text reorder — captured at col 0 with the
+            // upgrade pending) leaves the fresh prompt rendering on the grid
+            // while the permanent editor already shows in the strip. Blank
+            // the prompt ROW now — decoupled from the column settlement —
+            // so the raw prompt never flashes beside the editor. The row is
+            // stable across the column upgrade (the cursor stays on it as the
+            // prompt text renders), and the SubmitHold pin stays settlement-
+            // gated (pump_pending readiness), so this presentation-only blank
+            // can never mispin a cover. Cursor must still be ON the captured
+            // row (a late output tail moved it off ⇒ raw is honest there).
+            (comp_active
+                && state.mode == ComposerMode::Compose
+                && state.at_prompt_latched()
+                && backend.prompt_end_pending())
+            .then(|| {
+                backend
+                    .block_feed
+                    .as_ref()
+                    .and_then(|f| f.prompt_end)
+                    .filter(|(line, _)| backend.cursor_line() == *line)
+                    .map(|(line, _)| line)
+            })
+            .flatten()
+        })
+        .or_else(|| {
             // D2: the heuristic latch's cell — the armed cover paints over
             // the raw `root@…#` row exactly like an integrated prompt row.
             // heur_cover_line embeds the full certainty chain (latch live,
@@ -2235,6 +2450,24 @@ pub fn cover_line_for(
             // rendering (drop-don't-drift).
             (comp_active)
                 .then(|| state.heur_cover_line(backend))
+                .flatten()
+        })
+        .or_else(|| {
+            // Optimistic HEURISTIC cover (flicker fix): with the permanent
+            // editor, the strip already shows the `#` editor during the
+            // markerless nested-shell re-prompt, but the heuristic LATCH
+            // (which gates SUBMISSION) only mints after HEUR_QUIET=300ms —
+            // so the raw `root@…#` prompt flashed beside the editor for that
+            // whole window. The COVER is decoupled from the arm and paints
+            // the SAME frame the classifier first reads the cursor row as a
+            // prompt (frame N — the earlier confirm-then-cover left a visible
+            // one-frame dual-prompt on every re-mint), then revokes next tick
+            // if the row was streaming (`maintain_heur_cover`). Presentation
+            // only: a false cover blanks a streaming row for at most one
+            // frame; a false ARM would type into a running command, which is
+            // why the arm keeps the full 300ms.
+            (comp_active)
+                .then(|| state.heur_cover_optimistic(backend))
                 .flatten()
         })
         .or_else(|| {
@@ -2745,6 +2978,15 @@ pub fn show(
         && inputs.at_prompt
         && !buffering
         && !cmd_multiline;
+    // PERMANENT EDITOR: the busy span under a held Compose — an open block,
+    // or the feed-time exec→pre span (`busy_since`) that covers the Blocks
+    // round-trip. Enter QUEUES here (dispatched by `pump_pending` at the
+    // next provably-clean prompt — never into the running command) and the
+    // hint slot carries the busy chip.
+    let busy_hold = inputs.running
+        && !inputs.alt
+        && !inputs.at_prompt
+        && (inputs.open_block || state.busy_since.is_some());
 
     // PRE-SHELL veto (v0.1.1): no hook event has been seen in the CURRENT
     // lifetime and no prompt latch is live — whatever is talking (ssh auth,
@@ -2911,7 +3153,11 @@ pub fn show(
                     }
                     n
                 };
-                match enter_action(can_submit, has_draft, buffering && !cmd_multiline) {
+                // Queue while the typeahead buffer is engaged OR across the
+                // whole busy span (permanent editor): Enter during a running
+                // command queues the draft as a blind submission that fires
+                // at the prompt-byte — faster than any human could re-type.
+                match enter_action(can_submit, has_draft, (buffering || busy_hold) && !cmd_multiline) {
                     EnterAction::Submit => {
                         let n = consume_all_enters(ui);
                         if n > 0 {
@@ -3213,7 +3459,28 @@ pub fn show(
             let quiet = state
                 .last_activity
                 .is_some_and(|t| now.duration_since(t) < REVEAL);
-            let hint = if lane_ghost.is_some() {
+            // PERMANENT EDITOR: honest Busy moved into the fixed hint slot,
+            // not died — while a command runs under the held Compose the
+            // slot shows the pulsing dot + running cmd + elapsed and states
+            // the contract ("Enter queues"). Same slot the hints use (one
+            // occupant, F3 stable chrome, zero geometry change); REVEAL
+            // hysteresis keeps instant commands from flashing it.
+            let busy_chip = (busy_hold && !quiet && lane_ghost.is_none() && !cmd_multiline)
+                .then(|| {
+                    match recs.iter().rev().find(|r| r.end_off.is_none()) {
+                        Some(r) => format!(
+                            "{} \u{b7} {} \u{2014} Enter queues",
+                            super::middle_ellipsize(&r.cmd.replace(['\r', '\n'], " "), 24),
+                            super::term_view::fmt_duration(
+                                now_ms().saturating_sub(r.started_ms)
+                            ),
+                        ),
+                        // Blocks round-trip gap (exec edge seen, rec not
+                        // mirrored yet): the contract line alone.
+                        None => "running \u{2014} Enter queues".to_string(),
+                    }
+                });
+            let hint = if lane_ghost.is_some() || busy_chip.is_some() {
                 None
             } else if cmd_multiline {
                 // P6b §6 / D2: the refusal is announced, never silent.
@@ -3229,7 +3496,7 @@ pub fn show(
             } else {
                 None
             };
-            if let Some(hint) = hint {
+            if busy_chip.is_some() || hint.is_some() {
                 let last = state.draft.lines().last().unwrap_or("");
                 let tw = if last.is_empty() {
                     0.0
@@ -3239,17 +3506,33 @@ pub fn show(
                         .size()
                         .x
                 };
+                let text: &str = busy_chip.as_deref().or(hint).unwrap_or_default();
                 let hg = painter.layout_no_wrap(
-                    hint.into(),
+                    text.into(),
                     FontId::proportional(10.0),
                     super::TEXT_FAINT,
                 );
-                if x + tw + 24.0 < slot_right - hg.size().x {
+                // The chip's dot needs its slice of the slot too.
+                let dot = busy_chip.is_some();
+                let extra = if dot { 13.0 } else { 0.0 };
+                if x + tw + 24.0 < slot_right - hg.size().x - extra {
+                    let tx = slot_right - hg.size().x;
+                    if dot {
+                        // Pulse + live elapsed: the same ~100ms cadence the
+                        // Busy lane asks for (silent long-running commands
+                        // produce no repaints of their own).
+                        ui.ctx().request_repaint_after(Duration::from_millis(100));
+                        let time = ui.input(|i| i.time);
+                        let pulse =
+                            0.6 + 0.4 * (time as f32 * std::f32::consts::TAU).sin().abs();
+                        painter.circle_filled(
+                            Pos2::new(tx - 10.0, strip_rect.center().y),
+                            3.0,
+                            super::ACCENT.gamma_multiply(pulse),
+                        );
+                    }
                     painter.galley(
-                        Pos2::new(
-                            slot_right - hg.size().x,
-                            strip_rect.center().y - hg.size().y / 2.0,
-                        ),
+                        Pos2::new(tx, strip_rect.center().y - hg.size().y / 2.0),
                         hg,
                         super::TEXT_FAINT,
                     );
@@ -3270,13 +3553,14 @@ pub fn show(
                             // Focus stays in the editor (typeahead window).
                             let (bytes, _) = state.submit(backend, cover_line, sub_cwd);
                             out.write = bytes;
-                        } else if buffering
+                        } else if (buffering || busy_hold)
                             && has_draft
                             && !cmd_multiline
                             && state.pending_has_room()
                         {
-                            // Mid-window Run click = the Enter gesture:
-                            // queue for the next prompt cycle.
+                            // Mid-window / mid-busy Run click = the Enter
+                            // gesture: queue for the next prompt cycle
+                            // (mouse-first parity with Enter's Queue).
                             state.queue_draft();
                         }
                     } else if !resp.has_focus() {
@@ -4244,12 +4528,17 @@ mod tests {
         st.has_focus = true;
         st.on_stream_events(1, 1, now);
         assert_eq!(st.mode, ComposerMode::Compose);
-        // Unfocused with an empty draft: quiet dismissal.
+        // REWRITTEN DELIBERATELY (permanent editor): the exec edge never
+        // demotes an existing Compose — unfocused/empty included (this leg
+        // used to pin the "quiet dismissal" to Raw(Busy), one of the two
+        // yields behind the measured re-arm gap). An external SubmitCommand
+        // under an armed composer keeps the box; busy-Compose is a healthy
+        // steady state and Enter queues.
         let mut st = ComposerState::default();
         st.on_stream_events(1, 0, now);
         st.mode = ComposerMode::Compose;
         st.on_stream_events(1, 1, now);
-        assert_eq!(st.mode, ComposerMode::Raw(RawReason::Busy));
+        assert_eq!(st.mode, ComposerMode::Compose, "exec edge never demotes Compose");
     }
 
     /// Build a backend parked at a clean captured prompt end (Bug 1 support).
@@ -4754,8 +5043,10 @@ mod tests {
 
     /// D2 post-submit window: resolves on the FRESH heuristic latch (draft
     /// kept, Compose held); the integrated 300ms threshold must NOT fire
-    /// mid-episode; with no fresh latch by HEUR_FLUSH the buffer flushes in
-    /// order as type-ahead and the composer yields Raw(Busy).
+    /// mid-episode; with no fresh latch by HEUR_FLUSH the window closes but
+    /// the editor STAYS and nothing flushes (REWRITTEN DELIBERATELY: this
+    /// leg used to pin the HEUR_FLUSH raw flush + Raw(Busy) yield — the
+    /// permanent-editor fix removes that yield on the heuristic lane too).
     #[test]
     fn heur_post_submit_resolution() {
         let (mut b, mut st, recs, t0) = heur_episode_setup();
@@ -4787,8 +5078,9 @@ mod tests {
         assert_eq!(st.draft, "id", "draft survives the resolution");
         assert!(st.take_pending_clear().is_none(), "nothing flushed");
 
-        // Flush branch: no fresh latch by HEUR_FLUSH ⇒ ordered type-ahead
-        // flush, editor yields Raw(Busy) — the honest long-running story.
+        // Threshold branch: no fresh latch by HEUR_FLUSH ⇒ the window
+        // closes, Compose HOLDS, nothing flushes — the inner long-running
+        // command keeps the editor and its visible draft (permanent editor).
         let (mut b, mut st, recs, t0) = heur_episode_setup();
         let t1 = t0 + HEUR_QUIET + Duration::from_millis(100);
         st.tick(&b, &recs, true, true, t1);
@@ -4796,13 +5088,19 @@ mod tests {
         let _ = st.dispatch_submission(&b, cover, None, "sleep 100", t1);
         b.advance_live(b"sleep 100\r\n"); // echo, then silence — no prompt
         st.draft = "id2".into();
-        st.tick(&b, &recs, true, true, t1 + HEUR_FLUSH + Duration::from_millis(10));
-        assert_eq!(st.mode, ComposerMode::Raw(RawReason::Busy));
+        let late = t1 + HEUR_FLUSH + Duration::from_millis(10);
+        st.tick(&b, &recs, true, true, late);
         assert_eq!(
-            st.take_pending_clear().as_deref(),
-            Some(b"id2".as_slice()),
-            "buffered typing flushes in order as shell type-ahead"
+            st.mode,
+            ComposerMode::Compose,
+            "the heuristic threshold no longer yields the editor"
         );
+        assert!(st.post_submit.is_none(), "window closed at HEUR_FLUSH");
+        assert!(
+            st.take_pending_clear().is_none(),
+            "buffered typing never flushes raw"
+        );
+        assert_eq!(st.draft, "id2", "typing stays visible in the draft");
     }
 
     /// D2 hand-back (extends `nested_shell_reattach`): a heuristic-armed
@@ -4879,6 +5177,7 @@ mod tests {
                         &recs,
                         1,
                         true,
+                        false, // collapsed (C2): strip visible in this headless rig
                         false,
                         FontId::monospace(13.0),
                         None,
@@ -6595,12 +6894,15 @@ mod tests {
         assert!(st.draft.is_empty(), "flushed, not duplicated");
     }
 
-    /// Disambiguation rule (b): no fresh prompt within POST_SUBMIT_FLUSH —
-    /// the command is long-running (`ping -n 3`) and typing during it is
-    /// shell type-ahead: the buffer flushes to the PTY and the composer
-    /// yields Raw(Busy). PSReadLine echoes and executes it natively.
+    /// Rule (b), REWRITTEN DELIBERATELY for the permanent editor (this test
+    /// used to pin the 300ms flush+yield — the measured re-arm gap): no
+    /// fresh prompt within POST_SUBMIT_FLUSH means the command is
+    /// long-running (`ping -n 3`) — the WINDOW closes but the editor STAYS,
+    /// typed text keeps buffering visibly in the draft, and NOTHING flushes
+    /// raw. Enter then queues; the queued command fires at the prompt-byte
+    /// via pump_pending.
     #[test]
-    fn busy_threshold_flushes_typeahead_to_shell() {
+    fn busy_threshold_holds_compose_and_buffers_typing() {
         let recs: Vec<BlockRec> = Vec::new();
         let now = Instant::now();
         let mut b = backend_full_screen_prompt();
@@ -6615,29 +6917,46 @@ mod tests {
         pump_counters(&mut st, &b, now);
         st.draft = "dfs".into(); // typed during the ping
 
-        // Inside the threshold: still buffering (a fast prompt would keep it).
+        // Inside the threshold: still buffering.
         st.tick(&b, &recs, true, false, now + POST_SUBMIT_FLUSH - Duration::from_millis(10));
         assert_eq!(st.mode, ComposerMode::Compose);
         assert!(st.take_pending_clear().is_none());
         assert_eq!(st.draft, "dfs");
 
-        // Past it: flush + yield.
+        // Past it: window closed, Compose HELD, zero bytes, draft intact —
+        // the editor never leaves (box-away time = 0).
         st.tick(&b, &recs, true, false, now + POST_SUBMIT_FLUSH + Duration::from_millis(10));
-        assert_eq!(st.mode, ComposerMode::Raw(RawReason::Busy));
-        assert_eq!(
-            st.take_pending_clear().as_deref(),
-            Some(b"dfs".as_ref()),
-            "typed-ahead keys land at the shell exactly once"
-        );
-        assert!(st.draft.is_empty());
+        assert_eq!(st.mode, ComposerMode::Compose, "the editor never yields on the threshold");
+        assert!(st.take_pending_clear().is_none(), "no raw flush, ever");
+        assert_eq!(st.draft, "dfs", "typing stays visible in the draft");
+        assert!(!st.buffering(), "the window itself is closed");
+
+        // Enter now queues (busy_hold routing); the queued command fires the
+        // frame the fresh prompt certifies clean — the prompt-byte.
+        st.queue_draft();
+        assert!(st.pump_pending(&b, None, Some("C:\\"), now + Duration::from_secs(1)).is_none(),
+            "never dispatches into the running command");
+        let mut d = b"\r\ndone\r\n".to_vec();
+        d.extend(hook_bytes("pre", r#"{"e":0,"n":2,"d":"C:"}"#));
+        d.extend_from_slice(b"PS C:\\> ");
+        d.extend_from_slice(b"\x1b]133;B\x07");
+        b.advance_live(&d);
+        let t2 = now + Duration::from_secs(2);
+        pump_counters(&mut st, &b, t2);
+        st.tick(&b, &recs, true, false, t2);
+        let (bytes, spacer) = st
+            .pump_pending(&b, None, Some("C:\\"), t2)
+            .expect("queued submission fires at the clean fresh prompt");
+        assert_eq!(bytes, b"dfs\r");
+        assert!(!spacer);
     }
 
-    /// An EMPTY buffer at the threshold (nothing typed since Enter): the
-    /// window yields to Raw(Busy) with zero bytes — from here typing goes
-    /// raw to the grid as native shell type-ahead, the pre-typeahead
-    /// behavior for a busy shell.
+    /// An EMPTY buffer at the threshold (nothing typed since Enter),
+    /// REWRITTEN DELIBERATELY for the permanent editor (used to pin the
+    /// yield to Raw(Busy)): the window closes with zero bytes and the
+    /// editor stays — lane_content remains Editor for the whole run.
     #[test]
-    fn empty_window_expires_to_busy_without_bytes() {
+    fn empty_window_expires_holding_compose() {
         let recs: Vec<BlockRec> = Vec::new();
         let now = Instant::now();
         let mut b = backend_full_screen_prompt();
@@ -6651,10 +6970,940 @@ mod tests {
         b.advance_live(&d);
         pump_counters(&mut st, &b, now);
 
-        st.tick(&b, &recs, true, false, now + POST_SUBMIT_FLUSH + Duration::from_millis(10));
-        assert_eq!(st.mode, ComposerMode::Raw(RawReason::Busy));
+        let late = now + POST_SUBMIT_FLUSH + Duration::from_millis(10);
+        st.tick(&b, &recs, true, false, late);
+        assert_eq!(st.mode, ComposerMode::Compose, "no yield at the threshold");
         assert!(st.take_pending_clear().is_none(), "no bytes for an empty buffer");
         assert!(!st.buffering());
+        assert_eq!(
+            lane_content(&st, true, false, true, late),
+            LaneContent::Editor,
+            "the strip lane stays the editor across the busy span"
+        );
+    }
+
+    // ── Permanent editor (rearm-latency fix): zero box-away time ───────
+
+    /// Submit-ready predicate, mirroring show()'s `can_submit` core (the
+    /// measurement rig's definition).
+    fn submit_ready(st: &ComposerState, b: &TermBackend, recs: &[BlockRec], now: Instant) -> bool {
+        let i = st.gate_inputs(b, recs, true, now);
+        st.mode == ComposerMode::Compose
+            && i.running
+            && !i.alt
+            && !i.open_block
+            && i.at_prompt
+            && !st.buffering()
+    }
+
+    /// THE latency assertion (permanence truth table, lanes B/D of the
+    /// measurement rig on simulated clocks): across a submit → slow command
+    /// → fresh prompt cycle, `lane_content` is Editor at EVERY frame (box-
+    /// away time = 0ms) and submit-ready returns within one 4ms frame of
+    /// the 133;B prompt-byte feed.
+    #[test]
+    fn editor_never_leaves_across_submit_cycle() {
+        // Lane B: integrated, 1.2s command (the measured 945ms hidden span).
+        let recs: Vec<BlockRec> = Vec::new();
+        let t0 = Instant::now();
+        let mut b = backend_full_screen_prompt();
+        let mut st = ComposerState::default();
+        assert_eq!(sim_frame(&mut st, &mut b, &recs, t0), Some(5));
+        st.draft = "npm run build".into();
+        let _ = st.submit(&b, Some(5), Some("C:\\"));
+
+        let mut exec = hook_bytes("exec", r#"{"c":"npm run build"}"#);
+        exec.extend_from_slice(b"npm run build\r\n");
+        let mut prompt = hook_bytes("pre", r#"{"e":0,"n":2,"d":"C:"}"#);
+        prompt.extend_from_slice(b"PS C:\\> ");
+        let mut schedule: Vec<(u64, Vec<u8>)> = vec![
+            (20, exec),
+            (300, b"building...\r\n".to_vec()),
+            (1200, b"done\r\n".to_vec()),
+            (1230, prompt),
+            (1245, b"\x1b]133;B\x07".to_vec()),
+        ];
+        let mut fed = 0usize;
+        let mut ready_at: Option<u64> = None;
+        for el in (0..=1500u64).step_by(4) {
+            let now = t0 + Duration::from_millis(el);
+            while fed < schedule.len() && schedule[fed].0 <= el {
+                let bytes = std::mem::take(&mut schedule[fed].1);
+                b.advance_live(&bytes);
+                pump_counters(&mut st, &b, now);
+                fed += 1;
+            }
+            let _ = sim_frame(&mut st, &mut b, &recs, now);
+            assert_eq!(
+                lane_content(&st, true, false, false, now),
+                LaneContent::Editor,
+                "lane must be Editor at every frame (t=+{el}ms)"
+            );
+            if ready_at.is_none() && el > 0 && submit_ready(&st, &b, &recs, now) {
+                ready_at = Some(el);
+            }
+        }
+        let ready = ready_at.expect("submit-ready must return");
+        // Ready returns at the PRE byte (+1230): the box is already Compose,
+        // so the pre latch alone re-enables Enter — an Enter landing in the
+        // pre→133;B render window QUEUES and pump-dispatches on the 133;B
+        // frame (Bug 1a, pinned by window_submit_queues_then_converts_via_
+        // pump), so nothing can fire before the prompt-byte certifies.
+        assert!(
+            (1230..=1249).contains(&ready),
+            "submit-ready within one frame of the prompt bytes, got +{ready}ms"
+        );
+
+        // Lane D: ssh, RTT 350ms > the old 300ms window (the measured 80ms
+        // blink on EVERY submit) — the box must not blink at all.
+        let t0 = Instant::now();
+        let mut b = backend_full_screen_prompt();
+        let mut st = ComposerState {
+            is_ssh: true,
+            ..Default::default()
+        };
+        assert_eq!(sim_frame(&mut st, &mut b, &recs, t0), Some(5));
+        st.draft = "ls".into();
+        let _ = st.submit(&b, Some(5), Some("~"));
+        let mut exec = hook_bytes("exec", r#"{"c":"ls"}"#);
+        exec.extend_from_slice(b"ls\r\nfile1\r\n");
+        let mut prompt = hook_bytes("pre", r#"{"e":0,"n":2,"d":"~"}"#);
+        prompt.extend_from_slice(b"PS C:\\> \x1b]133;B\x07");
+        let mut schedule: Vec<(u64, Vec<u8>)> = vec![(350, exec), (380, prompt)];
+        let mut fed = 0usize;
+        let mut ready_at: Option<u64> = None;
+        for el in (0..=600u64).step_by(4) {
+            let now = t0 + Duration::from_millis(el);
+            while fed < schedule.len() && schedule[fed].0 <= el {
+                let bytes = std::mem::take(&mut schedule[fed].1);
+                b.advance_live(&bytes);
+                pump_counters(&mut st, &b, now);
+                fed += 1;
+            }
+            let _ = sim_frame(&mut st, &mut b, &recs, now);
+            assert_eq!(
+                lane_content(&st, true, false, false, now),
+                LaneContent::Editor,
+                "ssh 350ms RTT: no per-submit blink (t=+{el}ms)"
+            );
+            if ready_at.is_none() && el > 0 && submit_ready(&st, &b, &recs, now) {
+                ready_at = Some(el);
+            }
+        }
+        let ready = ready_at.expect("ssh submit-ready must return");
+        // The window close at +300ms re-exposes the still-latched prompt
+        // (the exec is still on the wire at RTT 350) — submit-ready may
+        // return as wire type-ahead before the prompt bytes; it must never
+        // be LATER than one frame after them.
+        assert!(
+            ready <= 384,
+            "ssh ready by one frame after the prompt bytes, got +{ready}ms"
+        );
+    }
+
+    /// Lane F (heuristic nested shell, 1.5s inner command — the measured
+    /// 821ms hidden span): Editor at every frame; the queue contract holds
+    /// (a mid-run Enter fires at the fresh mint, not into the command).
+    #[test]
+    fn heur_editor_never_leaves_across_submit_cycle() {
+        let (mut b, mut st, recs, t0) = heur_episode_setup();
+        let t1 = t0 + HEUR_QUIET + Duration::from_millis(100);
+        st.tick(&b, &recs, true, true, t1);
+        assert_eq!(st.mode, ComposerMode::Compose);
+        let cover = cover_line_for(&st, &b, true, t1);
+        let _ = st.dispatch_submission(&b, cover, None, "apt update", t1);
+        let _ = st.take_submit_cmd();
+
+        let mut schedule: Vec<(u64, Vec<u8>)> = vec![
+            (30, b"apt update\r\n".to_vec()),
+            (700, b"Reading package lists...\r\n".to_vec()),
+            (1500, b"Done\r\n".to_vec()),
+            (1520, b"root@box:/# ".to_vec()),
+        ];
+        let mut fed = 0usize;
+        let mut latch_was_down = false;
+        let mut minted_at: Option<u64> = None;
+        for el in (0..=2000u64).step_by(4) {
+            let now = t1 + Duration::from_millis(el);
+            while fed < schedule.len() && schedule[fed].0 <= el {
+                let bytes = std::mem::take(&mut schedule[fed].1);
+                b.advance_live(&bytes);
+                fed += 1;
+            }
+            st.tick(&b, &recs, true, true, now);
+            assert_eq!(
+                lane_content(&st, true, false, true, now),
+                LaneContent::Editor,
+                "heuristic lane: the editor never leaves (t=+{el}ms)"
+            );
+            // The FRESH mint (the pre-submit latch is still live at el=0
+            // until the echo tears it down at +30ms — skip it).
+            if !st.heur_live(&b) {
+                latch_was_down = true;
+            } else if latch_was_down && minted_at.is_none() {
+                minted_at = Some(el);
+            }
+        }
+        let minted = minted_at.expect("fresh heuristic latch must mint");
+        // Simulated-instant caveat: HEUR_QUIET reads the backend's real
+        // output clock, so the walk can only pin "at/after the prompt
+        // paints" here — the exact cmd-end+300ms remint timing is the
+        // measurement rig's job (real clocks, staging).
+        assert!(
+            minted >= 1520,
+            "re-mint only after the fresh nested prompt paints, got +{minted}ms"
+        );
+    }
+
+    /// THE measured G-trap, structurally fixed: typing during a busy
+    /// command lands in the (still present, still focused) draft — never
+    /// raw — so the returning prompt is clean, the box never DEMOTEs into
+    /// hidden-until-click (the rig measured "hidden FOREVER" here), and a
+    /// mid-run Enter queues then fires at the prompt-byte.
+    #[test]
+    fn typed_during_busy_stays_in_draft() {
+        let recs: Vec<BlockRec> = Vec::new();
+        let t0 = Instant::now();
+        let mut b = backend_full_screen_prompt();
+        let mut st = ComposerState::default();
+        assert_eq!(sim_frame(&mut st, &mut b, &recs, t0), Some(5));
+        st.draft = "npm test".into();
+        let _ = st.submit(&b, Some(5), Some("C:\\"));
+
+        let mut exec = hook_bytes("exec", r#"{"c":"npm test"}"#);
+        exec.extend_from_slice(b"npm test\r\n");
+        b.advance_live(&exec);
+        pump_counters(&mut st, &b, t0);
+
+        // +600ms: the user types the next command — into the DRAFT (the
+        // editor is present and focused; keys can no longer fall raw).
+        let t_type = t0 + Duration::from_millis(600);
+        st.tick(&b, &recs, true, true, t_type);
+        assert_eq!(st.mode, ComposerMode::Compose, "box present while typing");
+        st.draft = "git status".into();
+        // …and presses Enter: queue (the busy_hold Enter routing).
+        st.queue_draft();
+
+        // Well past DEMOTE with the command still running: never demoted.
+        let t_demote = t_type + DEMOTE + Duration::from_millis(100);
+        st.tick(&b, &recs, true, true, t_demote);
+        assert_eq!(
+            st.mode,
+            ComposerMode::Compose,
+            "typing during busy can never DEMOTE the box into hidden-until-click"
+        );
+        assert!(st.take_pending_clear().is_none(), "nothing leaks to the PTY");
+
+        // The prompt returns CLEAN (no echoed type-ahead exists to dirty
+        // it); the queued command fires at the prompt-byte frame.
+        let mut d = b"ok\r\n".to_vec();
+        d.extend(hook_bytes("pre", r#"{"e":0,"n":2,"d":"C:"}"#));
+        d.extend_from_slice(b"PS C:\\> ");
+        d.extend_from_slice(b"\x1b]133;B\x07");
+        b.advance_live(&d);
+        let t_prompt = t0 + Duration::from_millis(1245);
+        pump_counters(&mut st, &b, t_prompt);
+        st.tick(&b, &recs, true, true, t_prompt);
+        assert_eq!(st.mode, ComposerMode::Compose);
+        let (bytes, spacer) = st
+            .pump_pending(&b, None, Some("C:\\"), t_prompt)
+            .expect("queued submission fires at the clean fresh prompt");
+        assert_eq!(bytes, b"git status\r");
+        assert!(!spacer);
+        assert!(!st.episode_used || st.mode == ComposerMode::Compose, "no ManualOnly trap");
+    }
+
+    /// The no-demote pin: busy-Compose is DEMOTE-healthy through BOTH busy
+    /// signals — an open block rec, and the feed-time exec→pre span
+    /// (`busy_since`, covering the Blocks round-trip) — while the idle-
+    /// prompt broken-cover case still demotes (the restored-render fix's
+    /// reason to exist; pinned by compose_demotes_after_sustained_…).
+    #[test]
+    fn busy_compose_survives_demote_clock() {
+        // Signal 1: busy_since alone (no rec mirrored yet — empty recs).
+        let recs: Vec<BlockRec> = Vec::new();
+        let t0 = Instant::now();
+        let mut b = backend_full_screen_prompt();
+        let mut st = ComposerState::default();
+        assert_eq!(sim_frame(&mut st, &mut b, &recs, t0), Some(5));
+        st.draft = "sleep 60".into();
+        let _ = st.submit(&b, Some(5), Some("C:\\"));
+        let mut exec = hook_bytes("exec", r#"{"c":"sleep 60"}"#);
+        exec.extend_from_slice(b"sleep 60\r\n");
+        b.advance_live(&exec);
+        pump_counters(&mut st, &b, t0);
+        st.tick(&b, &recs, true, true, t0 + DEMOTE + Duration::from_secs(5));
+        assert_eq!(
+            st.mode,
+            ComposerMode::Compose,
+            "busy-by-latch-drop (busy_since) is a healthy Compose steady state"
+        );
+
+        // Signal 2: open block rec (the mirrored-recs shape).
+        let open = vec![BlockRec {
+            epoch: 1,
+            n: 0,
+            cmd: "sleep 60".into(),
+            cwd: None,
+            exit: None,
+            started_ms: 0,
+            ended_ms: None,
+            start_off: 0,
+            end_off: None,
+            truncated: false,
+        }];
+        st.tick(&b, &open, true, true, t0 + DEMOTE + Duration::from_secs(10));
+        assert_eq!(
+            st.mode,
+            ComposerMode::Compose,
+            "an open block is a healthy Compose steady state"
+        );
+    }
+
+    /// The ONE remaining auto-yield: a password / y-n question printed by
+    /// the RUNNING command on the cursor row steps the busy-Compose editor
+    /// aside (keys belong to the program; echo may be off). Nothing fires —
+    /// the queue folds into the visible draft — and the gate re-arms clean
+    /// at the next fresh prompt.
+    #[test]
+    fn inline_prompt_yields_editor() {
+        let recs: Vec<BlockRec> = Vec::new();
+        let t0 = Instant::now();
+        let mut b = backend_full_screen_prompt();
+        let mut st = ComposerState::default();
+        assert_eq!(sim_frame(&mut st, &mut b, &recs, t0), Some(5));
+        st.draft = "sudo make install".into();
+        let _ = st.submit(&b, Some(5), Some("C:\\"));
+        let mut exec = hook_bytes("exec", r#"{"c":"sudo make install"}"#);
+        exec.extend_from_slice(b"sudo make install\r\n");
+        b.advance_live(&exec);
+        pump_counters(&mut st, &b, t0);
+        st.draft = "next cmd".into();
+        st.queue_draft(); // a queued Enter that must NEVER blind-fire here
+
+        // Ordinary output: the editor holds.
+        b.advance_live(b"make: entering directory\r\n");
+        st.tick(&b, &recs, true, true, t0 + Duration::from_millis(400));
+        assert_eq!(st.mode, ComposerMode::Compose);
+
+        // The command asks: the classifier yields the editor same frame.
+        b.advance_live(b"[sudo] password for alec: ");
+        st.tick(&b, &recs, true, true, t0 + Duration::from_millis(500));
+        assert_eq!(
+            st.mode,
+            ComposerMode::Raw(RawReason::Busy),
+            "editor steps aside for the inline password prompt"
+        );
+        assert!(st.take_pending_clear().is_none(), "nothing fires at a password");
+        assert_eq!(st.draft, "next cmd", "queue folded into the visible draft");
+        assert!(st.pending.is_empty());
+
+        // The prompt returns: the gate re-arms clean (no trap).
+        let mut d = b"\r\n".to_vec();
+        d.extend(hook_bytes("pre", r#"{"e":0,"n":2,"d":"C:"}"#));
+        d.extend_from_slice(b"PS C:\\> ");
+        d.extend_from_slice(b"\x1b]133;B\x07");
+        b.advance_live(&d);
+        let t1 = t0 + Duration::from_millis(900);
+        pump_counters(&mut st, &b, t1);
+        st.tick(&b, &recs, true, true, t1);
+        assert_eq!(st.mode, ComposerMode::Compose, "re-arms at the fresh prompt");
+    }
+
+    /// Classifier fixtures for the inline-interactive auto-yield: password /
+    /// passphrase / host-key / y-n confirm shapes match at the row END only;
+    /// prompts, percentages, plain output and colons-without-keywords never
+    /// match (a false positive is only ever the old always-yield behavior,
+    /// but the negatives keep the permanent editor permanent).
+    #[test]
+    fn inline_interactive_prompt_table() {
+        for row in [
+            "Password:",
+            "alec@box's password: ",
+            "Enter passphrase for key '/home/a/.ssh/id_ed25519':",
+            "[sudo] password for alec: ",
+            "Are you sure you want to continue connecting (yes/no)?",
+            "Are you sure you want to continue connecting (yes/no/[fingerprint])?",
+            "Do you want to continue? [Y/n]",
+            "Proceed with installation? (y/N)",
+            "Replace existing file? (y/n): ",
+            "Save changes [y/N]?",
+        ] {
+            assert!(inline_interactive_prompt(row), "must yield for {row:?}");
+        }
+        for row in [
+            "PS C:\\> ",
+            "root@box:/# ",
+            "Compiling pulse v0.1.4",
+            "progress: 100%",
+            "Elapsed time: 00:01:",     // colon tail, no keyword
+            "downloading... done",
+            "echo hello world",
+            "-- INSERT --",
+            "",
+        ] {
+            assert!(!inline_interactive_prompt(row), "must hold for {row:?}");
+        }
+    }
+
+    /// Busy typing through the REAL show() path (headless egui — the D2
+    /// test pattern): with the window closed and the command still running
+    /// (busy_hold), keys land in the draft with zero PTY bytes and Enter
+    /// QUEUES — the permanence truth table's interactive leg.
+    #[test]
+    fn show_busy_types_and_queues_enter() {
+        let recs: Vec<BlockRec> = Vec::new();
+        let t0 = Instant::now();
+        let mut b = backend_full_screen_prompt();
+        let mut st = ComposerState::default();
+        assert_eq!(sim_frame(&mut st, &mut b, &recs, t0), Some(5));
+        st.draft = "cargo build".into();
+        let _ = st.submit(&b, Some(5), Some("C:\\"));
+        let mut exec = hook_bytes("exec", r#"{"c":"cargo build"}"#);
+        exec.extend_from_slice(b"cargo build\r\n   Compiling...\r\n");
+        b.advance_live(&exec);
+        pump_counters(&mut st, &b, t0);
+        // The threshold has passed: window closed, Compose held (what a
+        // tick at +300ms does — set directly, show() uses the real clock).
+        st.post_submit = None;
+        st.submit_hold = None;
+        assert!(!st.buffering());
+
+        let ctx = egui::Context::default();
+        let strip = Rect::from_min_max(Pos2::new(0.0, 564.0), Pos2::new(800.0, 600.0));
+        let grid = Rect::from_min_max(Pos2::ZERO, Pos2::new(800.0, 564.0));
+        let frame = |st: &mut ComposerState, b: &TermBackend, events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_max(Pos2::ZERO, Pos2::new(800.0, 600.0))),
+                events,
+                ..Default::default()
+            };
+            let mut out = None;
+            let _ = ctx.run_ui(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    out = Some(show(
+                        ui,
+                        strip,
+                        grid,
+                        Uuid::nil(),
+                        st,
+                        b,
+                        &recs,
+                        1,
+                        true,
+                        false,
+                        false,
+                        FontId::monospace(13.0),
+                        None,
+                        None,
+                    ));
+                });
+            });
+            let o = out.unwrap();
+            st.has_focus = o.has_focus;
+            o
+        };
+        // Frame 1: the busy editor holds egui focus.
+        let o = frame(&mut st, &b, vec![]);
+        assert!(o.has_focus, "busy editor must hold focus");
+        assert_eq!(st.mode, ComposerMode::Compose);
+        // Frame 2: typing lands in the draft — zero PTY bytes.
+        let o = frame(&mut st, &b, vec![egui::Event::Text("git st".into())]);
+        assert!(o.write.is_empty(), "keystrokes never go raw while busy");
+        assert_eq!(st.draft, "git st");
+        // Frame 3: Enter queues (busy_hold routing) — still zero bytes.
+        let o = frame(
+            &mut st,
+            &b,
+            vec![egui::Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        assert!(o.write.is_empty(), "Enter during busy queues, never submits raw");
+        assert_eq!(st.pending.len(), 1, "the draft became a queued submission");
+        assert_eq!(st.pending[0], "git st");
+        assert!(st.draft.is_empty());
+        assert_eq!(st.mode, ComposerMode::Compose, "the box never leaves");
+    }
+
+    /// Production-faithful frame: on_stream_events + tick + drain the cover,
+    /// THEN compute cover_line and pump ONE queued submission in the SAME
+    /// frame (exactly central.rs' order — tick at :233, cover drain at :269,
+    /// cover_line at :362, pump inside show at :3198), draining the pump's
+    /// own cover. Returns the dispatched bytes, if any.
+    fn prod_frame(
+        st: &mut ComposerState,
+        b: &mut TermBackend,
+        recs: &[BlockRec],
+        now: Instant,
+    ) -> Option<Vec<u8>> {
+        // Mirror central.rs order: resolve a pending prompt-end upgrade
+        // (:220) BEFORE the tick/gate/pump read it.
+        let _ = b.poll_pending_prompt_end(now);
+        let f = b.block_feed.as_ref().unwrap();
+        let (pre, exec) = (f.pre_seen, f.exec_seen);
+        st.on_stream_events(pre, exec, now);
+        st.tick(b, recs, true, true, now);
+        if let Some((l, c, cwd, cmd)) = st.take_pending_history_cover() {
+            b.add_history_cover(l, c, cwd, cmd);
+        }
+        let comp_active = st.mode == ComposerMode::Compose;
+        let cl = cover_line_for(st, b, comp_active, now);
+        st.pump_pending(b, cl, Some("C:\\"), now).map(|(bytes, _)| {
+            if let Some((l, c, cwd, cmd)) = st.take_pending_history_cover() {
+                b.add_history_cover(l, c, cwd, cmd);
+            }
+            bytes
+        })
+    }
+
+    /// RAPID-FIRE REGRESSION (field: sandbox round 3 — Enter mashed on an
+    /// ssh session left the scrollback flip-flopping between `❯ cwd ls`
+    /// covers and raw `zany@host:~$ ls` prompt rows). Reproduces the ssh
+    /// delivery shape the passing blind_triple test does NOT: the echo of a
+    /// command and its completion prompt arrive in SEPARATE drains (RTT), so
+    /// the queued dispatch fires the frame the prompt-byte lands — racing the
+    /// just-closed block's cover mint. EVERY submitted command's prompt row
+    /// must get its `❯ cwd cmd` cover regardless of dispatch timing: N
+    /// back-to-back queued submits ⇒ N covered rows, zero raw leaks.
+    #[test]
+    fn rapid_fire_submits_every_row_covered() {
+        const N: usize = 8;
+        let recs: Vec<BlockRec> = Vec::new();
+        let mut t = Instant::now();
+        let mut b = backend_full_screen_prompt();
+        let mut st = ComposerState::default();
+        assert_eq!(sim_frame(&mut st, &mut b, &recs, t), Some(5));
+
+        // Enter mashed: the first submits, the rest queue instantly (all
+        // typed before any completes — the field gesture).
+        st.draft = "ls".into();
+        let (bytes, _) = st.submit(&b, cover_line_for(&st, &b, true, t), Some("C:\\"));
+        assert_eq!(bytes, b"ls\r");
+        for _ in 1..N {
+            st.draft = "ls".into();
+            st.queue_draft();
+        }
+        assert_eq!(st.pending.len(), N - 1);
+
+        // Drive the shell one delivery-chunk at a time. The ssh shape:
+        // Frame A: exec + echo (RTT) — NO prompt yet.
+        // Frame B: output rows scroll.
+        // Frame C: fresh pre + prompt text + 133;B (command done).
+        // The queued dispatch fires in Frame C's own tick/pump.
+        let mut done = 0usize;
+        let mut n = 2u32;
+        for _round in 0..(N * 6) {
+            // Whatever command is live (just dispatched or the initial ls).
+            // Frame A: exec OSC ahead of the echo (ConPTY reorder), then the
+            // echoed command text — a separate drain from the prompt.
+            b.advance_live(&hook_bytes("exec", r#"{"c":"ls"}"#));
+            b.advance_live(b"ls\r\n");
+            t += Duration::from_millis(4);
+            let _ = prod_frame(&mut st, &mut b, &recs, t);
+
+            // Frame B: a couple of output rows (the ls listing) scroll.
+            b.advance_live(b"Documents  Downloads\r\nMusic  Public\r\n");
+            t += Duration::from_millis(4);
+            let _ = prod_frame(&mut st, &mut b, &recs, t);
+
+            // Frame C: the completion prompt (pre ahead of its text — ConPTY
+            // order — then 133;B). at_prompt latches clean HERE.
+            let mut d = hook_bytes("pre", &format!(r#"{{"e":0,"n":{n},"d":"C:"}}"#));
+            d.extend_from_slice(b"PS C:\\> ");
+            d.extend_from_slice(b"\x1b]133;B\x07");
+            b.advance_live(&d);
+            n += 1;
+            t += Duration::from_millis(4);
+            let dispatched = prod_frame(&mut st, &mut b, &recs, t);
+            if dispatched.is_some() {
+                done += 1;
+            }
+            if !st.buffering() && st.submit_hold.is_none() && st.pending.is_empty() {
+                // Let the last hold release + convert.
+                for _ in 0..3 {
+                    t += Duration::from_millis(4);
+                    let _ = prod_frame(&mut st, &mut b, &recs, t);
+                }
+                break;
+            }
+        }
+
+        // Every one of the N `ls` invocations must have a healthy `❯ ls`
+        // history cover on a DISTINCT row — zero raw prompt leaks.
+        let covers = b.healthy_covers();
+        let cmd_covers: Vec<_> = covers.iter().filter(|c| c.cmd.is_some()).collect();
+        let mut lines: Vec<i32> = cmd_covers.iter().map(|c| c.line).collect();
+        lines.sort_unstable();
+        lines.dedup();
+        assert_eq!(
+            (cmd_covers.len(), lines.len()),
+            (N, N),
+            "all {N} submitted rows must be covered on distinct rows (got {} covers, {} distinct); \
+             a shortfall is the raw-prompt flip-flop leak",
+            cmd_covers.len(),
+            lines.len()
+        );
+        for c in &cmd_covers {
+            assert!(
+                b.row_has_text_at(c.line, c.col, "ls"),
+                "cover at row {} must sit on a row that really shows its `ls` echo",
+                c.line
+            );
+        }
+        assert_eq!(done, N - 1, "all queued submits dispatched");
+    }
+
+    /// REORDER REPRO (the field flip-flop's real mechanism): conhost
+    /// forwards the 133;B OSC AHEAD of its prompt text, so `prompt_end` is
+    /// captured PROVISIONALLY at col 0 with the cursor also parked at col 0 —
+    /// `cursor_at_prompt_end()` is briefly true there. With the permanent
+    /// editor's immediate queued dispatch, pump fires in THAT window and pins
+    /// the SubmitHold at col 0; the echo then lands at the real prompt-end
+    /// col, so the conversion `row_has_text_at(row, 0, cmd)` fails and the row
+    /// leaks raw. The fix: pump waits for the SETTLED prompt end.
+    #[test]
+    fn rapid_fire_reorder_no_raw_leak() {
+        const N: usize = 6;
+        let recs: Vec<BlockRec> = Vec::new();
+        let mut t = Instant::now();
+        let mut b = backend_full_screen_prompt();
+        let mut st = ComposerState::default();
+        assert_eq!(sim_frame(&mut st, &mut b, &recs, t), Some(5));
+        st.draft = "ls".into();
+        let _ = st.submit(&b, cover_line_for(&st, &b, true, t), Some("C:\\"));
+        for _ in 1..N {
+            st.draft = "ls".into();
+            st.queue_draft();
+        }
+        let mut n = 2u32;
+        for _round in 0..(N * 8) {
+            // exec ahead of echo (ConPTY reorder), echo, output scroll.
+            b.advance_live(&hook_bytes("exec", r#"{"c":"ls"}"#));
+            b.advance_live(b"ls\r\n");
+            b.advance_live(b"Documents  Downloads\r\n");
+            t += Duration::from_millis(4);
+            let _ = prod_frame(&mut st, &mut b, &recs, t);
+            // REORDER: the fresh prompt's pre + 133;B arrive BEFORE the prompt
+            // text — the cursor sits at col 0, so prompt_end captures
+            // provisionally at col 0 (pending upgrade).
+            let mut d = hook_bytes("pre", &format!(r#"{{"e":0,"n":{n},"d":"C:"}}"#));
+            d.extend_from_slice(b"\x1b]133;B\x07");
+            b.advance_live(&d);
+            n += 1;
+            t += Duration::from_millis(4);
+            // THIS frame is the col-0 window: pump must NOT dispatch here.
+            let _ = prod_frame(&mut st, &mut b, &recs, t);
+            // The prompt text renders (cursor → col 8); the pending upgrade
+            // will settle prompt_end there.
+            b.advance_live(b"PS C:\\> ");
+            t += Duration::from_millis(4);
+            let _ = prod_frame(&mut st, &mut b, &recs, t);
+            // A few quiet frames let poll_pending_prompt_end settle the cell.
+            // The upgrade clock is REAL (last_output_at = Instant::now() in
+            // advance_live), so sleep past PROMPT_END_QUIESCE and drive the
+            // settle frames on the real clock (the sim-clock caveat).
+            std::thread::sleep(Duration::from_millis(45));
+            for _ in 0..3 {
+                let rt = Instant::now();
+                t = t.max(rt);
+                let _ = prod_frame(&mut st, &mut b, &recs, rt);
+            }
+            if !st.buffering() && st.submit_hold.is_none() && st.pending.is_empty() {
+                break;
+            }
+        }
+        let covers = b.healthy_covers();
+        let cmd_covers: Vec<_> = covers.iter().filter(|c| c.cmd.is_some()).collect();
+        let mut lines: Vec<i32> = cmd_covers.iter().map(|c| c.line).collect();
+        lines.sort_unstable();
+        lines.dedup();
+        assert_eq!(
+            (cmd_covers.len(), lines.len()),
+            (N, N),
+            "reorder window must not leak: {N} covers on distinct rows expected, \
+             got {} covers / {} distinct rows (raw-prompt flip-flop)",
+            cmd_covers.len(),
+            lines.len()
+        );
+        for c in &cmd_covers {
+            assert!(
+                b.row_has_text_at(c.line, c.col, "ls"),
+                "cover at row {} col {} must sit on its `ls` echo",
+                c.line,
+                c.col
+            );
+        }
+    }
+
+    /// FLICKER REGRESSION — integrated settle window (field: raw prompt +
+    /// block cursor visible above the strip while it already shows "Type a
+    /// command…"). The permanent editor keeps the strip up through the
+    /// ConPTY reorder settle window (pre → provisional col-0 133;B → prompt
+    /// text → 40ms quiescence upgrade); the raw prompt row on the grid must
+    /// be covered at EVERY frame from the prompt-byte on, or it flashes
+    /// beside the editor (the dual-prompt state). Frame-level bound: cover
+    /// present the pre frame (N) and every frame after — decoupled from the
+    /// column settlement that still gates the SubmitHold.
+    #[test]
+    fn no_dual_prompt_across_integrated_settle() {
+        let recs: Vec<BlockRec> = Vec::new();
+        let mut t = Instant::now();
+        let mut b = backend_full_screen_prompt();
+        let mut st = ComposerState::default();
+        assert_eq!(sim_frame(&mut st, &mut b, &recs, t), Some(5));
+        st.draft = "ls".into();
+        let _ = st.submit(&b, cover_line_for(&st, &b, true, t), Some("C:\\"));
+
+        // exec + echo + output scroll (the initial hold converts here).
+        b.advance_live(&hook_bytes("exec", r#"{"c":"ls"}"#));
+        b.advance_live(b"ls\r\nDocuments  Downloads\r\n");
+        t += Duration::from_millis(4);
+        let _ = prod_frame(&mut st, &mut b, &recs, t);
+
+        let armed = |st: &ComposerState| st.mode == ComposerMode::Compose;
+        // Frame N — the pre (prompt-byte) arrives: incoming-prompt blank.
+        b.advance_live(&hook_bytes("pre", r#"{"e":0,"n":2,"d":"C:"}"#));
+        t += Duration::from_millis(4);
+        let _ = prod_frame(&mut st, &mut b, &recs, t);
+        assert!(armed(&st));
+        assert!(
+            cover_line_for(&st, &b, true, t).is_some(),
+            "pre frame N: the incoming prompt row must be blanked"
+        );
+        // Provisional col-0 133;B (reorder capture, upgrade pending).
+        b.advance_live(b"\x1b]133;B\x07");
+        t += Duration::from_millis(4);
+        let _ = prod_frame(&mut st, &mut b, &recs, t);
+        assert!(
+            cover_line_for(&st, &b, true, t).is_some(),
+            "provisional 133;B frame: still covered"
+        );
+        // Prompt TEXT renders — cursor → col 8, prompt_end still (5,0)
+        // provisional: this is the exact window that used to flash raw.
+        b.advance_live(b"PS C:\\> ");
+        t += Duration::from_millis(4);
+        let _ = prod_frame(&mut st, &mut b, &recs, t);
+        assert!(armed(&st));
+        assert!(
+            !b.cursor_at_prompt_end(),
+            "premise: column not settled yet (provisional cell)"
+        );
+        assert!(
+            cover_line_for(&st, &b, true, t).is_some(),
+            "provisional-settle window: the raw prompt must never flash beside the editor"
+        );
+        // Real-clock quiescence settles the column; steady state stays covered.
+        std::thread::sleep(Duration::from_millis(45));
+        for _ in 0..3 {
+            let rt = Instant::now();
+            let _ = prod_frame(&mut st, &mut b, &recs, rt);
+            assert!(
+                cover_line_for(&st, &b, true, rt).is_some(),
+                "settled prompt: covered"
+            );
+        }
+    }
+
+    /// FLICKER REGRESSION — nested (heuristic) re-mint window (field:
+    /// `root@ubuntu-vm:/home/zany#` + cursor visible while the strip shows
+    /// "# Type a command…"). After the first mint the permanent editor keeps
+    /// the strip up across an inner command, so the RE-appearing nested
+    /// prompt's 300ms arm quiet window used to show raw beside the editor.
+    /// The COVER is decoupled from the arm: it lands within ONE at-rest frame
+    /// of the classifier first reading the cursor row as a prompt (the
+    /// tightest safe bound — a false cover over streaming output is
+    /// impossible because feed_gen changes every output batch). Bound met:
+    /// classifier-pass frame N → cover present frame N+1; the SUBMISSION arm
+    /// still waits the full HEUR_QUIET.
+    #[test]
+    fn no_dual_prompt_across_heur_remint() {
+        let (mut b, mut st, recs, t0) = heur_episode_setup();
+        // First mint: Raw(Busy) → Compose (initial entry — no flicker, mode
+        // was Raw through its own 300ms window). Sim `now` past the window is
+        // fine HERE — we WANT the arm to mint.
+        let tm = t0 + HEUR_QUIET + Duration::from_millis(50);
+        st.tick(&b, &recs, true, true, tm);
+        assert_eq!(st.mode, ComposerMode::Compose);
+        assert!(st.heur_live(&b));
+
+        // Submit an inner command (heur ledger lane) and run it.
+        let cover = cover_line_for(&st, &b, true, tm);
+        let _ = st.dispatch_submission(&b, cover, None, "whoami", tm);
+        let _ = st.take_submit_cmd();
+        b.advance_live(b"whoami\r\nroot\r\n");
+        st.tick(&b, &recs, true, true, tm + Duration::from_millis(10));
+        assert!(!st.heur_live(&b), "output tore the arm latch down");
+        assert_eq!(st.mode, ComposerMode::Compose, "permanent editor: box stays up");
+
+        // The fresh nested prompt reappears. From here drive on the REAL clock
+        // (the arm's HEUR_QUIET reads `last_output_at`, a real stamp): the
+        // quiet window must NOT elapse yet — this is the pre-mint window the
+        // cover must fill without the arm.
+        b.advance_live(b"root@box:/# ");
+        // Frame N: the classifier reads the row as a prompt — the optimistic
+        // cover paints THIS frame (zero dual-prompt frames), while the arm has
+        // NOT minted (quiet < HEUR_QUIET).
+        let rn = Instant::now();
+        st.tick(&b, &recs, true, true, rn);
+        assert_eq!(st.mode, ComposerMode::Compose);
+        assert!(!st.heur_live(&b), "arm still waiting (quiet < HEUR_QUIET) at frame N");
+        assert_eq!(
+            cover_line_for(&st, &b, true, rn),
+            Some(b.cursor_line()),
+            "frame N: nested cover paints the SAME frame the classifier passes"
+        );
+
+        // Frame N+1: still at rest (no output since ⇒ feed_gen unchanged) —
+        // the cover HOLDS (not revoked), still before the arm mints.
+        let rn2 = Instant::now();
+        st.tick(&b, &recs, true, true, rn2);
+        assert!(!st.heur_live(&b), "arm still waiting at frame N+1 (cover ≠ arm)");
+        assert_eq!(
+            cover_line_for(&st, &b, true, rn2),
+            Some(b.cursor_line()),
+            "an at-rest prompt is not revoked — cover holds"
+        );
+
+        // After the full real HEUR_QUIET the arm mints and heur_cover_line
+        // takes the row over seamlessly (same row, no flash).
+        std::thread::sleep(HEUR_QUIET + Duration::from_millis(30));
+        let rn3 = Instant::now();
+        st.tick(&b, &recs, true, true, rn3);
+        assert!(st.heur_live(&b), "the arm mints after the full HEUR_QUIET");
+        assert_eq!(
+            cover_line_for(&st, &b, true, rn3),
+            Some(b.cursor_line()),
+            "seamless hand-off: armed cover on the same row"
+        );
+    }
+
+    /// Optimistic-with-revocation over STREAMING output: a false cover may
+    /// paint for AT MOST ONE frame, then every subsequent streaming frame is
+    /// revoked and suppressed — and the ARM never mints/dispatches off it.
+    /// The suppress resets on a classifier FAIL, so a genuinely fresh at-rest
+    /// prompt after the stream covers again. (Real clock, fast feeds:
+    /// HEUR_QUIET never elapses, so the arm stays unminted throughout.)
+    #[test]
+    fn heur_optimistic_cover_never_covers_streaming() {
+        let (mut b, mut st, recs, t0) = heur_episode_setup();
+        let tm = t0 + HEUR_QUIET + Duration::from_millis(50);
+        st.tick(&b, &recs, true, true, tm);
+        assert_eq!(st.mode, ComposerMode::Compose);
+        let cover = cover_line_for(&st, &b, true, tm);
+        let _ = st.dispatch_submission(&b, cover, None, "make", tm);
+        let _ = st.take_submit_cmd();
+        b.advance_live(b"make\r\n");
+
+        // Stream output (real clock, fast): each batch ends in `#` with the
+        // cursor parked after it — the classifier's worst case. The FIRST
+        // frame is optimistically covered; every batch after bumps feed_gen,
+        // so frame N+1 REVOKES and the run stays suppressed.
+        let mut covered_frames = 0u32;
+        for i in 0..6 {
+            b.advance_live(b"Building target #");
+            let rn = Instant::now();
+            st.tick(&b, &recs, true, true, rn);
+            assert!(!st.heur_live(&b), "arm must not mint over streaming output");
+            if cover_line_for(&st, &b, true, rn).is_some() {
+                covered_frames += 1;
+                assert_eq!(i, 0, "only the very first streaming frame may be covered");
+            }
+            b.advance_live(b"\r\n");
+        }
+        assert_eq!(
+            covered_frames, 1,
+            "streaming covered for at most one frame, then revoked + suppressed"
+        );
+
+        // Suppress resets on a classifier FAIL: after the cursor sits on a
+        // non-prompt row, a genuinely fresh at-rest prompt covers again.
+        b.advance_live(b"regular output line\r\n"); // cursor col 0 ⇒ fails
+        let rf = Instant::now();
+        st.tick(&b, &recs, true, true, rf);
+        assert_eq!(
+            cover_line_for(&st, &b, true, rf),
+            None,
+            "a non-prompt row is never covered"
+        );
+        b.advance_live(b"root@box:/# "); // the real fresh prompt
+        let rn = Instant::now();
+        st.tick(&b, &recs, true, true, rn);
+        assert_eq!(
+            cover_line_for(&st, &b, true, rn),
+            Some(b.cursor_line()),
+            "a fresh at-rest prompt after streaming covers again (suppress reset on fail)"
+        );
+    }
+
+    /// FRAME-TRACE — one full integrated submit cycle has NO single-frame
+    /// raw hole: the just-submitted command's row stays covered (SubmitHold
+    /// ghost → history cover, handed off in one frame) at EVERY frame, and
+    /// the fresh prompt's row is covered from its pre onward. This is the
+    /// hold→history→new-prompt handoff the user might otherwise see flash.
+    #[test]
+    fn integrated_submit_cycle_no_cover_hole() {
+        let recs: Vec<BlockRec> = Vec::new();
+        let now = Instant::now();
+        let mut b = backend_full_screen_prompt(); // prompt on row 5 (bottom)
+        let mut st = ComposerState::default();
+        assert_eq!(sim_frame(&mut st, &mut b, &recs, now), Some(5));
+
+        st.draft = "ls".into();
+        let _ = st.submit(&b, cover_line_for(&st, &b, true, now), Some("C:\\"));
+
+        // A grid row is "covered" (blanked, not raw) if the current-prompt
+        // cover is on it OR a healthy presentational cover sits on it.
+        let covered = |b: &TermBackend, cl: Option<i32>, line: i32| -> bool {
+            cl == Some(line) || b.healthy_covers().iter().any(|c| c.line == line)
+        };
+
+        // Deliver the cycle chunk-by-chunk (ConPTY order: exec ahead of echo).
+        let mut prompt = hook_bytes("pre", r#"{"e":0,"n":2,"d":"C:"}"#);
+        prompt.extend_from_slice(b"PS C:\\> ");
+        let chunks: Vec<Vec<u8>> = vec![
+            hook_bytes("exec", r#"{"c":"ls"}"#), // exec OSC (grid untouched)
+            b"ls".to_vec(),                      // echo lands → hold converts
+            b"\r\nout1\r\n".to_vec(),            // output scrolls the ls row up
+            prompt,                              // fresh pre + prompt text
+            b"\x1b]133;B\x07".to_vec(),          // fresh prompt settles
+        ];
+        for (i, ch) in chunks.iter().enumerate() {
+            b.advance_live(ch);
+            let cl = sim_frame(&mut st, &mut b, &recs, now);
+            assert_eq!(st.mode, ComposerMode::Compose, "chunk {i}: box stays up");
+            // The submit row's live position: the hold pin while live, else
+            // the `ls` history cover it converted to.
+            let submit_row = st.hold_line(&b, now).or_else(|| {
+                b.healthy_covers()
+                    .iter()
+                    .find(|c| c.cmd.as_deref() == Some("ls"))
+                    .map(|c| c.line)
+            });
+            if let Some(r) = submit_row {
+                assert!(
+                    covered(&b, cl, r),
+                    "chunk {i}: submit row {r} must stay covered — no raw hole"
+                );
+            }
+        }
+        // End state: the ls converted to a history cover, and the fresh
+        // prompt row is the live cover (no hole through the whole handoff).
+        assert!(
+            b.healthy_covers()
+                .iter()
+                .any(|c| c.cmd.as_deref() == Some("ls")),
+            "ls became a history cover"
+        );
+        assert_eq!(
+            cover_line_for(&st, &b, true, now),
+            Some(5),
+            "fresh prompt row is covered"
+        );
     }
 
     /// The flush preserves byte order relative to queued Enters: queued

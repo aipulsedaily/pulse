@@ -227,7 +227,20 @@ fn try_connect(ctx: egui::Context) -> anyhow::Result<IpcClient> {
     let _ = sock.set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(Duration::from_secs(15)));
 
     let mut writer = stream.try_clone()?;
-    write_frame(&mut writer, &C2D::Hello { token: info.token })?;
+    // Generation-carrying handshake (proto 12): the daemon needs to know we
+    // re-attach ourselves on D2C::Reset so it suppresses its blind-size
+    // Replay push in the restore resync (the width-mismatch garble fix). An
+    // older daemon cannot decode the appended variant — it gets the legacy
+    // Hello (and keeps its legacy push; the GUI gates the re-attach on
+    // `proto >= 12` to match, so nothing doubles under skew).
+    if info.proto >= 12 {
+        write_frame(
+            &mut writer,
+            &C2D::Hello2 { token: info.token, proto: crate::protocol::PROTO },
+        )?;
+    } else {
+        write_frame(&mut writer, &C2D::Hello { token: info.token })?;
+    }
 
     let (tx, rx) = std::sync::mpsc::channel::<(Instant, D2C)>();
     let connected = Arc::new(AtomicBool::new(true));

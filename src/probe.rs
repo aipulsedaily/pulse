@@ -60,6 +60,12 @@
 //!                 restart → restore replays the last command's output
 //!                 COMPLETELY (on-disk journal AND serialized replay; locks
 //!                 the shutdown output drain)
+//!   width_mismatch_replay  the 2026-07-09 restored-claude garble: alt
+//!                 content recorded at 175×49 → daemon restart → proto-12
+//!                 attach at 147×49 is readable (no fused rows), the PTY is
+//!                 resized to the attacher BEFORE serialization, the
+//!                 restore-resync push is suppressed for proto-12 clients
+//!                 (Reset only; they re-attach) and kept for legacy ones
 //!   compact_crash journal compaction is crash-atomic: flood past MAX_LEN,
 //!                 TerminateProcess the daemon right after the compaction,
 //!                 assert journal present (no remove+rename window), no .tmp
@@ -222,6 +228,32 @@ impl Conn {
         stream.set_read_timeout(Some(Duration::from_secs(3)))?;
         let mut write = stream.try_clone()?;
         write_frame(&mut write, &C2D::Hello { token: info.token })?;
+        Ok(Self { stream, write })
+    }
+
+    /// Proto-12 handshake (`Hello2`): the client contract where the daemon
+    /// suppresses its restore-resync Replay push and the client re-attaches
+    /// itself on `D2C::Reset` (the width-mismatch garble fix). Cases probing
+    /// that contract connect this way; plain `open()` stays legacy so every
+    /// existing case keeps exercising the pre-12 compat push.
+    fn open_v2() -> anyhow::Result<Self> {
+        let info: DaemonInfo = serde_json::from_slice(&std::fs::read(daemon_info_path())?)?;
+        anyhow::ensure!(
+            info.proto >= 12,
+            "daemon predates Hello2 (proto {})",
+            info.proto
+        );
+        let stream = TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], info.port)),
+            Duration::from_secs(1),
+        )?;
+        stream.set_nodelay(true)?;
+        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+        let mut write = stream.try_clone()?;
+        write_frame(
+            &mut write,
+            &C2D::Hello2 { token: info.token, proto: crate::protocol::PROTO },
+        )?;
         Ok(Self { stream, write })
     }
 
@@ -3435,6 +3467,311 @@ fn case_restore_fidelity() -> anyhow::Result<()> {
         "restore seam leaked visible text"
     );
     delete_terminal(&mut c3, id);
+    Ok(())
+}
+
+/// THE 2026-07-09 WIDTH-MISMATCH REPLAY regression (the restored-claude
+/// garble): a session live on the ALT screen with content recorded at
+/// 175×49, after a full daemon restart, attached by a proto-12 client at
+/// 147×49. Pins all three legs of the fix:
+///   1. the attach replay is readable at the FOREIGN width — the frame row
+///      addressed to row 6 carries only its own text (the raw-tail replay
+///      this replaced fused it with the wrapped spill of the 170-col row
+///      above it: the field screenshot, char-for-char);
+///   2. ConPTY/mirror/state are resized to the ATTACHER's grid before the
+///      replay is serialized (the attach contract, via DebugDump);
+///   3. a restore-resync sends a proto-12 client Reset ONLY (no blind-size
+///      Replay/StreamPos/Blocks push — the client re-attaches itself, GUI
+///      style), while a LEGACY client on the same restart still gets the
+///      full compat push.
+fn case_width_mismatch_replay() -> anyhow::Result<()> {
+    ensure_isolated_daemon("width_mismatch_replay")?;
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    let log0 = daemon_log_len();
+
+    // `await_output` also scans Replay frames, and after the restore the
+    // replayed history contains the phase-1 sentinels (the alt-closure fix
+    // flattens the killed frame into scrollback) — a draw-completion wait
+    // must therefore watch LIVE Output only, or it returns before the draw
+    // ever executed (observed: the phase-4 attach then races the redraw and
+    // finds the mirror still on the primary screen).
+    fn await_live(
+        c: &mut Conn,
+        id: Uuid,
+        secs: u64,
+        pred: impl Fn(&str) -> bool,
+    ) -> anyhow::Result<()> {
+        let mut stripper = AnsiStripper::default();
+        let mut pending = String::new();
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < deadline {
+            match c.recv() {
+                Ok(D2C::Output { id: rid, bytes }) if rid == id => {
+                    stripper.feed(&bytes, &mut pending);
+                    if pending.lines().any(&pred) {
+                        return Ok(());
+                    }
+                    if let Some(p) = pending.rfind('\n') {
+                        pending.drain(..=p);
+                    }
+                }
+                _ => {}
+            }
+        }
+        anyhow::bail!("live output never matched within {secs}s (tail: {pending:?})")
+    }
+
+    // The alt-frame fixture, claude-shaped: a full-width (170-col) row
+    // directly above an absolutely-addressed row — the fusion pair — plus a
+    // completion sentinel. Markers are assembled by string concatenation so
+    // the PSReadLine ECHO of the command never contains the joined text.
+    const DRAW: &[u8] = b"$e=[char]27; [Console]::Out.Write(\"$e[?1049h$e[?25l$e[5;1H\" + ('A'*170) + \"$e[6;30HWM\" + \"ROW_SIX_TEXT\" + \"$e[7;1HDRAW\" + \"N_OK\")\r";
+
+    // Phase 1: live session at 175×49, alt content recorded at that width.
+    let old_info: DaemonInfo = serde_json::from_slice(&std::fs::read(daemon_info_path())?)?;
+    let mut c = Conn::open()?;
+    let _ = c.first_snapshot()?;
+    let id = create_probe_terminal(&mut c, "__probe_width_mismatch__")?;
+    c.send(&C2D::Attach { id, cols: 175, rows: 49 })?;
+    c.await_blocks(id, 10, |_| true)?;
+    c.send(&C2D::Input { id, bytes: DRAW.to_vec() })?;
+    await_live(&mut c, id, 20, |l| l.contains("DRAWN_OK"))?;
+
+    // Phase 2: full daemon restart (the field event), restore_fidelity's
+    // exact shutdown/respawn recipe.
+    c.send(&C2D::Shutdown)?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if c.recv().is_err() {
+            break;
+        }
+    }
+    let lock = crate::state::data_dir().join("daemon.lock");
+    for _ in 0..50 {
+        if !lock.exists() || std::fs::remove_file(&lock).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::process::Command::new(std::env::current_exe()?)
+        .arg("--daemon")
+        .creation_flags(DETACHED_PROCESS)
+        .spawn()?;
+    let mut c2 = {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            anyhow::ensure!(Instant::now() < deadline, "restarted daemon never came up");
+            std::thread::sleep(Duration::from_millis(200));
+            let fresh = std::fs::read(daemon_info_path())
+                .ok()
+                .and_then(|b| serde_json::from_slice::<DaemonInfo>(&b).ok())
+                .is_some_and(|i| i.pid != old_info.pid);
+            if !fresh {
+                continue;
+            }
+            if let Ok(conn) = Conn::open() {
+                break conn;
+            }
+        }
+    };
+    c2.snapshot_until(20, |s| {
+        s.terminal(id).is_some_and(|t| t.status == TermStatus::Running)
+    })?;
+    std::thread::sleep(Duration::from_millis(1500));
+
+    // Phase 3: the restored session re-enters the alt screen (the field's
+    // `claude --resume` did exactly this). The respawned PTY inherited the
+    // pre-kill 175×49, so the new frame is again recorded at 175. The
+    // sentinel differs from phase 1's: the restore flattened the first
+    // frame into primary scrollback, so the attach Replay already carries
+    // "DRAWN_OK" and would satisfy the wait before the redraw ever ran.
+    const DRAW3: &[u8] = b"$e=[char]27; [Console]::Out.Write(\"$e[?1049h$e[?25l$e[5;1H\" + ('A'*170) + \"$e[6;30HWM\" + \"ROW_SIX_TEXT\" + \"$e[7;1HDRAW\" + \"N2_OK\")\r";
+    c2.send(&C2D::Attach { id, cols: 175, rows: 49 })?;
+    c2.send(&C2D::Input { id, bytes: DRAW3.to_vec() })?;
+    await_live(&mut c2, id, 30, |l| l.contains("DRAWN2_OK"))?;
+
+    // Phase 4: a proto-12 client attaches at the FOREIGN width.
+    let mut c3 = Conn::open_v2()?;
+    let _ = c3.first_snapshot()?;
+    c3.send(&C2D::Attach { id, cols: 147, rows: 49 })?;
+    let mut replay: Option<Vec<u8>> = None;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        anyhow::ensure!(Instant::now() < deadline, "no attach Replay/StreamPos");
+        match c3.recv() {
+            Ok(D2C::Replay { id: rid, bytes }) if rid == id => replay = Some(bytes),
+            Ok(D2C::StreamPos { id: rid, .. }) if rid == id => {
+                anyhow::ensure!(replay.is_some(), "StreamPos before the Replay");
+                break;
+            }
+            Ok(D2C::Output { id: rid, .. }) if rid == id => {
+                anyhow::bail!("live Output before StreamPos on attach");
+            }
+            _ => {}
+        }
+    }
+    let replay = replay.expect("checked above");
+
+    // Leg 2: the attach contract — Term/PTY/state all at the attacher's
+    // grid; the replay was serialized after this resize by lock order.
+    let dump = debug_dump(&mut c3)?;
+    let d = dump
+        .iter()
+        .find(|d| d.id == id)
+        .ok_or_else(|| anyhow::anyhow!("terminal missing from DebugDump"))?;
+    anyhow::ensure!(
+        (d.term_cols, d.term_rows) == (147, 49)
+            && (d.pty_cols, d.pty_rows) == (147, 49)
+            && (d.state_cols, d.state_rows) == (147, 49),
+        "attach must bring Term/PTY/state to the attacher's 147×49 first, got \
+         term {}x{} pty {}x{} state {}x{}",
+        d.term_cols, d.term_rows, d.pty_cols, d.pty_rows, d.state_cols, d.state_rows
+    );
+
+    // Leg 1: the replay, parsed at the client's own 147×49 (exactly the
+    // GUI's parse), is width-honest. The replay must still land on the alt
+    // grid (live-TUI semantics)…
+    anyhow::ensure!(
+        memchr::memmem::find(&replay, b"\x1b[?1049h").is_some(),
+        "live-alt replay must enter the alternate screen"
+    );
+    // Exact row indices/lengths are conhost's business (it re-renders alt
+    // frames with relative moves and reflows them on resize); the invariant
+    // the field bug violated is READABILITY — the marker row and the wide
+    // row never share cells (the raw-tail replay fused the wrapped spill of
+    // the 170-col row into the marker row: `repro-attach-state.txt`,
+    // char-for-char the field screenshot).
+    let rows = parse_screen(&replay, 147, 49);
+    anyhow::ensure!(rows.len() >= 49, "parse yielded {} rows", rows.len());
+    let screen = &rows[rows.len() - 49..];
+    anyhow::ensure!(
+        screen
+            .iter()
+            .any(|r| r.len() >= 100 && r.chars().all(|ch| ch == 'A')),
+        "the wide row must survive as a pure A-run on the alt screen: {screen:?}"
+    );
+    anyhow::ensure!(
+        screen.iter().any(|r| r.trim() == "WMROW_SIX_TEXT"),
+        "the marker row must survive UNFUSED on the alt screen: {screen:?}"
+    );
+    for r in &rows {
+        if r.contains("WMROW_SIX_TEXT") {
+            anyhow::ensure!(
+                !r.contains('A'),
+                "row fusion at the foreign width (the restored-claude garble): {r:?}"
+            );
+        }
+    }
+
+    // Leg 4: "after claude repaints" — the PTY now sits at the AGREED
+    // 147×49 (leg 2), so a TUI full repaint sized for it must parse clean
+    // in the live stream too (the field heal: the manual resize forced
+    // exactly this repaint; here the attach itself already resized).
+    const DRAW2: &[u8] = b"$e=[char]27; [Console]::Out.Write(\"$e[2J$e[5;1H\" + ('B'*140) + \"$e[6;20HRE\" + \"PAINTED_ROW\" + \"$e[7;1HREPAINT_\" + \"OK\")\r";
+    c3.send(&C2D::Input { id, bytes: DRAW2.to_vec() })?;
+    let live = c3.await_output(id, 20, |l| l.contains("REPAINT_OK"))?;
+    let mut view = replay.clone();
+    view.extend_from_slice(&live);
+    let rows2 = parse_screen(&view, 147, 49);
+    let screen2 = &rows2[rows2.len() - 49..];
+    anyhow::ensure!(
+        screen2
+            .iter()
+            .any(|r| r.len() >= 100 && r.chars().all(|ch| ch == 'B')),
+        "post-resize repaint wide row intact at the agreed width: {screen2:?}"
+    );
+    anyhow::ensure!(
+        screen2
+            .iter()
+            .any(|r| r.trim() == "REPAINTED_ROW" && !r.contains('B')),
+        "post-resize repaint must stay readable (no fusion): {screen2:?}"
+    );
+
+    // Leg 3: restore-resync push suppression. c2 (legacy) and c3 (proto 12)
+    // are both attached; kill + restart the terminal (blocks_stream_pos's
+    // recipe — launch() is not a live-restart verb) and watch both
+    // contracts.
+    c2.send(&C2D::KillTerminal { id })?;
+    c2.snapshot_until(10, |s| {
+        s.terminal(id).is_some_and(|t| t.status == TermStatus::Dead)
+    })?;
+    c2.send(&C2D::RestartTerminal { id })?;
+    // c3 first: Reset arrives…
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        anyhow::ensure!(Instant::now() < deadline, "no Reset at the proto-12 client");
+        if let Ok(D2C::Reset { id: rid }) = c3.recv() {
+            if rid == id {
+                break;
+            }
+        }
+    }
+    // …then NOTHING for this terminal until we re-attach (the suppressed
+    // push): any Replay/StreamPos/Blocks/Output here is the pre-12 blind-
+    // size push racing our re-attach.
+    let silent_until = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < silent_until {
+        match c3.recv() {
+            Ok(D2C::Replay { id: rid, .. }) if rid == id => {
+                anyhow::bail!("daemon pushed a Replay at a proto-12 client after Reset")
+            }
+            Ok(D2C::StreamPos { id: rid, .. }) if rid == id => {
+                anyhow::bail!("daemon pushed StreamPos at a proto-12 client after Reset")
+            }
+            Ok(D2C::Blocks { id: rid, .. }) if rid == id => {
+                anyhow::bail!("daemon pushed Blocks at a proto-12 client after Reset")
+            }
+            Ok(D2C::Output { id: rid, .. }) if rid == id => {
+                anyhow::bail!("live Output at a detached proto-12 client after Reset")
+            }
+            _ => {}
+        }
+    }
+    // GUI-style re-attach at our real grid: the ordered attach sequence.
+    c3.send(&C2D::Attach { id, cols: 147, rows: 49 })?;
+    let mut saw_replay = false;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        anyhow::ensure!(Instant::now() < deadline, "no re-attach Replay/StreamPos");
+        match c3.recv() {
+            Ok(D2C::Replay { id: rid, bytes }) if rid == id => {
+                saw_replay = true;
+                let text = strip_ansi(&String::from_utf8_lossy(&bytes));
+                anyhow::ensure!(
+                    !text.contains("tc:seam"),
+                    "re-attach replay leaked the seam sentinel"
+                );
+            }
+            Ok(D2C::StreamPos { id: rid, .. }) if rid == id => {
+                anyhow::ensure!(saw_replay, "re-attach StreamPos before its Replay");
+                break;
+            }
+            Ok(D2C::Output { id: rid, .. }) if rid == id => {
+                anyhow::bail!("re-attach Output before StreamPos");
+            }
+            _ => {}
+        }
+    }
+    // The legacy client got the full compat push, unprompted.
+    let (mut saw_reset2, mut saw_replay2, mut saw_sp2) = (false, false, false);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && !saw_sp2 {
+        match c2.recv() {
+            Ok(D2C::Reset { id: rid }) if rid == id => saw_reset2 = true,
+            Ok(D2C::Replay { id: rid, .. }) if rid == id && saw_reset2 => saw_replay2 = true,
+            Ok(D2C::StreamPos { id: rid, .. }) if rid == id && saw_replay2 => saw_sp2 = true,
+            _ => {}
+        }
+    }
+    anyhow::ensure!(
+        saw_reset2 && saw_replay2 && saw_sp2,
+        "legacy client must keep the pre-12 push (reset={saw_reset2} replay={saw_replay2} \
+         streampos={saw_sp2})"
+    );
+
+    ensure_no_new_panics(log0)?;
+    delete_terminal(&mut c2, id);
     Ok(())
 }
 
@@ -8994,6 +9331,7 @@ pub fn run(case: Option<&str>) -> anyhow::Result<()> {
         ("composer_gate_replay", case_composer_gate_replay),
         ("cold_attach", case_cold_attach),
         ("restore_fidelity", case_restore_fidelity),
+        ("width_mismatch_replay", case_width_mismatch_replay),
         ("compact_crash", case_compact_crash),
         ("boot_cover", case_boot_cover),
         ("reclaim_extract", case_reclaim_extract),

@@ -2500,9 +2500,11 @@ impl App {
                 }
                 D2C::Reset { id } => {
                     // The daemon rewrote this terminal's world (restore); a
-                    // fresh serialized Replay follows. Start from a blank grid
-                    // sized like the others (per-terminal: hooked terminals
-                    // reserve the composer strip). With no committed layout
+                    // fresh serialized Replay follows — via our own re-Attach
+                    // below (proto ≥ 12), or the legacy daemon push. Start
+                    // from a blank grid sized like the others (per-terminal:
+                    // hooked terminals reserve the composer strip). With no
+                    // committed layout
                     // (occluded/boot GUI) fall back to the terminal's last
                     // known PTY size, never the 160×42 default (Bug B: the
                     // default-size flap resized real PTYs on every boot).
@@ -2523,7 +2525,28 @@ impl App {
                     if let Some((layout, cell)) = self.last_grid {
                         let _ = backend.resize_to(self.layout_for(id, layout), cell);
                     }
+                    let (cols, rows) = (backend.size.cols, backend.size.rows);
                     self.terms.insert(id, backend);
+                    // WIDTH-MISMATCH GARBLE FIX: re-announce OUR real grid by
+                    // re-attaching (the sleep-Exited arm's proven pattern) —
+                    // a proto ≥ 12 daemon suppressed its blind-size Replay
+                    // push for us and its attach arm resizes ConPTY to these
+                    // dims BEFORE serializing, so the replay parses
+                    // width-correct and the PTY is never stranded at the
+                    // pre-restore width (the restored-claude field garble:
+                    // 175-col replay bytes parsed into this 147-col grid,
+                    // silently, with the show-heal no-oping forever after).
+                    // An older daemon still pushes its own Replay; a
+                    // re-attach would then DOUBLE the scrollback, so this
+                    // gates on the daemon generation.
+                    if self.ipc.as_ref().is_some_and(|c| c.proto >= 12) {
+                        // Search matches indexed the replaced grid — drop
+                        // honestly (the r2-M1 shrink's rule).
+                        if self.selected == Some(id) {
+                            self.search = None;
+                        }
+                        self.send(C2D::Attach { id, cols, rows });
+                    }
                     // Composer: fresh session — draft kept, latches cleared;
                     // the new session's first live `pre` re-arms (§2.4).
                     if let Some(st) = self.composers.get_mut(&id) {

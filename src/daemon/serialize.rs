@@ -331,6 +331,30 @@ fn scratch_term(raw: &[u8], cols: u16, rows: u16) -> Term<EventProxy> {
 /// The scratch parse plus the end-of-stream alt-closure bytes (empty when
 /// the tail already ends on the primary screen). See `preface_with_alt_fix`.
 fn scratch_term_with_fix(raw: &[u8], cols: u16, rows: u16) -> (Term<EventProxy>, Vec<u8>) {
+    let (mut scratch, mut parser) = scratch_parse(raw, cols, rows);
+    // A tail that ENDS inside the alternate screen (session died mid-TUI —
+    // sleep/reboot/daemon kill while claude drew) leaves the ACTIVE grid
+    // holding the TUI's dead frame and hides the primary grid + all
+    // scrollback. A real terminal leaving a TUI restores the primary screen;
+    // do exactly that — and re-print the killed frame as literal lines so
+    // the last thing the user saw survives as scrollback (the fix bytes are
+    // returned for the journal so future parses see real closed bytes).
+    let fix = if is_alt_screen(&scratch) {
+        alt_frame_fix(&mut scratch, &mut parser)
+    } else {
+        Vec::new()
+    };
+    (scratch, fix)
+}
+
+/// The shared scratch parse: follows the stream's own geometry reports
+/// (`scratch_segments`), the alt-cut trim, and the seam alt-closures —
+/// WITHOUT the end-of-stream alt closure. A tail that ends inside the
+/// alternate screen leaves the returned Term ON the alt grid; callers
+/// decide what that means (`scratch_term_with_fix` flattens the killed
+/// frame into primary scrollback for dead sessions; `serialize_live_alt`
+/// captures it as a live frame overlay).
+fn scratch_parse(raw: &[u8], cols: u16, rows: u16) -> (Term<EventProxy>, super::ImmediateProcessor) {
     use alacritty_terminal::term;
     // ALT-SCREEN CUT SAFETY (the "claude fragments fused with prompts"
     // artifact): a tail whose first alt marker is an EXIT was cut INSIDE an
@@ -380,19 +404,7 @@ fn scratch_term_with_fix(raw: &[u8], cols: u16, rows: u16) -> (Term<EventProxy>,
             }
         }
     }
-    // A tail that ENDS inside the alternate screen (session died mid-TUI —
-    // sleep/reboot/daemon kill while claude drew) leaves the ACTIVE grid
-    // holding the TUI's dead frame and hides the primary grid + all
-    // scrollback. A real terminal leaving a TUI restores the primary screen;
-    // do exactly that — and re-print the killed frame as literal lines so
-    // the last thing the user saw survives as scrollback (the fix bytes are
-    // returned for the journal so future parses see real closed bytes).
-    let fix = if is_alt_screen(&scratch) {
-        alt_frame_fix(&mut scratch, &mut parser)
-    } else {
-        Vec::new()
-    };
-    (scratch, fix)
+    (scratch, parser)
 }
 
 /// Geometry segment table for a raw journal tail: (start, end, cols, rows).
@@ -491,29 +503,42 @@ pub fn alt_cut_scan(raw: &[u8]) -> (usize, Option<bool>) {
     (start, rest.last().map(|&(_, enter)| enter))
 }
 
-/// Prepare a raw journal tail for replay to a client attaching to a session
-/// that is LIVE on the alternate screen. When the TUI has emitted more than
-/// the tail cap since entering the alt screen, the ENTER lies before the
-/// cut: a client parsing the tail never switches grids, every TUI frame
-/// paints onto its PRIMARY grid, and the app's eventual real exit is a
-/// no-op there — TUI fragments stay fused with the shell rows rendered
-/// after (the field "claude remnants interleaved with prompts" artifact;
-/// opening the GUI while claude is drawing hits exactly this). Skip any
-/// leading orphan region, and if no ENTER survives in the tail, synthesize
-/// one — the live mirror says the session is on the alt screen NOW, so the
-/// frames must land there.
-pub fn alt_tail_for_live(tail: Vec<u8>) -> Vec<u8> {
-    let (start, state) = alt_cut_scan(&tail);
-    match state {
-        Some(true) if start == 0 => tail,
-        Some(true) => tail[start..].to_vec(),
-        _ => {
-            let mut out = Vec::with_capacity(tail.len() - start + 8);
-            out.extend_from_slice(b"\x1b[?1049h");
-            out.extend_from_slice(&tail[start..]);
-            out
-        }
-    }
+/// Attach/resync replay for a session LIVE on the alternate screen — the
+/// WIDTH-MISMATCH GARBLE FIX. This replaced `alt_tail_for_live`'s raw-tail
+/// replay: raw journal bytes are width-honest only at the geometry they
+/// were recorded at — parsed into a client grid of a different width,
+/// wide rows wrap early (shifting every following row) while the TUI's
+/// absolute CUPs clamp onto the wrong rows and overwrite mid-row: old and
+/// new text interleave (the restored-claude field garble, healed only by a
+/// manual resize forcing a full TUI repaint).
+///
+/// Instead: scratch-parse the tail at its own recorded geometry
+/// (`scratch_segments` follows the stream's XTWINOPS reports) and emit
+/// - `serialize_term` of the PRIMARY grid (scrollback underlay —
+///   reconstructs at ANY client size; also re-asserts the live modes), then
+/// - `\x1b[?1049h` + `capture_alt_frame` of the alt grid (the sleep
+///   freeze-frame renderer: absolute rows, clip semantics at a smaller
+///   attacher, never re-flows) — the live TUI's next repaint refreshes it.
+///
+/// When the tail's parse does NOT end inside the alt screen (journal/mirror
+/// divergence — the caller's mirror is the authority that the session is on
+/// the alt screen NOW), the underlay is still emitted and the alt grid is
+/// entered blank; the TUI's next repaint fills it.
+pub fn serialize_live_alt(raw: &[u8], cols: u16, rows: u16) -> Vec<u8> {
+    let (mut scratch, mut parser) = scratch_parse(raw, cols, rows);
+    let frame = if is_alt_screen(&scratch) {
+        // Capture the frame BEFORE exiting (the exit restores the primary
+        // grid); the exit gives serialize_term the primary + scrollback.
+        let f = capture_alt_frame(&scratch);
+        parser.advance(&mut scratch, b"\x1b[?1049l");
+        f
+    } else {
+        Vec::new()
+    };
+    let mut out = serialize_term(&scratch, None);
+    out.extend_from_slice(b"\x1b[?1049h");
+    out.extend_from_slice(&frame);
+    out
 }
 
 /// The deepest 1-based row absolutely addressed in `seg` by CUP (`CSI r;cH`
@@ -1378,8 +1403,7 @@ mod tests {
     }
 
     /// Alt-screen cut safety (Bug 4, the "claude fragments fused with shell
-    /// prompts" artifact): the marker scan, the orphan-exit skip, and the
-    /// live-tail preparation.
+    /// prompts" artifact): the marker scan and the orphan-exit skip.
     #[test]
     fn alt_cut_scan_and_live_tail() {
         // No markers: undecidable; start at 0.
@@ -1402,18 +1426,117 @@ mod tests {
         // 47 / 1047 variants count.
         assert_eq!(alt_cut_scan(b"\x1b[?47hX").1, Some(true));
         assert!(alt_cut_scan(b"\x1b[?1047lX").0 > 0);
+    }
 
-        // Live-tail preparation: a tail with no surviving ENTER gets one
-        // synthesized (the mirror says the session is on the alt screen),
-        // so the client's parser routes the frames to its ALT grid.
-        let fixed = alt_tail_for_live(b"\x1b[2J\x1b[HFRAME ONLY".to_vec());
-        assert!(fixed.starts_with(b"\x1b[?1049h"));
-        // A self-consistent tail (enter present, still inside) is untouched.
-        let ok = b"sh\x1b[?1049hFRAME".to_vec();
-        assert_eq!(alt_tail_for_live(ok.clone()), ok);
-        // Orphan exit + a later enter: skip the junk, keep from the shell.
-        let mixed = b"JUNK\x1b[?1049lsh\x1b[?1049hF2".to_vec();
-        assert_eq!(alt_tail_for_live(mixed), b"sh\x1b[?1049hF2".to_vec());
+    /// THE WIDTH-MISMATCH GARBLE FIX (the 2026-07-09 restored-claude field
+    /// bug): a live alt-screen session recorded at 175 cols, replayed to a
+    /// client attaching at 147, must stay readable. The old raw-tail replay
+    /// (`alt_tail_for_live`) shipped bytes that are width-honest only at
+    /// their recorded geometry: at 147, the 175-col row wraps early and its
+    /// spill fuses with the next absolutely-addressed row (reproduced below
+    /// as the A/B control — the exact field mechanism, `scratchpad\
+    /// garble-evidence\repro-attach-state.txt`). `serialize_live_alt`
+    /// scratch-parses the tail at its own XTWINOPS-reported geometry and
+    /// re-emits it as a frozen alt frame over a serialized primary
+    /// underlay — width-correct by construction at BOTH widths.
+    #[test]
+    fn serialize_live_alt_is_width_honest() {
+        // The field journal's shape, reduced: one XTWINOPS report pins the
+        // recorded geometry at 175×49; primary scrollback; alt enter; a TUI
+        // frame with a full-width row directly above an absolutely-addressed
+        // row (the fusion pair), plus a CUP to a column beyond 147.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"\x1b[8;49;175t");
+        raw.extend_from_slice(b"PS C:\\quipshot-hub> claude\r\nHISTLINE ONE\r\n");
+        raw.extend_from_slice(b"\x1b[?1049h\x1b[?25l");
+        raw.extend_from_slice(format!("\x1b[5;1H{}", "A".repeat(170)).as_bytes());
+        raw.extend_from_slice(b"\x1b[6;30HWMROW_SIX_TEXT");
+        raw.extend_from_slice(b"\x1b[7;160HDEEPCOL");
+
+        // A/B control — the OLD path (raw tail, enter survives ⇒ shipped
+        // verbatim) parsed at the mismatched width manufactures the fusion:
+        // the wrapped spill of row 5 shares row 6 with WMROW_SIX_TEXT.
+        let (screen, _, _, _) = client_grid(&raw, 147, 49);
+        let fused = &screen[5];
+        assert!(
+            fused.contains('A') && fused.contains("WMROW_SIX_TEXT"),
+            "control failed to reproduce the field fusion (raw tail at 147): {fused:?}"
+        );
+
+        // The fix, at the RECORDED width: frame rows land exactly where the
+        // TUI drew them, nothing fused.
+        let out = serialize_live_alt(&raw, 175, 49);
+        let (s175, _, _, _) = client_grid(&out, 175, 49);
+        assert_eq!(s175[4], "A".repeat(170), "recorded-width row intact");
+        assert!(
+            s175[5].trim_start().starts_with("WMROW_SIX_TEXT") && !s175[5].contains('A'),
+            "row 6 must hold only its own text at 175: {:?}",
+            s175[5]
+        );
+        assert!(s175[6].contains("DEEPCOL"), "deep-column row at 175: {:?}", s175[6]);
+
+        // The fix, at the FOREIGN width (the field's 147): the wide row
+        // CLIPS at the edge instead of wrapping (capture_alt_frame's ?7l),
+        // so row 6 is readable and free of row-5 spill; the >147 CUP text
+        // clips away rather than landing mid-row.
+        let (s147, _, _, _) = client_grid(&out, 147, 49);
+        assert!(
+            s147[4].starts_with(&"A".repeat(147)) && s147[4].len() <= 147,
+            "wide row clips at the client edge: {:?}",
+            s147[4]
+        );
+        assert!(
+            s147[5].trim_start().starts_with("WMROW_SIX_TEXT") && !s147[5].contains('A'),
+            "the field fusion is gone at 147: {:?}",
+            s147[5]
+        );
+
+        // Both replays end INSIDE the alt screen (live-TUI semantics) and
+        // the primary underlay beneath carries the pre-alt history.
+        let mut replay_term = {
+            use alacritty_terminal::term;
+            let (tx, _rx) = std::sync::mpsc::channel();
+            let mut t = Term::new(
+                term::Config::default(),
+                &TermSize::new(147, 49),
+                super::super::session::EventProxy::new(tx),
+            );
+            let mut p = super::super::ImmediateProcessor::new();
+            p.advance(&mut t, &out);
+            t
+        };
+        assert!(
+            replay_term.mode().contains(TermMode::ALT_SCREEN),
+            "replay must leave the client on the alt grid"
+        );
+        {
+            let mut p = super::super::ImmediateProcessor::new();
+            p.advance(&mut replay_term, b"\x1b[?1049l");
+        }
+        let grid = replay_term.grid();
+        let hist = grid.history_size() as i32;
+        let all: String = (-hist..49)
+            .map(|l| {
+                let row = &grid[Line(l)];
+                let len = row.line_length().0.min(147);
+                (0..len).map(|c| row[Column(c)].c).collect::<String>() + "\n"
+            })
+            .collect();
+        assert!(
+            all.contains("HISTLINE ONE"),
+            "primary underlay must carry the pre-alt scrollback: {all:?}"
+        );
+
+        // Divergence belt: a tail whose parse ends PRIMARY still enters a
+        // blank alt grid (the mirror said alt) over the serialized underlay.
+        let primary_tail = b"\x1b[8;24;80tPS> done\r\nPS> ".to_vec();
+        let out2 = serialize_live_alt(&primary_tail, 80, 24);
+        assert!(out2.ends_with(b"\x1b[?1049h"), "blank alt entry appended");
+        let (s2, _, _, _) = client_grid(&out2, 80, 24);
+        assert!(
+            s2.iter().all(|r| !r.contains("PS> done")),
+            "alt grid starts blank: {s2:?}"
+        );
     }
 
     /// The fused-region regression, end to end at the scratch-parse level: a

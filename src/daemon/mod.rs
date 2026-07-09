@@ -146,6 +146,12 @@ pub struct ClientConn {
     /// TC_SESSION_ID of the terminal this controller runs inside, if any —
     /// the recursion guard's target (see control.rs).
     self_session: Option<Uuid>,
+    /// The client's protocol generation, resolved at the handshake
+    /// (`Hello2` carries it; legacy `Hello`/`HelloCtl` ⇒ 0). Proto ≥ 12
+    /// clients re-attach themselves on `D2C::Reset`, so the restore resync
+    /// must not race them with its own blind-size Replay push (the
+    /// width-mismatch garble fix — see protocol::C2D::Hello2).
+    proto: u32,
 }
 
 impl ClientConn {
@@ -1632,6 +1638,22 @@ impl Core {
                 // against live output by the journal lock (same guarantee as
                 // Attach).
                 if !suspended.is_empty() {
+                    // WIDTH-MISMATCH GARBLE FIX (proto 12): the push below
+                    // serializes at the MIRROR's size, blind to each client's
+                    // grid — the restored-claude field garble. Proto ≥ 12
+                    // clients instead re-attach themselves on Reset: their
+                    // C2D::Attach announces the client's REAL grid and the
+                    // attach arm resizes ConPTY to it BEFORE serializing, so
+                    // the replay is width-correct by contract. They get Reset
+                    // ONLY and stay detached until that Attach lands (no live
+                    // Output can beat their Replay). Legacy clients keep the
+                    // pre-12 push — they never re-attach on Reset and would
+                    // otherwise stare at a blank grid forever.
+                    let legacy: Vec<Arc<ClientConn>> = suspended
+                        .iter()
+                        .filter(|c| c.proto < 12)
+                        .cloned()
+                        .collect();
                     // Hint inputs (proto 7), snapshotted under the journal
                     // lock exactly like Attach's; computed after it drops.
                     let mut hint_job: Option<(Vec<u8>, u64, Vec<u8>)> = None;
@@ -1641,56 +1663,73 @@ impl Core {
                         .get(&id)
                         .map(|s| (s.term.clone(), s.preface.clone(), s.win32_input.clone()));
                     if let (Some((term, preface, win32)), Ok(journal)) = (arcs, self.journal(id)) {
-                        let j = journal.lock();
-                        let mut raw_tail_replay = false;
-                        let mut bytes = {
-                            let t = term.lock();
-                            if serialize::is_alt_screen(&t) {
-                                // Cut-safe: a tail cut inside the alt region
-                                // would otherwise paint TUI frames onto the
-                                // client's PRIMARY grid (claude-fragment
-                                // fusion class — see alt_tail_for_live).
-                                raw_tail_replay = true;
-                                serialize::alt_tail_for_live(j.tail())
-                            } else {
-                                serialize::serialize_term(&t, Some(&preface.lock()))
-                            }
-                        };
-                        // Private mode 9001 (win32-input-mode) isn't part of
-                        // the mirror's serializable state; re-assert it so the
-                        // client's key encoder sees it (term_backend scans its
-                        // own byte stream for exactly this).
-                        if win32.load(Ordering::Relaxed) {
-                            bytes.extend_from_slice(b"\x1b[?9001h");
-                        }
-                        // Same guarantee as Attach: captured under the
-                        // journal lock, so live Output resumes exactly here.
-                        let stream_off = j.absolute_len();
-                        // ONE shared Replay frame for every suspended client
-                        // (borrowed payload — see replay_frame): encodes the
-                        // serialized grid once and lets `bytes` MOVE into the
-                        // hint job instead of being cloned per consumer.
-                        let rframe = replay_frame(id, &bytes);
-                        if !raw_tail_replay {
-                            let tail = j.tail();
-                            if !tail.is_empty() {
-                                let tail_base = j.absolute_len() - tail.len() as u64;
-                                hint_job = Some((tail, tail_base, bytes));
-                            }
-                        }
-                        for c in &suspended {
-                            c.attached.lock().insert(id);
-                            if let Some(f) = frame_bytes(&D2C::Reset { id }) {
-                                c.enqueue(&f);
-                            }
-                            if let Some(f) = &rframe {
-                                c.enqueue(f);
-                            }
-                            if let Some(f) = frame_bytes(&D2C::StreamPos { id, off: stream_off }) {
+                        if let Some(f) = frame_bytes(&D2C::Reset { id }) {
+                            for c in suspended.iter().filter(|c| c.proto >= 12) {
                                 c.enqueue(&f);
                             }
                         }
-                        drop(j);
+                        if !legacy.is_empty() {
+                            let j = journal.lock();
+                            let mut raw_tail_replay = false;
+                            let mut bytes = {
+                                let t = term.lock();
+                                if serialize::is_alt_screen(&t) {
+                                    // Live alt-screen: a raw journal tail is
+                                    // width-honest only at its recorded
+                                    // geometry (the restored-claude garble).
+                                    // Serialize instead: scratch-parse the
+                                    // tail at its own XTWINOPS-reported sizes
+                                    // and emit the primary underlay + the
+                                    // frozen alt frame — replayable at ANY
+                                    // client size (clip semantics). Frame
+                                    // overlay ⇒ no hints (rows point into the
+                                    // hidden primary grid), like the sleep arm.
+                                    raw_tail_replay = true;
+                                    serialize::serialize_live_alt(&j.tail(), cols, rows)
+                                } else {
+                                    serialize::serialize_term(&t, Some(&preface.lock()))
+                                }
+                            };
+                            // Private mode 9001 (win32-input-mode) isn't part
+                            // of the mirror's serializable state; re-assert it
+                            // so the client's key encoder sees it
+                            // (term_backend scans its own bytes for this).
+                            if win32.load(Ordering::Relaxed) {
+                                bytes.extend_from_slice(b"\x1b[?9001h");
+                            }
+                            // Same guarantee as Attach: captured under the
+                            // journal lock, so live Output resumes exactly
+                            // here.
+                            let stream_off = j.absolute_len();
+                            // ONE shared Replay frame for every legacy client
+                            // (borrowed payload — see replay_frame): encodes
+                            // the serialized grid once and lets `bytes` MOVE
+                            // into the hint job instead of being cloned per
+                            // consumer.
+                            let rframe = replay_frame(id, &bytes);
+                            if !raw_tail_replay {
+                                let tail = j.tail();
+                                if !tail.is_empty() {
+                                    let tail_base = j.absolute_len() - tail.len() as u64;
+                                    hint_job = Some((tail, tail_base, bytes));
+                                }
+                            }
+                            for c in &legacy {
+                                c.attached.lock().insert(id);
+                                if let Some(f) = frame_bytes(&D2C::Reset { id }) {
+                                    c.enqueue(&f);
+                                }
+                                if let Some(f) = &rframe {
+                                    c.enqueue(f);
+                                }
+                                if let Some(f) =
+                                    frame_bytes(&D2C::StreamPos { id, off: stream_off })
+                                {
+                                    c.enqueue(&f);
+                                }
+                            }
+                            drop(j);
+                        }
                     }
                     // Blocks full sync after the resync (journal lock
                     // dropped; blocks is a leaf). Fixes a real P1 gap:
@@ -1703,12 +1742,14 @@ impl Core {
                     };
                     // r4 perf-daemon LOW-2 (same shape as the attach arm):
                     // serialize ONCE from the moved recs — shared across all
-                    // suspended clients — then recover them for the hint job.
+                    // legacy clients — then recover them for the hint job.
+                    // Proto ≥ 12 clients get their full sync from the attach
+                    // arm (Replay → StreamPos → Blocks under one lock hold).
                     let full = match full {
                         Some((epoch, recs)) => {
                             let msg = D2C::Blocks { id, epoch, full: true, recs };
                             if let Some(f) = frame_bytes(&msg) {
-                                for c in &suspended {
+                                for c in &legacy {
                                     c.enqueue(&f);
                                 }
                             }
@@ -1735,7 +1776,7 @@ impl Core {
                             recs,
                             cols,
                             rows,
-                            targets: suspended.iter().map(Arc::downgrade).collect(),
+                            targets: legacy.iter().map(Arc::downgrade).collect(),
                         });
                     }
                 }
@@ -2279,7 +2320,9 @@ impl Core {
             }
         }
         match msg {
-            C2D::Hello { .. } => {}
+            // Handshake frames are only valid as the FIRST frame (consumed
+            // by handle_client); ignored here.
+            C2D::Hello { .. } | C2D::Hello2 { .. } => {}
             C2D::Ping => {
                 if let Some(f) = frame_bytes(&D2C::Pong) {
                     client.enqueue(&f);
@@ -2441,10 +2484,11 @@ impl Core {
                 // of their journal tail (perf-wave-3 — see serialize_dead;
                 // a tail that ends inside the alt screen reconstructs the
                 // restored PRIMARY grid since the render-bugs pass). LIVE
-                // alt-screen falls back to the raw journal tail — cut-safe
-                // via alt_tail_for_live, or a tail cut inside the alt region
-                // paints TUI frames onto the attacher's primary grid (the
-                // "claude remnants fused with prompts" artifact).
+                // alt-screen gets a scratch-parsed reconstruction too:
+                // primary underlay + the frozen alt frame, width-correct at
+                // any attacher size (serialize_live_alt — the raw-tail
+                // fallback this replaced was width-honest only at recorded
+                // geometry: the restored-claude width-mismatch garble).
                 let arcs = self.sessions.lock().get(&id).map(|s| {
                     (
                         s.term.clone(),
@@ -2478,9 +2522,9 @@ impl Core {
                     // nor double-apply a chunk.
                     let j = journal.lock();
                     let ser_t0 = perf::on().then(Instant::now);
-                    // Raw-tail replays (live alt-screen; the never-engaging
-                    // dead-alt belt) get no hints: their bytes are not a
-                    // grid serialization, so replay rows are not derivable
+                    // Raw-tail replays (the never-engaging dead-alt belt)
+                    // get no hints: their bytes are not a grid
+                    // serialization, so replay rows are not derivable
                     // (edge honesty — TUI frames carry no prompt rows).
                     let mut raw_tail_replay = false;
                     // Dead-arm tail, kept for the hint job below: the same
@@ -2498,8 +2542,23 @@ impl Core {
                         Some((term, preface, _, _, _)) => {
                             let t = term.lock();
                             if serialize::is_alt_screen(&t) {
-                                raw_tail_replay = true;
-                                serialize::alt_tail_for_live(j.tail())
+                                // Live alt-screen: a raw journal tail is
+                                // width-honest only at its recorded geometry —
+                                // parsed into a client grid of a different
+                                // width, 175-col rows wrap early and absolute
+                                // CUPs land on the wrong rows (the restored-
+                                // claude field garble). Serialize instead:
+                                // scratch-parse the tail at its own XTWINOPS-
+                                // reported sizes and emit the primary underlay
+                                // + `?1049h` + the frozen alt frame
+                                // (capture_alt_frame — replayable at ANY
+                                // client size, clip semantics; the live TUI's
+                                // next repaint refreshes it). Same overlay
+                                // shape as the sleep freeze-frame ⇒ hints
+                                // skipped via frame_overlay.
+                                drop(t);
+                                frame_overlay = true;
+                                serialize::serialize_live_alt(&j.tail(), eff_cols, eff_rows)
                             } else {
                                 serialize::serialize_term(&t, Some(&preface.lock()))
                             }
@@ -3465,16 +3524,17 @@ fn handle_client(core: Arc<Core>, stream: TcpStream, token: &str) {
         Ok(s) => s,
         Err(_) => return,
     };
-    // First frame must be a valid Hello (GUI, FULL rights) or HelloCtl
-    // (controller: master token ⇒ FULL, scoped token ⇒ its bits).
-    let (scope, self_session) = match read_frame::<_, C2D>(&mut reader) {
-        Ok(C2D::Hello { token: t }) if t == token => (SCOPE_FULL, None),
+    // First frame must be a valid Hello/Hello2 (GUI, FULL rights) or
+    // HelloCtl (controller: master token ⇒ FULL, scoped token ⇒ its bits).
+    let (scope, self_session, proto) = match read_frame::<_, C2D>(&mut reader) {
+        Ok(C2D::Hello { token: t }) if t == token => (SCOPE_FULL, None, 0),
+        Ok(C2D::Hello2 { token: t, proto }) if t == token => (SCOPE_FULL, None, proto),
         Ok(C2D::HelloCtl {
             token: t,
             self_session,
         }) => {
             if t == token {
-                (SCOPE_FULL, self_session)
+                (SCOPE_FULL, self_session, 0)
             } else {
                 let found = core
                     .ctl_tokens
@@ -3484,7 +3544,7 @@ fn handle_client(core: Arc<Core>, stream: TcpStream, token: &str) {
                     .find(|k| k.token == t)
                     .map(|k| k.scope);
                 match found {
-                    Some(s) => (s, self_session),
+                    Some(s) => (s, self_session, 0),
                     None => {
                         log::warn!("controller rejected: bad token");
                         return;
@@ -3505,6 +3565,7 @@ fn handle_client(core: Arc<Core>, stream: TcpStream, token: &str) {
         alive: AtomicBool::new(true),
         scope,
         self_session,
+        proto,
     });
 
     // One dedicated writer owns the socket write half. Producers only enqueue,
@@ -3795,6 +3856,13 @@ pub fn run() -> anyhow::Result<()> {
         port,
         token: token.clone(),
         pid: std::process::id(),
+        // 12 = WIDTH-MISMATCH GARBLE FIX: C2D::Hello2 appended (client
+        //      generation in the handshake); the restore resync suppresses
+        //      its blind-size Replay push for proto ≥ 12 clients, which
+        //      re-attach themselves on D2C::Reset so ConPTY is resized to
+        //      the CLIENT's grid before the replay is serialized; live
+        //      alt-screen replays are serialized (scratch-parse + frozen
+        //      alt frame) instead of raw journal tails;
         // 11 = CLAUDE SESSION ATTRIBUTION: CtlRequest::ReportCliSession
         //      appended (the `tc __claude-hook` self-report, Layer 2);
         // 10 = SSH AUTO-RECONNECT: C2D::CancelReconnect appended +
@@ -3809,7 +3877,7 @@ pub fn run() -> anyhow::Result<()> {
         // 6 = C2D::SubmitCommand (cmd submission ledger, P6b);
         // 5 = TerminalMeta.hooked appended (Snapshot wire layout changed);
         // 4 = Controller API (HelloCtl/Ctl), P5; 3 = PromptState.
-        proto: 11,
+        proto: crate::protocol::PROTO,
     };
     std::fs::write(daemon_info_path(), serde_json::to_vec(&info)?)?;
     install_autostart();

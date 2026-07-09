@@ -1,0 +1,11 @@
+#!/bin/sh
+# Pulse pre-commit meta-lint (fast greps only, no cargo). One-time setup:
+#   git config core.hooksPath .githooks
+# Bypass in an emergency with --no-verify; CI re-runs the same checks.
+root="$(git rev-parse --show-toplevel)" || exit 1
+if command -v pwsh >/dev/null 2>&1; then
+    PS=pwsh
+else
+    PS=powershell.exe
+fi
+exec "$PS" -NoProfile -ExecutionPolicy Bypass -File "$root/scripts/meta-lint.ps1" --staged
