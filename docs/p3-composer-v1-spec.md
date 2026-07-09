@@ -517,7 +517,7 @@ All painter-drawn in the P2 chrome style (SURFACE_2 fill, BORDER hairline top ed
 | Compose (unfocused) | editor body with draft (or hint "Type a command…"), dimmed border | `Run ▸` dimmed |
 | Raw(Busy) | spinner-dot + open block's `cmd` (middle-ellipsized 48) + live elapsed (`fmt_duration`, P2 §11.6) | — (gate fails; no compose button — never a dead-end lie) |
 | Raw(NoPrompt/UserRaw) with gate `ManualOnly`/latent | keyboard glyph + "Typing goes to the terminal" | `❯ Compose` ghost button (ACCENT text) — THE fallback affordance, always clickable when the gate core passes |
-| Raw(AltScreen) | "Keys go to the app" TEXT_FAINT | — |
+| Raw(AltScreen) | "Keys go to the app" TEXT_FAINT — fades to bare TERM_BG once the alt screen has been held ≥ 400ms (`HIDE_AFTER`, Bug C); pointer over the band fades it back in. Render-only: geometry untouched. | — (right cluster fades with the lane; asleep/reconnecting/dead lanes never hide) |
 | Raw(Dead) | "Session ended" TEXT_FAINT | — (header owns Restore) |
 
 - The strip itself (outside buttons) is click-to-activate when the gate core passes —
@@ -574,6 +574,12 @@ forth (that would be a resize storm on every tab switch — the exact ConPTY-wip
 
 The strip stays during alt-screen and Dead (inv. 5): vim in a hooked pwsh keeps the 36px band
 (showing "Keys go to the app") rather than triggering entry/exit resizes tied to app behavior.
+Bug C refinement: after the alt screen has been held continuously ≥ 400ms the band's label +
+right cluster fade to bare terminal background (every affordance is inert under alt); hovering
+the band reveals them, and ANY lane change (TUI exit, death, sleep, reconnect) restores the
+strip the same frame. The reservation itself is still constant — the hide is strictly
+render-side and never touches `layout_for` or the PTY size (pinned by
+`alt_screen_never_resizes_unchanged_layout`).
 
 ---
 

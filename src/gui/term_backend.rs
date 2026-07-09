@@ -3541,6 +3541,34 @@ mod tests {
         );
     }
 
+    /// Bug C geometry pin (R3 — the hide is RENDER-ONLY): alt-screen
+    /// entry/exit is not an input to any geometry function. With the hooked
+    /// layout unchanged, `resize_to` returns None across a real DECSET 1049
+    /// round-trip — no PTY resize may ever ride the strip hide/show (a
+    /// resize under alt marks the block feed stale and wipes anchors,
+    /// prompt_end and covers: see `pre_resize_ordinals`).
+    #[test]
+    fn alt_screen_never_resizes_unchanged_layout() {
+        let mut b = bhist(40, 8, 100);
+        let cell = egui::Vec2::new(8.0, 16.0);
+        let layout = egui::Vec2::new(40.0 * 8.0, 8.0 * 16.0);
+        assert_eq!(b.resize_to(layout, cell), None, "same grid ⇒ no resize");
+        b.advance_live(b"\x1b[?1049h\x1b[2J\x1b[Htui frame");
+        assert!(b.mode().contains(TermMode::ALT_SCREEN));
+        assert_eq!(
+            b.resize_to(layout, cell),
+            None,
+            "alt entry must not produce a PTY resize"
+        );
+        b.advance_live(b"\x1b[?1049l");
+        assert_eq!(
+            b.resize_to(layout, cell),
+            None,
+            "alt exit must not produce a PTY resize"
+        );
+        assert_eq!((b.size.cols, b.size.rows), (40, 8), "grid untouched");
+    }
+
     /// Restored-render fix: a Replay is a full grid reconstruction — any
     /// selection made against the pre-replay content is meaningless
     /// coordinates and must die with the old world (the immortal "navy
