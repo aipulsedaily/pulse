@@ -861,6 +861,51 @@ fn case_folders() -> anyhow::Result<()> {
         s.terminal(tid).is_some_and(|t| t.folder == Some(fid))
     })?;
 
+    // Bug B: reorder coverage. A second member joins the folder (appended
+    // after tid), then ReorderTerminal{delta:-1} must swap the pair's
+    // sidebar order (D6: presentation sorts by `order` alone).
+    let tid2 = create_probe_terminal(&mut c, "__probe_folder_term2__")?;
+    c.send(&C2D::MoveTerminal {
+        id: tid2,
+        folder: Some(fid),
+    })?;
+    c.snapshot_until(5, |s| {
+        s.terminal(tid2).is_some_and(|t| t.folder == Some(fid))
+    })?;
+    c.send(&C2D::ReorderTerminal { id: tid2, delta: -1 })?;
+    c.snapshot_until(5, |s| {
+        match (s.terminal(tid), s.terminal(tid2)) {
+            (Some(a), Some(b)) => b.order < a.order,
+            _ => false,
+        }
+    })?;
+
+    // Bug B: MoveFolder{delta:1} must swap folder order with a second
+    // folder created after (and therefore ordered below) the first.
+    c.send(&C2D::CreateFolder {
+        name: "__probe_folder_b__".into(),
+    })?;
+    let state = c.snapshot_until(5, |s| {
+        s.folders.iter().any(|f| f.name == "__probe_folder_b__")
+    })?;
+    let fid2 = state
+        .folders
+        .iter()
+        .find(|f| f.name == "__probe_folder_b__")
+        .unwrap()
+        .id;
+    c.send(&C2D::MoveFolder { id: fid, delta: 1 })?;
+    c.snapshot_until(5, |s| {
+        let a = s.folders.iter().find(|f| f.id == fid);
+        let b = s.folders.iter().find(|f| f.id == fid2);
+        match (a, b) {
+            (Some(a), Some(b)) => b.order < a.order,
+            _ => false,
+        }
+    })?;
+    c.send(&C2D::DeleteFolder { id: fid2 })?;
+    c.snapshot_until(5, |s| !s.folders.iter().any(|f| f.id == fid2))?;
+
     // Rename the folder.
     c.send(&C2D::RenameFolder {
         id: fid,
@@ -870,14 +915,16 @@ fn case_folders() -> anyhow::Result<()> {
         s.folders.iter().any(|f| f.id == fid && f.name == "__probe_folder_renamed__")
     })?;
 
-    // Delete the folder: the terminal must be reparented to none.
+    // Delete the folder: both members must be reparented to none.
     c.send(&C2D::DeleteFolder { id: fid })?;
     c.snapshot_until(5, |s| {
         !s.folders.iter().any(|f| f.id == fid)
             && s.terminal(tid).is_some_and(|t| t.folder.is_none())
+            && s.terminal(tid2).is_some_and(|t| t.folder.is_none())
     })?;
 
     delete_terminal(&mut c, tid);
+    delete_terminal(&mut c, tid2);
     Ok(())
 }
 

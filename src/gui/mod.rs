@@ -938,16 +938,26 @@ fn rename_commit(target: RenameTarget, value: &str) -> Option<C2D> {
 /// A drag-to-reorder in flight (§5.5). Created at egui's decided-drag
 /// threshold (~6px — clicks and context menus unaffected), transient.
 struct DragState {
-    id: Uuid,
-    /// The dragged terminal's folder at drag start (drop into the same
-    /// group sends no MoveTerminal).
-    from: Option<Uuid>,
-    /// Ghost content, captured at drag start (name + activity dot color).
+    /// What is being dragged — terminal rows and folder rows arm drags.
+    payload: DragPayload,
+    /// Ghost content, captured at drag start (name + activity dot color;
+    /// folder ghosts carry the member count and no dot).
     name: String,
     dot: Color32,
     /// Pointer-lock offset: grab point relative to the row's origin, so the
     /// ghost rides the pointer exactly where the row was grabbed.
     grab: Vec2,
+}
+
+/// The dragged subject (Bug B): terminals move/reorder, folders reorder.
+enum DragPayload {
+    Term {
+        id: Uuid,
+        /// The dragged terminal's folder at drag start (drop into the same
+        /// group sends no MoveTerminal).
+        from: Option<Uuid>,
+    },
+    Folder { id: Uuid },
 }
 
 /// One row painted by this frame's sidebar tree, recorded while a drag is
@@ -963,7 +973,13 @@ enum DropRow {
     Folder {
         rect: Rect,
         id: Uuid,
+        /// Painted folder ordinal (order-sorted) — folder-reorder drops.
+        idx: usize,
     },
+    /// The UNGROUPED header / empty tail of the tree — always revealed
+    /// while a terminal drag is armed so a terminal can ALWAYS be dragged
+    /// out of every folder (Bug B: previously a silent dead zone).
+    LooseZone { rect: Rect },
 }
 
 /// A resolved drop position (visual marker + wire semantics).
@@ -978,6 +994,15 @@ enum SlotHit {
     },
     /// Move into a folder (append) — the folder row highlights.
     IntoFolder { id: Uuid, rect: Rect },
+    /// Reorder a folder to painted ordinal `idx` — the bar sits in the
+    /// inter-group gap (`y` is below the target group / above the next).
+    FolderInsert {
+        idx: usize,
+        y: f32,
+        x: egui::Rangef,
+    },
+    /// Move a terminal out of all folders (append to the loose group).
+    LooseAppend { y: f32, x: egui::Rangef },
 }
 
 /// Pure §5.5 drop math (unit-tested): the `ReorderTerminal` delta that
@@ -1000,6 +1025,115 @@ fn drop_reorder_delta(group: &[Uuid], id: Uuid, idx: Option<usize>, same_group: 
         Some(i) => i.min(last),
     };
     fin as i32 - cur as i32
+}
+
+/// Pure §5.5 hit-test (unit-tested), payload-aware. Bands are the painted
+/// row rects widened by ±8px horizontally and ±4px vertically (half the
+/// worst inter-row gap — no dead strip between adjacent rows; overlapping
+/// bands resolve first-in-paint-order, which yields the same insert index
+/// either way). Outside every band ⇒ None (release there cancels).
+///
+/// Terminal payload: terminal rows split at their midline into
+/// insert-above / insert-below (the last row of each group gets 20px of
+/// grace below for end-of-list drops); folder rows are move-into targets
+/// over their whole height; LooseZone bands append to the loose group.
+///
+/// Folder payload: folder rows split at their midline into
+/// reorder-above / reorder-below; a folder's open member rows resolve to
+/// that folder's below-slot so the whole visual group reads as one target
+/// (the bar always sits in the inter-group gap). Loose terminal rows and
+/// LooseZone bands are ignored (a folder can't nest or go loose).
+fn slot_hit(rows: &[DropRow], payload: &DragPayload, p: Pos2) -> Option<SlotHit> {
+    const SLOP_X: f32 = 8.0;
+    const SLOP_Y: f32 = 4.0;
+    let in_band = |rect: Rect, grace: f32| {
+        p.x >= rect.min.x - SLOP_X
+            && p.x <= rect.max.x + SLOP_X
+            && p.y >= rect.min.y - SLOP_Y
+            && p.y <= rect.max.y + SLOP_Y + grace
+    };
+    // The inter-group gap below folder `fid`'s painted group: the bottom of
+    // its last visible member row (or the folder row itself when collapsed
+    // or empty) — where a FolderInsert below-bar sits.
+    let group_bottom = |fid: Uuid| {
+        rows.iter()
+            .filter_map(|r| match r {
+                DropRow::Folder { rect, id, .. } if *id == fid => Some(rect.max.y),
+                DropRow::Term { rect, folder, .. } if *folder == Some(fid) => Some(rect.max.y),
+                _ => None,
+            })
+            .fold(f32::MIN, f32::max)
+    };
+    for row in rows {
+        match (payload, row) {
+            (DragPayload::Term { .. }, DropRow::Term { rect, folder, idx }) => {
+                // Grace below the group's last painted row.
+                let last = !rows.iter().any(|r| {
+                    matches!(r, DropRow::Term { folder: f, idx: i, .. }
+                        if f == folder && *i == idx + 1)
+                });
+                if !in_band(*rect, if last { 20.0 } else { 0.0 }) {
+                    continue;
+                }
+                let below = p.y >= rect.center().y;
+                return Some(SlotHit::Insert {
+                    folder: *folder,
+                    idx: if below { idx + 1 } else { *idx },
+                    y: if below { rect.max.y + 2.0 } else { rect.min.y - 2.0 },
+                    x: rect.x_range(),
+                });
+            }
+            (DragPayload::Term { .. }, DropRow::Folder { rect, id, .. }) => {
+                if !in_band(*rect, 0.0) {
+                    continue;
+                }
+                return Some(SlotHit::IntoFolder { id: *id, rect: *rect });
+            }
+            (DragPayload::Term { .. }, DropRow::LooseZone { rect }) => {
+                if !in_band(*rect, 0.0) {
+                    continue;
+                }
+                return Some(SlotHit::LooseAppend {
+                    y: rect.min.y + 1.0,
+                    x: rect.x_range(),
+                });
+            }
+            (DragPayload::Folder { .. }, DropRow::Folder { rect, id, idx }) => {
+                if !in_band(*rect, 0.0) {
+                    continue;
+                }
+                let below = p.y >= rect.center().y;
+                return Some(SlotHit::FolderInsert {
+                    idx: if below { idx + 1 } else { *idx },
+                    y: if below { group_bottom(*id) + 2.0 } else { rect.min.y - 2.0 },
+                    x: rect.x_range(),
+                });
+            }
+            (DragPayload::Folder { .. }, DropRow::Term { rect, folder: Some(fid), .. }) => {
+                // A foldered member row: the whole open group reads as its
+                // folder's below-slot.
+                if !in_band(*rect, 0.0) {
+                    continue;
+                }
+                let fidx = rows.iter().find_map(|r| match r {
+                    DropRow::Folder { id, idx, .. } if id == fid => Some(*idx),
+                    _ => None,
+                })?;
+                let frect = rows.iter().find_map(|r| match r {
+                    DropRow::Folder { rect, id, .. } if id == fid => Some(*rect),
+                    _ => None,
+                })?;
+                return Some(SlotHit::FolderInsert {
+                    idx: fidx + 1,
+                    y: group_bottom(*fid) + 2.0,
+                    x: frect.x_range(),
+                });
+            }
+            // A folder can't nest into loose rows or the loose zone.
+            (DragPayload::Folder { .. }, _) => continue,
+        }
+    }
+    None
 }
 
 fn prefs_path() -> PathBuf {
@@ -2773,7 +2907,14 @@ impl App {
                 self.renaming = None;
             }
         }
-        if self.drag.as_ref().is_some_and(|d| !ids.contains(&d.id)) {
+        let drag_alive = match self.drag.as_ref().map(|d| &d.payload) {
+            Some(DragPayload::Term { id, .. }) => ids.contains(id),
+            Some(DragPayload::Folder { id }) => {
+                self.state.folders.iter().any(|f| f.id == *id)
+            }
+            None => true,
+        };
+        if !drag_alive {
             self.drag = None;
         }
         if self.selected.is_some_and(|id| !ids.contains(&id)) {
@@ -3182,63 +3323,61 @@ impl App {
         }
     }
 
-    /// Hit-test a pointer position against the painted rows: folder rows are
-    /// move-into targets over their whole height; terminal rows split at
-    /// their midline into insert-above / insert-below; the last row of each
-    /// group extends 20px of grace below it (end-of-list drops). Outside
-    /// every band ⇒ None (release there cancels).
+    /// Hit-test the pointer against LAST frame's slot map for the armed
+    /// payload (see `slot_hit` for the band rules). None while no drag.
     fn slot_at(&self, p: Pos2) -> Option<SlotHit> {
-        for row in &self.drop_rows {
-            let (rect, grace) = match row {
-                DropRow::Folder { rect, .. } => (*rect, 0.0),
-                DropRow::Term { rect, folder, idx } => {
-                    // Grace below the group's last painted row.
-                    let last = !self.drop_rows.iter().any(|r| {
-                        matches!(r, DropRow::Term { folder: f, idx: i, .. }
-                            if f == folder && *i == idx + 1)
-                    });
-                    (*rect, if last { 20.0 } else { 0.0 })
-                }
-            };
-            if p.x < rect.min.x - 8.0 || p.x > rect.max.x + 8.0 {
-                continue;
-            }
-            if p.y < rect.min.y - 2.0 || p.y > rect.max.y + 2.0 + grace {
-                continue;
-            }
-            return Some(match row {
-                DropRow::Folder { rect, id } => SlotHit::IntoFolder { id: *id, rect: *rect },
-                DropRow::Term { rect, folder, idx } => {
-                    let below = p.y >= rect.center().y;
-                    SlotHit::Insert {
-                        folder: *folder,
-                        idx: if below { idx + 1 } else { *idx },
-                        y: if below { rect.max.y + 2.0 } else { rect.min.y - 2.0 },
-                        x: rect.x_range(),
-                    }
-                }
-            });
-        }
-        None
+        let d = self.drag.as_ref()?;
+        slot_hit(&self.drop_rows, &d.payload, p)
     }
 
-    /// Wire a resolved drop (§5.5): MoveTerminal when the folder changed,
-    /// then ReorderTerminal with the client-computed delta — two messages,
-    /// same daemon thread, processed in order. Nothing is applied
+    /// Wire a resolved drop (§5.5): for terminals, MoveTerminal when the
+    /// folder changed, then ReorderTerminal with the client-computed delta —
+    /// two messages, same daemon thread, processed in order. For folders,
+    /// MoveFolder with the same delta math. Nothing is applied
     /// optimistically; the snapshot round-trip repaints the truth.
     fn perform_drop(&mut self, hit: SlotHit) {
         let Some(d) = self.drag.take() else { return };
+        match (d.payload, hit) {
+            (DragPayload::Term { id, from }, hit) => self.perform_term_drop(id, from, hit),
+            (DragPayload::Folder { id }, SlotHit::FolderInsert { idx, .. }) => {
+                // Replicate the daemon's MoveFolder semantics: folders
+                // sorted by `order` alone (D6), remove+insert+clamp — the
+                // exact math drop_reorder_delta encodes.
+                let mut fs: Vec<(Uuid, i64)> = self
+                    .state
+                    .folders
+                    .iter()
+                    .map(|f| (f.id, f.order))
+                    .collect();
+                fs.sort_by_key(|&(_, o)| o);
+                let folders: Vec<Uuid> = fs.into_iter().map(|(i, _)| i).collect();
+                let delta = drop_reorder_delta(&folders, id, Some(idx), true);
+                if delta != 0 {
+                    self.send(C2D::MoveFolder { id, delta });
+                }
+            }
+            // slot_hit filters targets by payload, so a folder payload can
+            // only resolve to FolderInsert — defensively drop anything else.
+            (DragPayload::Folder { .. }, _) => {}
+        }
+    }
+
+    /// The terminal half of `perform_drop` (§5.5).
+    fn perform_term_drop(&mut self, id: Uuid, from: Option<Uuid>, hit: SlotHit) {
         let (dest, idx) = match hit {
-            SlotHit::IntoFolder { id, .. } => {
-                if d.from == Some(id) {
+            SlotHit::IntoFolder { id: fid, .. } => {
+                if from == Some(fid) {
                     return; // already in that folder — nothing to do
                 }
-                (Some(id), None)
+                (Some(fid), None)
             }
             SlotHit::Insert { folder, idx, .. } => (folder, Some(idx)),
+            // Bug B: the UNGROUPED zone appends to the loose group.
+            SlotHit::LooseAppend { .. } => (None, None),
+            SlotHit::FolderInsert { .. } => return, // not a terminal target
         };
-        if d.from != dest {
-            self.send(C2D::MoveTerminal { id: d.id, folder: dest });
+        if from != dest {
+            self.send(C2D::MoveTerminal { id, folder: dest });
         }
         // Replicate the daemon's post-move group EXACTLY (its filter walks
         // the snapshot vec in order, then stable-sorts by `order` — same
@@ -3249,16 +3388,16 @@ impl App {
             .terminals
             .iter()
             .filter(|t| {
-                let f = if t.id == d.id { dest } else { t.folder };
+                let f = if t.id == id { dest } else { t.folder };
                 f == dest
             })
             .map(|t| (t.id, t.order))
             .collect();
         g.sort_by_key(|&(_, o)| o);
         let group: Vec<Uuid> = g.into_iter().map(|(i, _)| i).collect();
-        let delta = drop_reorder_delta(&group, d.id, idx, d.from == dest);
+        let delta = drop_reorder_delta(&group, id, idx, from == dest);
         if delta != 0 {
-            self.send(C2D::ReorderTerminal { id: d.id, delta });
+            self.send(C2D::ReorderTerminal { id, delta });
         }
     }
 
@@ -3268,8 +3407,13 @@ impl App {
     fn paint_drag_feedback(&self, ui: &mut egui::Ui) {
         let Some(d) = &self.drag else { return };
         let Some(p) = ui.ctx().pointer_latest_pos() else { return };
-        match self.slot_at(p) {
-            Some(SlotHit::Insert { y, x, .. }) => {
+        let hit = self.slot_at(p);
+        match &hit {
+            Some(
+                SlotHit::Insert { y, x, .. }
+                | SlotHit::FolderInsert { y, x, .. }
+                | SlotHit::LooseAppend { y, x },
+            ) => {
                 let bar = Rect::from_min_max(
                     Pos2::new(x.min + 4.0, y - 1.0),
                     Pos2::new(x.max - 4.0, y + 1.0),
@@ -3278,21 +3422,29 @@ impl App {
             }
             Some(SlotHit::IntoFolder { rect, .. }) => {
                 ui.painter()
-                    .rect_filled(rect, CornerRadius::same(6), ACCENT_SUBTLE);
+                    .rect_filled(*rect, CornerRadius::same(6), ACCENT_SUBTLE);
             }
             None => {}
         }
-        // Ghost: name + dot on SURFACE_2 r6 + soft shadow, 80% opacity,
-        // riding the pointer at the grab offset. Painted on the tooltip
-        // layer so it clears every panel.
+        // Dead zone (Bug B): a release here cancels — say so instead of
+        // failing silently. The ghost dims and the cursor flips to no-drop
+        // (reveal, never outline).
+        let live = hit.is_some();
+        let alpha = if live { 0.8 } else { 0.45 };
+        // Ghost: name (+ activity dot for terminals; folder ghosts are
+        // dot-less name · count) on SURFACE_2 r6 + soft shadow, riding the
+        // pointer at the grab offset. Painted on the tooltip layer so it
+        // clears every panel.
+        let is_folder = matches!(d.payload, DragPayload::Folder { .. });
         let painter = ui
             .ctx()
             .layer_painter(egui::LayerId::new(egui::Order::Tooltip, Id::new("drag-ghost")));
         let galley =
             painter.layout_no_wrap(d.name.clone(), FontId::proportional(13.0), TEXT);
+        let (text_x, pad) = if is_folder { (14.0, 26.0) } else { (26.0, 36.0) };
         let rect = Rect::from_min_size(
             p - d.grab,
-            Vec2::new(galley.size().x + 36.0, 28.0),
+            Vec2::new(galley.size().x + pad, 28.0),
         );
         painter.add(
             egui::epaint::Shadow {
@@ -3303,15 +3455,52 @@ impl App {
             }
             .as_shape(rect, CornerRadius::same(6)),
         );
-        painter.rect_filled(rect, CornerRadius::same(6), SURFACE_2.gamma_multiply(0.8));
-        painter.circle_filled(
-            Pos2::new(rect.min.x + 14.0, rect.center().y),
-            4.0,
-            d.dot.gamma_multiply(0.8),
-        );
+        painter.rect_filled(rect, CornerRadius::same(6), SURFACE_2.gamma_multiply(alpha));
+        if !is_folder {
+            painter.circle_filled(
+                Pos2::new(rect.min.x + 14.0, rect.center().y),
+                4.0,
+                d.dot.gamma_multiply(alpha),
+            );
+        }
         let ty = rect.center().y - galley.size().y / 2.0;
-        painter.galley(Pos2::new(rect.min.x + 26.0, ty), galley, TEXT.gamma_multiply(0.8));
-        ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        painter.galley(
+            Pos2::new(rect.min.x + text_x, ty),
+            galley,
+            TEXT.gamma_multiply(alpha),
+        );
+        ui.ctx().set_cursor_icon(if live {
+            CursorIcon::Grabbing
+        } else {
+            CursorIcon::NoDrop
+        });
+    }
+
+    /// Bug B: edge-band autoscroll while a drag is armed, run inside the
+    /// sidebar's ScrollArea closure. Pointer within 24px of the viewport's
+    /// top/bottom feeds a per-frame scroll delta proportional to edge
+    /// proximity, so off-screen drop targets are reachable mid-drag.
+    fn drag_autoscroll(&self, ui: &mut egui::Ui) {
+        if self.drag.is_none() {
+            return;
+        }
+        let Some(p) = ui.ctx().pointer_latest_pos() else { return };
+        let vp = ui.clip_rect();
+        if p.x < vp.min.x || p.x > vp.max.x {
+            return; // pointer left the sidebar column
+        }
+        const BAND: f32 = 24.0;
+        let dt = ui.input(|i| i.stable_dt).min(0.1);
+        // Positive scroll delta moves the view up (content down).
+        let dy = if p.y < vp.min.y + BAND {
+            (vp.min.y + BAND - p.y) * 8.0 * dt
+        } else if p.y > vp.max.y - BAND {
+            -((p.y - (vp.max.y - BAND)) * 8.0 * dt)
+        } else {
+            return;
+        };
+        ui.scroll_with_delta(Vec2::new(0.0, dy));
+        ui.ctx().request_repaint();
     }
 
     // ─────────────────────────── composer (P3) ───────────────────────────
@@ -5616,8 +5805,11 @@ fn middle_ellipsize(s: &str, max: usize) -> String {
     out
 }
 
-/// Uppercase section header (D20): 11px muted, 22px tall, 12px above / 4 below.
-fn section_header(ui: &mut egui::Ui, label: &str) {
+/// Uppercase section header (D20): 11px muted, 22px tall, 12px above / 4
+/// below. Color is caller-chosen (Bug B: the UNGROUPED header revealed
+/// mid-drag whispers at TEXT_FAINT); returns the header rect so it can
+/// register as a drop band.
+fn section_header_col(ui: &mut egui::Ui, label: &str, col: Color32) -> Rect {
     ui.add_space(12.0);
     let (rect, _) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::hover());
@@ -5626,9 +5818,10 @@ fn section_header(ui: &mut egui::Ui, label: &str) {
         Align2::LEFT_CENTER,
         label.to_uppercase(),
         FontId::proportional(11.0),
-        TEXT_MUTED,
+        col,
     );
     ui.add_space(4.0);
+    rect
 }
 
 /// Escape regex metacharacters so a search query matches as literal text (V4).
@@ -6525,6 +6718,82 @@ mod tests {
 
         // Unknown id ⇒ 0 (defensive; the daemon would ignore it anyway).
         assert_eq!(drop_reorder_delta(&group, Uuid::new_v4(), Some(0), true), 0);
+
+        // Bug B: folder reorder rides the SAME fn — the daemon's MoveFolder
+        // has identical remove+insert+clamp semantics. Folder id lists,
+        // always same_group (the painted folders include the dragged one).
+        let f: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        // Drag folder 0 below folder 1 (painted idx 2) ⇒ delta +1.
+        assert_eq!(drop_reorder_delta(&f, f[0], Some(2), true), 1);
+        // Drag the last folder to the top ⇒ delta −2.
+        assert_eq!(drop_reorder_delta(&f, f[2], Some(0), true), -2);
+        // Below the end (idx past last) ⇒ clamped append.
+        assert_eq!(drop_reorder_delta(&f, f[1], Some(3), true), 1);
+        // Own slot (above or below itself) ⇒ no-op, nothing is sent.
+        assert_eq!(drop_reorder_delta(&f, f[1], Some(1), true), 0);
+        assert_eq!(drop_reorder_delta(&f, f[1], Some(2), true), 0);
+    }
+
+    /// Bug B §5.5: the pure payload-aware hit-test. Layout (x 0..200):
+    /// folder A (0..30) with members a0 (33..63) and a1 (66..96, last —
+    /// 20px grace), collapsed folder B (101..131), UNGROUPED header zone
+    /// (143..165), loose term l0 (169..199), tail zone (202..400).
+    #[test]
+    fn slot_hit_table() {
+        let (fa, fb) = (Uuid::new_v4(), Uuid::new_v4());
+        let r = |y0: f32, y1: f32| {
+            Rect::from_min_max(Pos2::new(0.0, y0), Pos2::new(200.0, y1))
+        };
+        let rows = vec![
+            DropRow::Folder { rect: r(0.0, 30.0), id: fa, idx: 0 },
+            DropRow::Term { rect: r(33.0, 63.0), folder: Some(fa), idx: 0 },
+            DropRow::Term { rect: r(66.0, 96.0), folder: Some(fa), idx: 1 },
+            DropRow::Folder { rect: r(101.0, 131.0), id: fb, idx: 1 },
+            DropRow::LooseZone { rect: r(143.0, 165.0) },
+            DropRow::Term { rect: r(169.0, 199.0), folder: None, idx: 0 },
+            DropRow::LooseZone { rect: r(202.0, 400.0) },
+        ];
+        let term = DragPayload::Term { id: Uuid::new_v4(), from: None };
+        let hit = |pl: &DragPayload, x: f32, y: f32| slot_hit(&rows, pl, Pos2::new(x, y));
+
+        // Terminal payload — midline split on member rows.
+        assert!(matches!(hit(&term, 100.0, 40.0),
+            Some(SlotHit::Insert { folder: Some(f), idx: 0, .. }) if f == fa));
+        assert!(matches!(hit(&term, 100.0, 55.0),
+            Some(SlotHit::Insert { folder: Some(f), idx: 1, .. }) if f == fa));
+        // Group-end grace: 20px below the last member still appends there.
+        assert!(matches!(hit(&term, 100.0, 105.0),
+            Some(SlotHit::Insert { folder: Some(f), idx: 2, .. }) if f == fa));
+        // Folder rows are move-into targets over their whole height.
+        assert!(matches!(hit(&term, 100.0, 15.0),
+            Some(SlotHit::IntoFolder { id, .. }) if id == fa));
+        assert!(matches!(hit(&term, 100.0, 125.0),
+            Some(SlotHit::IntoFolder { id, .. }) if id == fb));
+        // The UNGROUPED header and the empty tail append to loose.
+        assert!(matches!(hit(&term, 100.0, 150.0), Some(SlotHit::LooseAppend { .. })));
+        assert!(matches!(hit(&term, 100.0, 300.0), Some(SlotHit::LooseAppend { .. })));
+        // Dead zone (the gap between B and the header, past ±4 slop) ⇒ None.
+        assert!(hit(&term, 100.0, 137.0).is_none());
+        // Horizontal slop is ±8.
+        assert!(hit(&term, -9.0, 15.0).is_none());
+        assert!(matches!(hit(&term, -7.0, 15.0), Some(SlotHit::IntoFolder { .. })));
+
+        // Folder payload — folder rows split at the midline into reorder
+        // slots; the below-bar sits at the group's bottom (a1 = 96).
+        let fol = DragPayload::Folder { id: fb };
+        assert!(matches!(hit(&fol, 100.0, 10.0),
+            Some(SlotHit::FolderInsert { idx: 0, .. })));
+        assert!(matches!(hit(&fol, 100.0, 25.0),
+            Some(SlotHit::FolderInsert { idx: 1, y, .. }) if y == 98.0));
+        // A's open member rows read as A's below-slot (one visual group).
+        assert!(matches!(hit(&fol, 100.0, 45.0),
+            Some(SlotHit::FolderInsert { idx: 1, y, .. }) if y == 98.0));
+        assert!(matches!(hit(&fol, 100.0, 80.0),
+            Some(SlotHit::FolderInsert { idx: 1, .. })));
+        // Loose terminals and the loose zones are not folder targets.
+        assert!(hit(&fol, 100.0, 150.0).is_none());
+        assert!(hit(&fol, 100.0, 184.0).is_none());
+        assert!(hit(&fol, 100.0, 300.0).is_none());
     }
 
     /// task #22: the CLI attention dot state table. Working <800ms for
