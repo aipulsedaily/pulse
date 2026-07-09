@@ -488,6 +488,7 @@ impl App {
             if let Some(b) = self.terms.get_mut(&id) {
                 b.note_input();
             }
+            self.rearm_attention(id); // Bug A: user input re-arms amber
             // P6b §5.2 observed-raw capture (the deliberate-yield path — with
             // post-submit typeahead, composed keys never reach here): a raw
             // Enter at a hooked cmd prompt is the only executions witness cmd
@@ -791,6 +792,7 @@ impl App {
                         b.mark_prompt_spacer();
                     }
                 }
+                self.rearm_attention(id); // Bug A: user input re-arms amber
                 // Chunked: a composer submission can carry a large paste.
                 self.send_input(id, comp_write);
             }

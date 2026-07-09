@@ -625,6 +625,14 @@ struct ActivityState {
     /// Output before this instant never arms `cli_stream` — the post-attach
     /// conhost repaint / respawn banner window (CLI_ATTACH_SUPPRESS).
     cli_suppress_until: Instant,
+    /// Bug A attention ack: true ⇒ the next waiting signal (bell / prompt
+    /// signature / CLI quiet) may latch NeedsYou. Viewing the terminal (or
+    /// clicking the attention pill) DISARMS persistently — a still-painted
+    /// permission prompt or an idle REPL repaint can never re-fire amber.
+    /// Only user-authored PTY input re-arms (`rearm_attention`), plus
+    /// session Reset and sleep/wake (both deliberate user acts). Starts
+    /// armed so a genuinely-waiting prompt alerts once at boot.
+    armed: bool,
 }
 
 impl ActivityState {
@@ -641,6 +649,7 @@ impl ActivityState {
             // Entries are created at attach (update_activity's first pass
             // over a fresh backend), so "now" is attach time.
             cli_suppress_until: Instant::now() + CLI_ATTACH_SUPPRESS,
+            armed: true,
         }
     }
 }
@@ -678,6 +687,50 @@ fn derive_activity(
         return Activity::Working;
     }
     Activity::Idle
+}
+
+/// Pure per-frame attention latch step (Bug A ack machine, unit-tested):
+/// the three latch sources (bell, prompt signature, CLI quiet) fire only
+/// while `st.armed`; viewing the terminal clears AND disarms, so nothing
+/// re-latches until user input re-arms (`rearm_attention`). Loop killers:
+/// a level-triggered `prompt_sig` that stays painted after the ack, and
+/// idle REPL repaints re-arming `cli_stream`, are both dead ends while
+/// disarmed. `prompt_sig` is passed (not read from `st`) so the caller's
+/// scan-refresh stays visible at the call site.
+fn step_attention(
+    st: &mut ActivityState,
+    bell: bool,
+    prompt_sig: bool,
+    is_cli: bool,
+    quiet: Duration,
+    viewing: bool,
+) {
+    if st.armed {
+        if bell {
+            st.needs_you = true;
+        }
+        if prompt_sig {
+            st.needs_you = true;
+        }
+        // task #22: a CLI streaming episode that has gone quiet past the
+        // threshold is DONE — latch NeedsYou (amber dot / left bar /
+        // titlebar pill / taskbar flash, the whole existing signal path)
+        // until the terminal is viewed. One latch per episode.
+        if is_cli && st.cli_stream && quiet >= CLI_ATTENTION_QUIET {
+            st.needs_you = true;
+            st.cli_stream = false;
+        }
+    }
+    if viewing {
+        st.needs_you = false;
+        st.bursts = 0;
+        // Viewing consumes any in-flight CLI episode too — typing
+        // (input) requires selection+focus, so a mid-stream glance
+        // means completion never alerts unless input follows.
+        st.cli_stream = false;
+        // Persistent ack: amber stays off until the user sends input.
+        st.armed = false;
+    }
 }
 
 /// Inline scrollback search over the selected terminal (V4).
@@ -1670,6 +1723,7 @@ impl App {
             b.scroll_to_bottom();
             b.note_input(); // v0.1.1: freeze a pending prompt-end upgrade
         }
+        self.rearm_attention(id); // Bug A: user input re-arms amber
         if self.ipc.as_ref().is_some_and(|c| c.proto >= 6) {
             self.send(C2D::SubmitCommand {
                 id,
@@ -1830,6 +1884,7 @@ impl App {
         if let Some(st) = self.composers.get_mut(&id) {
             st.on_raw_input(Instant::now());
         }
+        self.rearm_attention(id); // Bug A: user input re-arms amber
         self.send_input(id, bytes);
     }
 
@@ -2334,6 +2389,9 @@ impl App {
                     let ast = self.activity.entry(id).or_insert_with(ActivityState::new);
                     ast.cli_suppress_until = Instant::now() + CLI_ATTACH_SUPPRESS;
                     ast.cli_stream = false;
+                    // Bug A: a fresh session may alert once (respawn is a
+                    // deliberate user act, like boot).
+                    ast.armed = true;
                 }
                 D2C::Error { message } => {
                     self.last_error = Some((message, Instant::now()));
@@ -2847,8 +2905,9 @@ impl App {
     }
 
     /// Drain per-frame signals: bell + prompt detection latch NeedsYou; viewing
-    /// a terminal (selected AND focused) clears its latch and burst count; a
-    /// newly-latched terminal flashes the taskbar once while unfocused (V-D).
+    /// a terminal (selected AND focused) clears its latch and burst count AND
+    /// disarms further latching until user input (Bug A ack, `step_attention`);
+    /// a newly-latched terminal flashes the taskbar once while unfocused (V-D).
     fn update_activity(&mut self, ctx: &egui::Context, focused: bool) {
         let selected = self.selected;
         let mut flash = false;
@@ -2878,6 +2937,9 @@ impl App {
                 st.needs_you = false;
                 st.bursts = 0;
                 st.cli_stream = false;
+                // Bug A: wake requires a deliberate user act, so a woken
+                // session behaves like a fresh one — may alert once.
+                st.armed = true;
                 let _ = std::mem::take(&mut backend.bell);
                 self.unread.remove(&id);
                 self.attention_flashed.remove(&id);
@@ -2888,9 +2950,9 @@ impl App {
             let is_cli = matches!(t.kind, crate::state::TermKind::Claude { .. })
                 || t.inner_cli.is_some();
             let was = st.needs_you;
-            if std::mem::take(&mut backend.bell) {
-                st.needs_you = true;
-            }
+            // Drain the bell unconditionally (it must not pile up while
+            // disarmed); step_attention decides whether it latches.
+            let bell = std::mem::take(&mut backend.bell);
             // Prompt-signature scan only when the backend consumed bytes
             // since the last scan (UX HIGH-3); the cached verdict keeps the
             // exact per-frame latch semantics of the unconditional scan.
@@ -2898,25 +2960,13 @@ impl App {
                 st.scanned_gen = backend.feed_gen;
                 st.prompt_sig = backend.looks_like_prompt();
             }
-            if st.prompt_sig {
-                st.needs_you = true;
-            }
-            // task #22: a CLI streaming episode that has gone quiet past the
-            // threshold is DONE — latch NeedsYou (amber dot / left bar /
-            // titlebar pill / taskbar flash, the whole existing signal path)
-            // until the terminal is viewed. One latch per episode.
-            if is_cli && st.cli_stream && st.last_output.elapsed() >= CLI_ATTENTION_QUIET {
-                st.needs_you = true;
-                st.cli_stream = false;
-            }
-            if selected == Some(id) && focused {
-                st.needs_you = false;
-                st.bursts = 0;
-                // Viewing consumes any in-flight CLI episode too — typing
-                // (input) requires selection+focus, so this also covers the
-                // "input sent" clear.
-                st.cli_stream = false;
-            }
+            // Bug A: latch + view-ack live in the pure step (unit-tested);
+            // all three sources are gated on `st.armed` so an acked terminal
+            // stays quiet until the user sends input (`rearm_attention`).
+            let viewing = selected == Some(id) && focused;
+            let sig = st.prompt_sig;
+            let quiet = st.last_output.elapsed();
+            step_attention(st, bell, sig, is_cli, quiet, viewing);
             if st.needs_you && !was && !focused && !self.attention_flashed.contains(&id) {
                 flash = true;
                 self.attention_flashed.insert(id);
@@ -2943,6 +2993,22 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
                 egui::UserAttentionType::Informational,
             ));
+        }
+    }
+
+    /// Bug A: user-authored PTY input re-arms the attention latch — the NEXT
+    /// waiting signal (bell / prompt signature / CLI quiet) may fire amber
+    /// again. Also drops any stale CLI episode so the RESPONSE stream defines
+    /// the next one (an idle repaint before the input must not count). Call
+    /// beside every user-input `note_input` site; never from synthetic or
+    /// automatic writes. Typing requires selection+focus, so the same-frame
+    /// view-ack keeps re-arming itself invisible — amber only returns once
+    /// the CLI later goes quiet or prompts. Missing entry ⇒ nothing to do
+    /// (ActivityState::new already starts armed).
+    fn rearm_attention(&mut self, id: Uuid) {
+        if let Some(st) = self.activity.get_mut(&id) {
+            st.armed = true;
+            st.cli_stream = false;
         }
     }
 
@@ -3346,6 +3412,7 @@ impl App {
             b.scroll_to_bottom();
             b.note_input(); // v0.1.1: freeze a pending prompt-end upgrade
         }
+        self.rearm_attention(id); // Bug A: user input re-arms amber
     }
 
     /// Ask the daemon for the block's stripped output text; the D2C reply
@@ -4195,6 +4262,7 @@ impl App {
                             b.scroll_to_bottom();
                             b.note_input(); // v0.1.1: freeze a pending capture
                         }
+                        self.rearm_attention(id); // Bug A: user input re-arms
                         self.send(C2D::Input { id, bytes });
                     }
                     if let Some(cmdline) = cmd_submit {
@@ -4749,6 +4817,10 @@ impl App {
             self.select_terminal(next);
             if let Some(st) = self.activity.get_mut(&next) {
                 st.needs_you = false;
+                // Bug A: the click IS the ack — disarm persistently, same as
+                // the view-ack in step_attention (which also lands next
+                // frame, but only if the window is focused).
+                st.armed = false;
             }
             self.attention_flashed.remove(&next);
         }
@@ -6491,6 +6563,73 @@ mod tests {
         assert!(!quiet_enough(ms(2999), true));
         assert!(quiet_enough(ms(3000), true));
         assert!(!quiet_enough(ms(10_000), false));
+    }
+
+    /// Bug A: the attention ack state machine (`step_attention`). Amber fires
+    /// once per user turn: viewing clears AND disarms persistently, so a
+    /// still-painted prompt signature (loop a) and idle-REPL repaint episodes
+    /// (loop b) never re-fire; only user input re-arms; Reset/wake re-arm.
+    #[test]
+    fn attention_ack_state_table() {
+        use std::time::Duration as D;
+        let ms = D::from_millis;
+        let mut st = ActivityState::new();
+        assert!(st.armed, "starts armed: a waiting prompt alerts once at boot");
+
+        // 1. Armed + prompt signature ⇒ latch (baseline preserved).
+        step_attention(&mut st, false, true, false, ms(0), false);
+        assert!(st.needs_you, "armed prompt_sig latches");
+        assert!(st.armed, "latching does not disarm (taskbar flash/pill live)");
+
+        // 2. View ⇒ clear + disarm; the signature still painted across
+        //    deselect/reselect frames never re-latches (kills loop a).
+        step_attention(&mut st, false, true, false, ms(0), true);
+        assert!(!st.needs_you && !st.armed, "view acks: cleared + disarmed");
+        for _ in 0..50 {
+            step_attention(&mut st, false, true, false, ms(0), false);
+            assert!(!st.needs_you, "level-triggered prompt_sig stays acked");
+        }
+
+        // 3. Disarmed idle-repaint episode: output re-armed cli_stream, then
+        //    quiet past the threshold ⇒ no latch (kills loop b).
+        st.cli_stream = true;
+        step_attention(&mut st, false, false, true, ms(3500), false);
+        assert!(!st.needs_you, "idle repaint + quiet never re-fires while acked");
+
+        // 4. User input re-arms (rearm_attention: armed=true, cli_stream=false);
+        //    the response stream then defines the next episode, which fires
+        //    exactly once at the quiet threshold.
+        st.armed = true;
+        st.cli_stream = false; // rearm_attention drops the stale episode…
+        st.cli_stream = true; // …and the response bytes arm a fresh one
+        step_attention(&mut st, false, false, true, ms(2999), false);
+        assert!(!st.needs_you, "not quiet long enough yet");
+        step_attention(&mut st, false, false, true, ms(3000), false);
+        assert!(st.needs_you, "fires again on the next waiting transition");
+        assert!(!st.cli_stream, "episode consumed on latch — one alert per turn");
+        step_attention(&mut st, false, false, true, ms(5000), true); // view
+        assert!(!st.needs_you && !st.armed);
+
+        // 5. Bell while disarmed ⇒ drained upstream, no latch; armed ⇒ latch.
+        step_attention(&mut st, true, false, false, ms(0), false);
+        assert!(!st.needs_you, "acked bell stays quiet");
+        st.armed = true;
+        step_attention(&mut st, true, false, false, ms(0), false);
+        assert!(st.needs_you, "armed bell latches");
+
+        // 6. Reset/wake re-arm: the fresh session's boot prompt alerts once.
+        step_attention(&mut st, false, false, false, ms(0), true); // ack
+        assert!(!st.armed);
+        st.armed = true; // D2C::Reset / sleep-wake site
+        step_attention(&mut st, false, true, false, ms(0), false);
+        assert!(st.needs_you, "fresh session may alert once");
+
+        // 7. Pill click acks persistently (needs_you=false AND armed=false):
+        //    the still-painted signature must not re-light next frame.
+        st.needs_you = false;
+        st.armed = false;
+        step_attention(&mut st, false, true, false, ms(0), false);
+        assert!(!st.needs_you, "pill ack is durable, not a one-frame clear");
     }
 
     /// SLEEP §7.1: the presented-status → lifecycle-menu table. Running gets
