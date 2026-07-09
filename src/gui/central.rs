@@ -83,7 +83,7 @@ impl App {
         // last committed; clearing any pending candidate stops it from
         // committing with stale timing when focus returns, where the normal
         // 250ms debounce re-evaluates fresh.
-        let win_focused = ui.ctx().input(|i| i.focused);
+        let win_focused = ui.ctx().input(|i| i.focused) || self.diag_assume_focus;
         if !win_focused {
             // Only the FOCUSED window drives PTY resizes; otherwise two windows
             // of different sizes fight over each terminal's grid. Drop any
@@ -327,6 +327,11 @@ impl App {
         }) {
             self.recompute_search(id);
         }
+        // C2: one predicate evaluation for this frame's paint decisions —
+        // the same `strip_hidden` question `layout_for` answered for the
+        // commit/heal resizes above (single source; computed here, before
+        // the long-lived search borrow below).
+        let strip_collapsed = hooked && self.strip_collapsed(id);
         let (sre, curm) = match &mut self.search {
             Some(s) => (
                 s.regex.as_mut(),
@@ -402,11 +407,16 @@ impl App {
             drop_label,
             asleep: asleep_wash(presented_now),
         };
-        // Card split (P3 §7): hooked terminals draw the grid above a
-        // CONSTANT 36px composer strip; hookless terminals keep today's
-        // single call byte-for-byte.
+        // Card split (P3 §7): hooked terminals draw the grid above a 36px
+        // composer strip; hookless terminals keep today's single call
+        // byte-for-byte. C2: under a STABLE full-screen app the strip
+        // collapses and the grid takes the whole card — `strip_collapsed`
+        // is the same `strip_hidden` predicate `layout_for` consulted for
+        // the PTY size this frame (single source: paint and grid dims can
+        // never disagree; the ±rows resize rode the debounced commit /
+        // corrective-heal machinery above).
         let full = ui.available_rect_before_wrap();
-        let grid_area = if hooked {
+        let grid_area = if hooked && !strip_collapsed {
             Rect::from_min_max(
                 full.min,
                 Pos2::new(full.max.x, full.max.y - composer::STRIP_H),
@@ -689,8 +699,12 @@ impl App {
             }
         }
 
-        // Composer strip (P3 §6.3). Present for hooked terminals in EVERY
-        // state (alt-screen, Dead, busy) — the reservation is constant.
+        // Composer strip (P3 §6.3). Runs for hooked terminals in EVERY
+        // state (alt-screen, Dead, busy). C2: while collapsed the band's
+        // rect overlaps the grid's bottom rows — composer::show then paints
+        // at most the hover-peek overlay there and registers no interaction
+        // (the pixels belong to the grid); every other state keeps the real
+        // reserved band.
         if hooked {
             let strip_rect = Rect::from_min_max(
                 Pos2::new(full.min.x, full.max.y - composer::STRIP_H),
@@ -731,6 +745,7 @@ impl App {
                     &bl.recs,
                     bl.epoch,
                     running,
+                    strip_collapsed,
                     overlay_open,
                     font,
                     cover_line,

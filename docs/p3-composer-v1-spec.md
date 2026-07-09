@@ -42,10 +42,12 @@ defaults.
    keys go to the composer TextEdit XOR the grid, decided per frame by explicit rules (§3). Mode
    transitions never move focus away from an actively-typing user except as the direct result of
    the user's own action (submit / Esc / click).
-5. **Grid geometry never depends on transient shell state**: the composer strip is a CONSTANT
-   36px reservation per hooked terminal — it does not appear/disappear with prompts, alt-screen,
-   or death. PTY resize events tied to composer behavior: zero (past incident class: resize
-   storms wipe conhost).
+5. **Grid geometry never depends on transient shell state**: the composer strip is a 36px
+   reservation per hooked terminal — it does not appear/disappear with prompts or death.
+   PTY resize events tied to composer behavior: zero (past incident class: resize storms wipe
+   conhost). C2 amendment — the ONE sanctioned exception: a STABLE alt screen (held ≥ 400ms)
+   collapses the strip and the terminal reclaims the rows, ±1 debounced resize per real TUI
+   enter/exit (§7 "C2 refinement" — hysteresis, single-source predicate, recoverable feed).
 6. **bincode compat**: **no protocol change at all.** Submission = existing `C2D::Input`; gate =
    existing `D2C::Blocks` + the GUI's own scanner; history = existing `BlockRec.cmd`.
    `DaemonInfo.proto` stays **2** (P2's value) — reuse, don't bump, because nothing on the wire
@@ -517,7 +519,7 @@ All painter-drawn in the P2 chrome style (SURFACE_2 fill, BORDER hairline top ed
 | Compose (unfocused) | editor body with draft (or hint "Type a command…"), dimmed border | `Run ▸` dimmed |
 | Raw(Busy) | spinner-dot + open block's `cmd` (middle-ellipsized 48) + live elapsed (`fmt_duration`, P2 §11.6) | — (gate fails; no compose button — never a dead-end lie) |
 | Raw(NoPrompt/UserRaw) with gate `ManualOnly`/latent | keyboard glyph + "Typing goes to the terminal" | `❯ Compose` ghost button (ACCENT text) — THE fallback affordance, always clickable when the gate core passes |
-| Raw(AltScreen) | "Keys go to the app" TEXT_FAINT — fades to bare TERM_BG once the alt screen has been held ≥ 400ms (`HIDE_AFTER`, Bug C); pointer over the band fades it back in. Render-only: geometry untouched. | — (right cluster fades with the lane; asleep/reconnecting/dead lanes never hide) |
+| Raw(AltScreen) | "Keys go to the app" TEXT_FAINT — once the alt screen has been held ≥ 400ms (`HIDE_AFTER`, C2) the strip COLLAPSES: the terminal reclaims the 36px (one debounced PTY resize; same `strip_hidden` predicate drives paint and `layout_for`). Pointer over the bottom band shows a translucent look-only peek OVERLAY over the grid. | — (right cluster rides the collapse; asleep/reconnecting/dead lanes never collapse) |
 | Raw(Dead) | "Session ended" TEXT_FAINT | — (header owns Restore) |
 
 - The strip itself (outside buttons) is click-to-activate when the gate core passes —
@@ -572,14 +574,26 @@ forth (that would be a resize storm on every tab switch — the exact ConPTY-wip
    the top part (via `ui.allocate_ui_at_rect`/child Ui), then `composer::show` in the strip
    rect. Hookless terminals: today's single call, byte-for-byte.
 
-The strip stays during alt-screen and Dead (inv. 5): vim in a hooked pwsh keeps the 36px band
-(showing "Keys go to the app") rather than triggering entry/exit resizes tied to app behavior.
-Bug C refinement: after the alt screen has been held continuously ≥ 400ms the band's label +
-right cluster fade to bare terminal background (every affordance is inert under alt); hovering
-the band reveals them, and ANY lane change (TUI exit, death, sleep, reconnect) restores the
-strip the same frame. The reservation itself is still constant — the hide is strictly
-render-side and never touches `layout_for` or the PTY size (pinned by
-`alt_screen_never_resizes_unchanged_layout`).
+The strip stays during Dead, busy, and UNSTABLE alt (inv. 5, amended by C2 below): a program
+that blips through alt never triggers entry/exit resizes tied to app behavior.
+
+C2 refinement (supersedes Bug C's render-only hide): after the alt screen has been held
+continuously ≥ 400ms (`HIDE_AFTER`) the strip **collapses** — the band stops painting AND the
+terminal reclaims the 36px: `layout_for` consults the SAME `strip_hidden` predicate the paint
+does (single source; paint and PTY size cannot disagree), so the grid grows by the reserved
+rows and the PTY resizes once through the ordinary debounced commit/heal machinery. The 400ms
+hysteresis is the flap debounce: re-collapse always needs a fresh 400ms of stable alt, so alt
+flapping (claude shelling out) can never storm resizes. ANY lane change (TUI exit, death,
+sleep, reconnect) un-collapses the same frame: the strip returns and the rows go back with one
+resize. Hover-peek while collapsed is a translucent OVERLAY floating over the grid's bottom
+band (label + cluster under a TERM_BG wash) — look-only: no geometry, no interaction (the
+band's pixels belong to the grid; clicks/wheel reach the app). Safety: the under-alt resize
+drops block chrome RECOVERABLY (`pre_resize_ordinals` clears anchors/prompt_end/covers but no
+longer stales the feed — the shell's next prompt re-primes block recording; pinned by
+`alt_hide_show_resize_reprimes_block_feed_after_exit`), and mode flips alone still never
+resize (`alt_screen_never_resizes_unchanged_layout`). Sleep while collapsed runs a
+freeze-geometry pre-pass (`prepare_sleep_geometry`): un-collapse + resize back BEFORE the
+sleep verb so the daemon's frozen frame matches the reserved-size asleep/wake presentation.
 
 ---
 

@@ -1594,8 +1594,14 @@ impl TermBackend {
         // will ever re-capture it; clearing it wiped the boot cover on the
         // corrective strip-resize, R1) and a free win for live prompts too. A
         // DIRTY prompt (cursor past the end / stale feed) is dropped as before
-        // — a wrong prompt-end is worse than a missing one.
-        let clean_prompt = self.cursor_at_prompt_end();
+        // — a wrong prompt-end is worse than a missing one. Never "clean"
+        // under ALT_SCREEN (C2): the visible cursor is the ALT grid's — a
+        // coincidental match with the primary prompt cell would re-derive
+        // prompt_end from alt coordinates and leak garbage past alt-exit.
+        // C2 resizes under alt on every strip collapse, so this is now a
+        // systematic path, not a drag-resize corner.
+        let clean_prompt = !self.term.mode().contains(TermMode::ALT_SCREEN)
+            && self.cursor_at_prompt_end();
         let pre = self.pre_resize_ordinals();
         let pre_covers = self.pre_resize_cover_ordinals();
         // Row GROWTH runs with alacritty's history-pull UNDONE
@@ -1652,7 +1658,8 @@ impl TermBackend {
             return None;
         }
         if self.term.mode().contains(TermMode::ALT_SCREEN) {
-            // pre_resize_ordinals already staled + cleared everything.
+            // pre_resize_ordinals already cleared everything (recoverable
+            // drop — the feed stays live for the post-TUI re-prime).
             return None;
         }
         let bottom = self.term.bottommost_line().0;
@@ -1746,21 +1753,32 @@ impl TermBackend {
     /// [row ..= bottommost_line]. Returns None when there is nothing to
     /// remap. Resizing while ALT_SCREEN makes the primary grid inaccessible
     /// (`inactive_grid` is private — known from the serializer work), so the
-    /// walk cannot run: anchors go stale instead of garbage.
+    /// walk cannot run: the primary-world chrome (anchors, prompt_end,
+    /// covers) is DROPPED instead of drifting — but the feed stays LIVE.
+    /// Those structures are inactive for the TUI's lifetime anyway, and the
+    /// shell's next prompt re-primes every one of them (pre → covers/latch,
+    /// 133;B → prompt_end, exec → anchors). `stale` — the permanent
+    /// degraded-for-this-attach verdict — is reserved for genuinely
+    /// unrecoverable states (ring saturation, r2-M1 history shrink); C2's
+    /// strip collapse resizes under alt on EVERY stable TUI run, and staling
+    /// there would kill block recording for the rest of the attach after a
+    /// single htop.
     fn pre_resize_ordinals(&mut self) -> Option<Vec<(u64, u32, Option<u32>)>> {
+        if self.term.mode().contains(TermMode::ALT_SCREEN) {
+            if let Some(bf) = self.block_feed.as_mut() {
+                bf.anchors.clear();
+                bf.prompt_end = None;
+                bf.pending_prompt_end = false;
+                bf.incoming_prompt = None;
+                bf.covers.clear();
+            }
+            return None;
+        }
         let live = self
             .block_feed
             .as_ref()
             .is_some_and(|f| f.enabled && !f.stale && !f.anchors.is_empty());
         if !live {
-            return None;
-        }
-        if self.term.mode().contains(TermMode::ALT_SCREEN) {
-            let bf = self.block_feed.as_mut().unwrap();
-            bf.stale = true;
-            bf.anchors.clear();
-            bf.prompt_end = None;
-            bf.covers.clear();
             return None;
         }
         let bottom = self.term.bottommost_line().0;
@@ -3541,12 +3559,12 @@ mod tests {
         );
     }
 
-    /// Bug C geometry pin (R3 — the hide is RENDER-ONLY): alt-screen
-    /// entry/exit is not an input to any geometry function. With the hooked
-    /// layout unchanged, `resize_to` returns None across a real DECSET 1049
-    /// round-trip — no PTY resize may ever ride the strip hide/show (a
-    /// resize under alt marks the block feed stale and wipes anchors,
-    /// prompt_end and covers: see `pre_resize_ordinals`).
+    /// C2 geometry pin: alt-screen FLIPS alone never resize — a resize needs
+    /// an actual layout change. With the hooked layout unchanged, `resize_to`
+    /// returns None across a real DECSET 1049 round-trip. (C2's row
+    /// reclamation changes the LAYOUT via `layout_for` when the strip
+    /// collapses; this test pins that the mode flip itself contributes
+    /// nothing — geometry moves only when the layout input moves.)
     #[test]
     fn alt_screen_never_resizes_unchanged_layout() {
         let mut b = bhist(40, 8, 100);
@@ -3567,6 +3585,62 @@ mod tests {
             "alt exit must not produce a PTY resize"
         );
         assert_eq!((b.size.cols, b.size.rows), (40, 8), "grid untouched");
+    }
+
+    /// C2 alt-exit re-prime regression (the htop cycle): enter alt → the
+    /// strip collapses and the grid GROWS (+rows, resize during alt) → exit
+    /// alt → the strip returns and the grid shrinks back → the shell's next
+    /// prompt re-primes the feed and the next command's block records
+    /// correctly. The alt resize drops anchors/prompt_end/covers (the primary
+    /// grid is unreachable — drop-don't-drift) but must NOT stale the feed:
+    /// stale is permanent for the attach, and staling here would end block
+    /// recording after every single TUI run.
+    #[test]
+    fn alt_hide_show_resize_reprimes_block_feed_after_exit() {
+        let cell = egui::Vec2::new(8.0, 16.0);
+        let mut b = bhist(80, 10, 200);
+        // A real block before the TUI: prompt → command → exec anchor.
+        b.advance_live(&prompt_frame(1));
+        b.advance_live(b"htop");
+        b.advance_live(&exec_hook("htop"));
+        assert_eq!(b.block_feed.as_ref().unwrap().anchors.len(), 1);
+        // TUI enters alt; after HIDE_AFTER the strip collapses and the heal
+        // resizes the grid to the FULL card (+2 rows at this cell height).
+        b.advance_live(b"\x1b[?1049h\x1b[2J\x1b[Hmeter frame");
+        assert!(b.mode().contains(TermMode::ALT_SCREEN));
+        assert_eq!(
+            b.resize_to(egui::Vec2::new(80.0 * 8.0, 12.0 * 16.0), cell),
+            Some((80, 12)),
+            "collapse: the grid gains the reclaimed rows"
+        );
+        {
+            let f = b.block_feed.as_ref().unwrap();
+            assert!(!f.stale, "the alt hide-resize must stay RECOVERABLE");
+            assert!(f.anchors.is_empty(), "anchors dropped, never drifted");
+            assert!(f.prompt_end.is_none() && f.covers.is_empty());
+        }
+        // TUI exits; strip returns; the heal resizes back the same frame.
+        b.advance_live(b"\x1b[?1049l");
+        assert_eq!(
+            b.resize_to(egui::Vec2::new(80.0 * 8.0, 10.0 * 16.0), cell),
+            Some((80, 10)),
+            "strip return: rows go back"
+        );
+        assert!(!b.block_feed.as_ref().unwrap().stale);
+        // The shell prints its next prompt: pre + 133;B re-prime the feed…
+        b.advance_live(b"\r\n");
+        b.advance_live(&prompt_frame(2));
+        assert!(b.feed_live(), "feed live after the full cycle");
+        assert!(b.has_prompt_end(), "133;B re-captured prompt_end");
+        assert!(b.cursor_at_prompt_end(), "clean prompt after the cycle");
+        // …and the NEXT command anchors a block again (records correctly).
+        b.advance_live(b"ls");
+        b.advance_live(&exec_hook("ls"));
+        assert_eq!(
+            b.block_feed.as_ref().unwrap().anchors.len(),
+            1,
+            "post-TUI command must anchor a fresh block"
+        );
     }
 
     /// Restored-render fix: a Replay is a full grid reconstruction — any

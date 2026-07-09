@@ -965,7 +965,14 @@ impl App {
                             // Gate GUI-side (S8): idle sleeps are instant;
                             // busy evidence gets the confirm modal naming it.
                             match self.sleep_gate_evidence(t.id) {
-                                None => self.send(C2D::SleepTerminal { id: t.id }),
+                                None => {
+                                    // C2: un-collapse + resize back BEFORE
+                                    // the sleep so the freeze-frame captures
+                                    // the reserved-size grid (wake geometry
+                                    // consistency).
+                                    self.prepare_sleep_geometry(t.id);
+                                    self.send(C2D::SleepTerminal { id: t.id });
+                                }
                                 Some(_) => self.modal = Some(Modal::ConfirmSleep(t.id)),
                             }
                             ui.close();

@@ -1364,6 +1364,15 @@ pub struct App {
     /// pipeline cost, spin+full = fixed + App paint. Never set in normal use.
     diag_spin: bool,
     diag_empty_ui: bool,
+    /// DIAGNOSTIC (C2 staging): TC_DIAG_ASSUME_FOCUS=1 treats the window as
+    /// focused for the PTY-resize gate. Display-detached RDP rigs never
+    /// deliver WM_SETFOCUS to the winit window, so `RawInput::focused` stays
+    /// false and NO resize (boot commit, corrective heal, strip collapse)
+    /// can ever flow — this knob lets scripted staging exercise the real
+    /// resize pipeline there. Single-window rigs only (the focused-only rule
+    /// exists so two windows can't fight over PTY grids). Never set in
+    /// normal use.
+    diag_assume_focus: bool,
     /// Startup/attach lifecycle stage tracker (perf-wave-3), enabled with
     /// TC_PERF_STAGES=1 — the daemon's stage-timer knob. Log-only; None when
     /// off. gui.log gets `[perf] gui …` lines for cold start (window+wgpu →
@@ -1635,6 +1644,8 @@ impl App {
             frame_t0: None,
             diag_spin: std::env::var("TC_DIAG_SPIN").ok().as_deref() == Some("1"),
             diag_empty_ui: std::env::var("TC_DIAG_EMPTY_UI").ok().as_deref() == Some("1"),
+            diag_assume_focus: std::env::var("TC_DIAG_ASSUME_FOCUS").ok().as_deref()
+                == Some("1"),
             perf3,
             font_perf: None,
             font_step_t0: None,
@@ -3517,15 +3528,89 @@ impl App {
     }
 
     /// Per-terminal grid geometry (P3 §7): hooked terminals reserve a
-    /// CONSTANT strip at the card's bottom edge; hookless terminals keep the
-    /// full card. Each terminal owns a stable geometry — tab switches change
+    /// strip at the card's bottom edge; hookless terminals keep the full
+    /// card. Each terminal owns a stable geometry — tab switches change
     /// nothing (a shared layout would flip grid sizes between hooked and
     /// hookless tabs: the resize-storm incident class).
+    ///
+    /// C2 exception — the ONE sanctioned dynamic edge: while the strip is
+    /// collapsed under a stable full-screen app (`strip_collapsed`, the same
+    /// `strip_hidden` predicate that gates the strip paint — single source,
+    /// paint and PTY size can never disagree) the terminal gets the FULL
+    /// card: the reclaimed rows reach the TUI through the ordinary debounced
+    /// resize paths (commit loop / corrective heal), one +rows resize at
+    /// collapse and one −rows at the instant return. The HIDE_AFTER
+    /// hysteresis inside the predicate is the flap debounce.
     fn layout_for(&self, id: Uuid, base: Vec2) -> Vec2 {
-        if self.hooked(id) {
+        if self.hooked(id) && !self.strip_collapsed(id) {
             Vec2::new(base.x, (base.y - composer::STRIP_H).max(0.0))
         } else {
             base
+        }
+    }
+
+    /// C2: is this terminal's strip collapsed (rows reclaimed by the grid)
+    /// right now? Thin app-side binding of `composer::strip_hidden` — it
+    /// derives every input live (backend ALT_SCREEN flag, Running status,
+    /// open recs, the composer's hysteresis clock) so EVERY caller —
+    /// layout_for (and through it all resize sites), central's card split,
+    /// the sleep pre-pass — asks the identical question. Terminals without
+    /// a composer/backend yet (cold attach, hookless) are never collapsed.
+    fn strip_collapsed(&self, id: Uuid) -> bool {
+        let Some(st) = self.composers.get(&id) else {
+            return false;
+        };
+        let Some(b) = self.terms.get(&id) else {
+            return false;
+        };
+        let running =
+            self.state.terminal(id).map(|t| t.status) == Some(TermStatus::Running);
+        let alt = b.mode().contains(TermMode::ALT_SCREEN);
+        let open_rec = self
+            .blocks
+            .get(&id)
+            .is_some_and(|bl| bl.recs.iter().any(|r| r.end_off.is_none()));
+        composer::strip_hidden(st, running, alt, open_rec, Instant::now())
+    }
+
+    /// C2 sleep pre-pass: the daemon's freeze-frame capture and the asleep
+    /// presentation must share ONE geometry. Sleeping while collapsed would
+    /// freeze a FULL-size frame that wake then presents in a reserved-size
+    /// grid (the asleep lane holds the strip visible by precedence). So:
+    /// restart the hide clock (the strip un-collapses this instant and
+    /// cannot re-collapse for HIDE_AFTER — ample cover for the sleep
+    /// round-trip) and resize back BEFORE the sleep verb ships; the daemon
+    /// processes messages in order, so the mirror + PTY are reserved-size
+    /// when the kill captures the frame. No-op unless actually collapsed.
+    fn prepare_sleep_geometry(&mut self, id: Uuid) {
+        if !self.strip_collapsed(id) {
+            return;
+        }
+        if let Some(st) = self.composers.get_mut(&id) {
+            st.restart_hide_clock();
+        }
+        if let Some((base, cell)) = self.last_grid {
+            let l = self.layout_for(id, base);
+            if let Some(b) = self.terms.get_mut(&id) {
+                if let Some((cols, rows)) = b.resize_to(l, cell) {
+                    self.send(C2D::Resize { id, cols, rows });
+                }
+            }
+        }
+    }
+
+    /// C2: the folder-sleep pre-pass — every member gets the same
+    /// freeze-geometry treatment before the shared SleepFolder verb.
+    fn prepare_sleep_geometry_folder(&mut self, folder: Uuid) {
+        let ids: Vec<Uuid> = self
+            .state
+            .terminals
+            .iter()
+            .filter(|t| t.folder == Some(folder))
+            .map(|t| t.id)
+            .collect();
+        for id in ids {
+            self.prepare_sleep_geometry(id);
         }
     }
 

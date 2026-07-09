@@ -62,15 +62,21 @@ const INCOMING_COVER_CAP: Duration = Duration::from_millis(500);
 /// or the raw label — instant commands (`ls` round-trips in 30-120ms) never
 /// flash the strip through busy/label states. Just under reaction time.
 const REVEAL: Duration = Duration::from_millis(180);
-/// Bug C (hide the bar under full-screen apps): once the alt screen has
-/// been held continuously this long, the strip's label + right cluster fade
-/// to bare TERM_BG — every affordance is already inert under alt, so the
-/// band is genuinely dead chrome there. RENDER-ONLY by contract: the 36px
-/// reservation, `layout_for` and the PTY grid never change (a hide-driven
-/// resize would SIGWINCH the TUI and wipe alt-screen block anchors —
-/// term_backend's pre_resize stale path). Delayed so programs that blip
-/// through alt at startup (or `less` on a short file) never flash the strip
-/// away; the return on any lane change is instant, same frame.
+/// Bug C/C2 (full-screen apps get the whole card): once the alt screen has
+/// been held continuously this long, the strip COLLAPSES — the label +
+/// right cluster stop painting AND the 36px reservation is handed to the
+/// grid (`layout_for` consults the same `strip_hidden` predicate, so the
+/// terminal gains the rows and the PTY resizes once). Every affordance is
+/// already inert under alt, so the band is genuinely dead chrome there.
+/// This delay is ALSO the resize debounce: alt flapping (claude shelling
+/// out, startup blips, `less` on a short file) can never storm PTY resizes
+/// — re-collapse needs a fresh 400ms of stable alt, so a flap cycle costs
+/// at most two resizes per ~800ms, all routed through the ordinary
+/// resize_to/no-op machinery. The return on any lane change is instant,
+/// same frame (the strip must be back the moment a prompt exists). The
+/// under-alt resize is safe since the C2 term_backend change: the alt
+/// pre_resize path drops chrome recoverably (never stales the feed) and the
+/// shell's next prompt re-primes block recording.
 const HIDE_AFTER: Duration = Duration::from_millis(400);
 
 /// How long an active Compose may sit with its cover certainty broken
@@ -709,10 +715,12 @@ pub struct ComposerState {
     /// its own cursor (two competing input surfaces) sitting like that
     /// forever on an idle restored session. None while healthy.
     compose_broken_since: Option<Instant>,
-    /// Bug C: rising-edge timestamp of the backend's ALT_SCREEN flag
-    /// (stamped/cleared by `tick` on the edges) — the strip-hide hysteresis
-    /// clock read by `strip_hidden`. Render-side only: no geometry code may
-    /// ever consult this.
+    /// Bug C/C2: rising-edge timestamp of the backend's ALT_SCREEN flag
+    /// (stamped/cleared by `tick` on the edges) — the strip-collapse
+    /// hysteresis clock read by `strip_hidden`, which is now the SINGLE
+    /// SOURCE for both the strip paint and the grid geometry (`layout_for`):
+    /// paint and PTY size can never disagree because they ask the same
+    /// question. The 400ms wait doubles as the resize debounce (HIDE_AFTER).
     alt_since: Option<Instant>,
 }
 
@@ -1423,6 +1431,17 @@ impl ComposerState {
         }
     }
 
+    /// C2 sleep pre-pass: force the strip visible NOW by restarting the
+    /// hide clock. `strip_hidden` goes false immediately (geometry follows —
+    /// the caller resizes back before the daemon's freeze-frame capture),
+    /// and because `tick` re-stamps the rising edge on its next run, the
+    /// strip cannot re-collapse for a full HIDE_AFTER — ample cover for the
+    /// sleep round-trip (Snapshot flips the lane to Asleep, which holds the
+    /// strip visible from then on).
+    pub fn restart_hide_clock(&mut self) {
+        self.alt_since = None;
+    }
+
     /// Per-frame signal pump for the SELECTED terminal (cheap: a gate eval).
     /// Applies the §2.4 transitions. `grid_focused` gates the auto-arm focus
     /// steal (§13.1: don't take focus the user didn't have on the grid).
@@ -1979,26 +1998,30 @@ pub(crate) fn lane_content(
     LaneContent::Label
 }
 
-/// Bug C — the strip-hide predicate (pure, table-tested like
-/// `lane_content`): the strip fades to bare background iff the lane
-/// presents the alt-screen state (lane_content's precedence already keeps
-/// Asleep `Wake ▸`, Reconnecting `Cancel`, SessionEnded `Restore ▸` and
-/// every non-alt lane visible), the alt screen has been held continuously
-/// for ≥ HIDE_AFTER, and the pointer is not over the band (hover is the
-/// reveal — the explainer stays discoverable; key-based reveal is rejected
-/// because keys belong to the app under alt by definition). The alt falling
-/// edge un-hides the SAME tick regardless of the clock: the lane is no
-/// longer AltScreen. Render-only: geometry never consults this.
+/// Bug C/C2 — the strip-collapse predicate (pure, table-tested like
+/// `lane_content`), and the SINGLE SOURCE for both paint and geometry: the
+/// strip collapses — stops painting AND hands its 36px reservation to the
+/// grid (`layout_for` + central's card split both call exactly this fn, so
+/// paint and PTY size can never disagree) — iff the lane presents the
+/// alt-screen state (lane_content's precedence already keeps Asleep
+/// `Wake ▸`, Reconnecting `Cancel`, SessionEnded `Restore ▸` and every
+/// non-alt lane visible) and the alt screen has been held continuously for
+/// ≥ HIDE_AFTER (the hysteresis doubles as the resize debounce — alt
+/// flapping can't storm PTY resizes). Hover is deliberately NOT an input:
+/// the hover-peek is a translucent OVERLAY painted over the grid's bottom
+/// band (peek = look, not reflow — a hover must never resize the TUI).
+/// Key-based reveal stays rejected: keys belong to the app under alt by
+/// definition. The alt falling edge un-collapses the SAME tick regardless
+/// of the clock: the lane is no longer AltScreen, the strip returns and the
+/// grid gives the rows back.
 pub(crate) fn strip_hidden(
     state: &ComposerState,
     running: bool,
     alt: bool,
     open_rec: bool,
-    hovered: bool,
     now: Instant,
 ) -> bool {
-    !hovered
-        && lane_content(state, running, alt, open_rec, now) == LaneContent::AltScreen
+    lane_content(state, running, alt, open_rec, now) == LaneContent::AltScreen
         && state
             .alt_since
             .is_some_and(|t| now.duration_since(t) >= HIDE_AFTER)
@@ -2031,6 +2054,11 @@ pub struct ComposerOutput {
     /// C2D::CancelReconnect (supervision stops; Dead + Restore affordances
     /// take over).
     pub cancel_reconnect: bool,
+    /// C2: the collapsed strip's hover-peek overlay is showing this frame
+    /// (render-only — an alpha-faded translucent band floating over the
+    /// grid's bottom rows; no geometry, no interaction). Surfaced so tests
+    /// pin peek-never-reflows.
+    pub strip_peek: bool,
 }
 
 /// What the manual-activation click will do to typed prompt text — computed
@@ -2204,6 +2232,12 @@ pub fn show(
     recs: &[BlockRec],
     epoch: u32,
     running: bool,
+    // C2: the caller's verdict from the SAME `strip_hidden` predicate that
+    // sized the grid this frame (central's card split + layout_for) — when
+    // true the band belongs to the grid and this fn paints at most the
+    // hover-peek overlay. Passed in rather than recomputed so paint and
+    // geometry share one evaluation per frame.
+    collapsed: bool,
     overlay_open: bool,
     font: FontId,
     cover_line: Option<i32>,
@@ -2218,6 +2252,7 @@ pub fn show(
         wake: false,
         restore: false,
         cancel_reconnect: false,
+        strip_peek: false,
     };
     let now = Instant::now();
     let inputs = state.gate_inputs(backend, recs, running, now);
@@ -2239,15 +2274,18 @@ pub fn show(
         && matches!(state.mode, ComposerMode::Raw(_));
     let painter = ui.painter().clone();
 
-    // ── Bug C: render-only hide under stable full-screen apps. After the
-    // alt screen has been held ≥ HIDE_AFTER, the lane label + right cluster
-    // fade to bare TERM_BG (every affordance is already inert under alt);
-    // hovering the band fades them back in as the explainer. The 36px
-    // reservation, strip_rect and the PTY grid are byte-for-byte untouched —
-    // hide/show moves ZERO geometry (no SIGWINCH, no alt-anchor wipe). Lane
-    // changes un-hide by construction: the predicate IS the lane, and
-    // asleep/reconnecting/dead win over alt in lane_content, so `Wake ▸`,
-    // `Cancel` and `Restore ▸` always paint at full strength.
+    // ── Bug C/C2: under a STABLE full-screen app the strip is COLLAPSED —
+    // the caller handed the band to the grid (`collapsed` came from the same
+    // `strip_hidden` predicate that sized the grid and the PTY this frame,
+    // so paint can never disagree with geometry) and this fn paints at most
+    // the hover-PEEK: a translucent overlay floating over the grid's bottom
+    // rows with the normal lane label + cluster, faded in/out (~120ms).
+    // Peek is look-only — no geometry (a hover must never SIGWINCH the TUI)
+    // and no interaction (the band's pixels belong to the grid: clicks and
+    // wheel go to the app). Lane changes un-collapse by construction: the
+    // predicate IS the lane, and asleep/reconnecting/dead win over alt in
+    // lane_content, so `Wake ▸`, `Cancel` and `Restore ▸` always paint at
+    // full strength on a real reserved band.
     let open_rec_any = recs.iter().any(|r| r.end_off.is_none());
     let strip_hover = ui
         .ctx()
@@ -2255,23 +2293,40 @@ pub fn show(
         .is_some_and(|p| strip_rect.contains(p));
     let lane_is_alt =
         lane_content(state, running, inputs.alt, open_rec_any, now) == LaneContent::AltScreen;
-    let hidden = strip_hidden(state, running, inputs.alt, open_rec_any, strip_hover, now);
-    // A fade (~120ms), never a pop. `reveal` multiplies the alt lane and
-    // cluster colors ONLY — non-alt lanes paint at full alpha the same frame
-    // they appear (the instant-return contract on TUI exit/death/sleep).
-    let reveal = ui
-        .ctx()
-        .animate_bool_with_time(Id::new(("strip_hide", terminal_id)), !hidden, 0.12);
-    // Repaint discipline: the hide edge must land without input — schedule
-    // the wakeup while the alt lane is visible and un-hovered (the Quiet
-    // reveal pattern). Un-hover re-hides on the pointer-motion repaint.
-    if lane_is_alt && !hidden {
+    let peek = collapsed && strip_hover;
+    out.strip_peek = peek;
+    // Band-content alpha: full while the strip is real; the peek animation
+    // while collapsed (never a pop). At 0 nothing paints. Non-alt lanes are
+    // never collapsed, so they appear at full alpha the same frame (the
+    // instant-return contract on TUI exit/death/sleep).
+    let reveal = ui.ctx().animate_bool_with_time(
+        Id::new(("strip_hide", terminal_id)),
+        !collapsed || peek,
+        0.12,
+    );
+    // Repaint discipline: the collapse edge must land without input —
+    // schedule the wakeup for the HIDE_AFTER deadline while the alt lane is
+    // still visible (that frame the predicate flips, the corrective heal
+    // resizes, and the band hands over to the grid). The peek edges ride
+    // the pointer-motion repaints.
+    if lane_is_alt && !collapsed {
         if let Some(t0) = state.alt_since {
             let d = (t0 + HIDE_AFTER).saturating_duration_since(now);
             if !d.is_zero() {
                 ui.ctx().request_repaint_after(d);
             }
         }
+    }
+    // Peek backdrop: the overlay floats OVER live grid rows — a bare label
+    // would be illegible on top of htop's meters; wash the band with
+    // translucent TERM_BG first (hover-only chrome, translucent per
+    // doctrine; alpha rides the fade).
+    if collapsed && reveal > 0.0 {
+        painter.rect_filled(
+            strip_rect,
+            CornerRadius::ZERO,
+            super::TERM_BG.gamma_multiply(0.88 * reveal),
+        );
     }
 
     // ── Static-input architecture: the editor ALWAYS lives here in the
@@ -2294,9 +2349,10 @@ pub fn show(
         Pos2::new(run_rect.min.x - 16.0, strip_rect.center().y),
         Vec2::splat(22.0),
     );
-    // Bug C: no invisible click-outside exemption rect while hidden (the
-    // popup can't open under alt anyway — the toggle is `!inputs.alt`).
-    out.history_btn = (!hidden).then_some(hist_rect);
+    // Bug C: no click-outside exemption rect while collapsed (the popup
+    // can't open under alt anyway — the toggle is `!inputs.alt`; during a
+    // peek the icon is a painted ghost, not a control).
+    out.history_btn = (!collapsed).then_some(hist_rect);
     // The right-aligned text slot left of History: the Compose hints and the
     // Raw ❯ Compose affordance share it (one slot, never two occupants).
     let slot_right = hist_rect.min.x - 8.0;
@@ -2350,10 +2406,16 @@ pub fn show(
         && recs.last().is_some_and(|r| r.epoch == epoch);
     let arm_available = core_passes && !pre_shell_now && (inputs.at_prompt || cold_ok);
 
+    // C2: while collapsed the band's pixels belong to the GRID — registering
+    // a widget over them would steal hover from the terminal response and
+    // clicks/wheel from the app (term_view gates its input pump on
+    // `response.hovered()`). Peek detection uses `pointer_latest_pos` alone;
+    // the interact keeps its stable Id on an empty rect so egui state never
+    // churns across collapse edges.
     let strip_resp = ui.interact(
-        strip_rect,
+        if collapsed { Rect::NOTHING } else { strip_rect },
         Id::new(("composer_strip", terminal_id)),
-        Sense::click(),
+        if collapsed { Sense::hover() } else { Sense::click() },
     );
     let hover_pos = ui.ctx().pointer_latest_pos();
     let over_kbd = hover_pos.is_some_and(|p| kbd_rect.contains(p));
@@ -2884,9 +2946,9 @@ pub fn show(
                     );
                 }
                 LaneContent::AltScreen => {
-                    // Bug C: fades with the hide predicate — at reveal 0 the
-                    // band is bare TERM_BG (no fill, no hairline: seamless
-                    // doctrine already leaves nothing else painted here).
+                    // Bug C/C2: pre-collapse this paints at full alpha; once
+                    // collapsed it appears only inside the hover-peek
+                    // overlay (reveal rides the peek fade, over the wash).
                     if reveal > 0.0 {
                         painter.text(
                             Pos2::new(lane_x, strip_rect.center().y),
@@ -3151,11 +3213,10 @@ pub fn show(
             // Interactions: History toggles the popup in every Raw state
             // (inert only under alt-screen); the REST of the strip is the
             // activation target (mouse-first) when arming is possible.
-            // Bug C: while hidden, a click in the band does nothing but
-            // reveal (which the hover already did — a pointer over the band
-            // clears `hidden`, so this guard is a belt for synthetic clicks
-            // that arrive without a hover frame).
-            if strip_resp.clicked() && !hidden {
+            // C2: while collapsed the interact sits on an empty rect so
+            // `clicked()` can never fire — the `!collapsed` guard is a belt
+            // for synthetic Responses; band clicks belong to the grid.
+            if strip_resp.clicked() && !collapsed {
                 if let Some(p) = strip_resp.interact_pointer_pos() {
                     if hist_rect.contains(p) {
                         if !inputs.alt {
@@ -3464,11 +3525,14 @@ mod tests {
         );
     }
 
-    /// Bug C — `strip_hidden` truth table: the strip hides ONLY for the
-    /// stable alt lane (≥ HIDE_AFTER, un-hovered); every precedence lane
-    /// (asleep `Wake ▸`, dead `Restore ▸`, reconnecting `Cancel`), the
-    /// pre-hysteresis window, hover, a missing latch, Compose, and the alt
-    /// falling edge (same tick, before any clock maintenance) stay visible.
+    /// C2 — `strip_hidden` truth table (hidden ⇔ the terminal owns the
+    /// reclaimed rows — this one predicate drives paint AND geometry): the
+    /// strip collapses ONLY for the stable alt lane (≥ HIDE_AFTER); every
+    /// precedence lane (asleep `Wake ▸`, dead `Restore ▸`, reconnecting
+    /// `Cancel`), the pre-hysteresis window, a missing latch, Compose, and
+    /// the alt falling edge (same tick, before any clock maintenance) keep
+    /// the reserved band. Hover is NOT an input — the peek overlays, it
+    /// never resizes.
     #[test]
     fn strip_hidden_truth_table() {
         let t0 = Instant::now();
@@ -3478,47 +3542,88 @@ mod tests {
             alt_since: Some(t0),
             ..Default::default()
         };
-        // Stable alt, un-hovered ⇒ hidden.
-        assert!(strip_hidden(&st, true, true, false, false, now));
-        // Younger than HIDE_AFTER ⇒ visible (startup alt blips never flash).
+        // Stable alt ⇒ collapsed: the grid gains the rows.
+        assert!(strip_hidden(&st, true, true, false, now));
+        // Younger than HIDE_AFTER ⇒ reserved (startup alt blips never
+        // resize — the hysteresis IS the flap debounce).
         assert!(!strip_hidden(
             &st,
             true,
             true,
             false,
-            false,
             now - Duration::from_millis(50)
         ));
-        // No latch stamped yet (tick hasn't run) ⇒ visible.
+        // No latch stamped yet (tick hasn't run) ⇒ reserved.
         st.alt_since = None;
-        assert!(!strip_hidden(&st, true, true, false, false, now));
+        assert!(!strip_hidden(&st, true, true, false, now));
         st.alt_since = Some(t0);
-        // Hover reveals.
-        assert!(!strip_hidden(&st, true, true, false, true, now));
-        // Alt falling edge: visible the SAME tick, even with the clock still
-        // stamped — the lane is no longer AltScreen (instant TUI-exit return).
-        assert!(!strip_hidden(&st, true, false, false, false, now));
-        // Sleep during alt (freeze-frame): asleep wins the lane ⇒ visible.
+        // Alt falling edge: reserved the SAME tick, even with the clock
+        // still stamped — the lane is no longer AltScreen (the strip and
+        // the rows are back the instant the TUI exits).
+        assert!(!strip_hidden(&st, true, false, false, now));
+        // Sleep during alt (freeze-frame): asleep wins the lane ⇒ reserved
+        // (the resize-back happens with the freeze, never after wake).
         st.asleep = true;
         st.mode = ComposerMode::Raw(RawReason::Asleep);
-        assert!(!strip_hidden(&st, true, true, false, false, now));
+        assert!(!strip_hidden(&st, true, true, false, now));
         // The one-frame Snapshot-before-tick belt (flag set, mode stale).
         st.mode = ComposerMode::Raw(RawReason::AltScreen);
-        assert!(!strip_hidden(&st, false, true, false, false, now));
+        assert!(!strip_hidden(&st, false, true, false, now));
         st.asleep = false;
-        // Death under alt (ssh drop during htop) ⇒ SessionEnded visible.
+        // Death under alt (ssh drop during htop) ⇒ SessionEnded reserved.
         st.mode = ComposerMode::Raw(RawReason::Dead);
-        assert!(!strip_hidden(&st, false, true, false, false, now));
-        // Reconnecting wins over the dead transients ⇒ `Cancel` visible.
+        assert!(!strip_hidden(&st, false, true, false, now));
+        // Reconnecting wins over the dead transients ⇒ `Cancel` reserved.
         st.reconnecting = true;
-        assert!(!strip_hidden(&st, false, true, false, false, now));
+        assert!(!strip_hidden(&st, false, true, false, now));
         st.reconnecting = false;
-        // Pre-shell ssh auth is non-alt by definition ⇒ never hidden.
+        // Pre-shell ssh auth is non-alt by definition ⇒ never collapsed.
         st.mode = ComposerMode::Raw(RawReason::NoPrompt);
-        assert!(!strip_hidden(&st, true, false, false, false, now));
-        // Compose never hides (stale clock or not).
+        assert!(!strip_hidden(&st, true, false, false, now));
+        // Compose never collapses (stale clock or not).
         st.mode = ComposerMode::Compose;
-        assert!(!strip_hidden(&st, true, false, false, false, now));
+        assert!(!strip_hidden(&st, true, false, false, now));
+        // The sleep pre-pass: restart_hide_clock un-collapses immediately
+        // (the freeze-frame resize-back rides this).
+        st.mode = ComposerMode::Raw(RawReason::AltScreen);
+        st.alt_since = Some(t0);
+        assert!(strip_hidden(&st, true, true, false, now));
+        st.restart_hide_clock();
+        assert!(!strip_hidden(&st, true, true, false, now));
+    }
+
+    /// C2 — flap debounce: an app toggling DECSET 1049 faster than
+    /// HIDE_AFTER (claude shelling out, a TUI restarting) never collapses
+    /// the strip, so alt flapping can produce ZERO strip-driven PTY resizes.
+    #[test]
+    fn alt_flap_never_collapses() {
+        let mut b = TermBackend::new(GridSize::default());
+        b.set_stream_pos(0);
+        let recs: Vec<BlockRec> = Vec::new();
+        let mut st = ComposerState::default();
+        let mut t = Instant::now();
+        for _ in 0..5 {
+            // Alt on, held ALMOST to the deadline.
+            b.advance_live(b"\x1b[?1049h\x1b[2J\x1b[Hflap");
+            st.tick(&b, &recs, true, false, t);
+            t += HIDE_AFTER - Duration::from_millis(20);
+            st.tick(&b, &recs, true, false, t);
+            assert!(
+                !strip_hidden(&st, true, true, false, t),
+                "sub-HIDE_AFTER alt hold must never collapse"
+            );
+            // Alt off: reserved instantly, clock cleared.
+            b.advance_live(b"\x1b[?1049l");
+            t += Duration::from_millis(10);
+            st.tick(&b, &recs, true, false, t);
+            assert!(!strip_hidden(&st, true, false, false, t));
+            assert_eq!(st.alt_since, None);
+            t += Duration::from_millis(10);
+        }
+        // A genuinely stable hold still collapses (the latch isn't wedged).
+        b.advance_live(b"\x1b[?1049h");
+        st.tick(&b, &recs, true, false, t);
+        assert!(strip_hidden(&st, true, true, false, t + HIDE_AFTER));
     }
 
     /// Bug C — `tick` maintains the hysteresis clock from real DECSET 1049
@@ -3538,7 +3643,7 @@ mod tests {
         assert_eq!(st.mode, ComposerMode::Raw(RawReason::AltScreen));
         assert_eq!(st.alt_since, Some(t0), "rising edge stamps the clock");
         assert!(
-            !strip_hidden(&st, true, true, false, false, t0),
+            !strip_hidden(&st, true, true, false, t0),
             "not hidden before the hysteresis elapses"
         );
         // Stable alt: the stamp never slides.
@@ -3546,7 +3651,7 @@ mod tests {
         st.tick(&b, &recs, true, false, t1);
         assert_eq!(st.alt_since, Some(t0));
         assert!(
-            strip_hidden(&st, true, true, false, false, t1),
+            strip_hidden(&st, true, true, false, t1),
             "hidden once alt has been stable for HIDE_AFTER"
         );
         // Sleep mid-htop (freeze-frame path): the lane flips to Asleep —
@@ -3554,33 +3659,34 @@ mod tests {
         st.asleep = true;
         st.tick(&b, &recs, true, false, t1);
         assert_eq!(st.mode, ComposerMode::Raw(RawReason::Asleep));
-        assert!(!strip_hidden(&st, true, true, false, false, t1));
+        assert!(!strip_hidden(&st, true, true, false, t1));
         st.asleep = false;
         // Falling edge clears; the strip is back the same tick.
         b.advance_live(b"\x1b[?1049l");
         let t2 = t1 + Duration::from_millis(10);
         st.tick(&b, &recs, true, false, t2);
         assert_eq!(st.alt_since, None, "falling edge clears the clock");
-        assert!(!strip_hidden(&st, true, false, false, false, t2));
+        assert!(!strip_hidden(&st, true, false, false, t2));
         // Re-entry restarts the full HIDE_AFTER wait.
         b.advance_live(b"\x1b[?1049h");
         let t3 = t2 + Duration::from_millis(10);
         st.tick(&b, &recs, true, false, t3);
         assert_eq!(st.alt_since, Some(t3), "re-entry restarts the hysteresis");
-        assert!(!strip_hidden(&st, true, true, false, false, t3));
-        assert!(strip_hidden(&st, true, true, false, false, t3 + HIDE_AFTER));
+        assert!(!strip_hidden(&st, true, true, false, t3));
+        assert!(strip_hidden(&st, true, true, false, t3 + HIDE_AFTER));
     }
 
-    /// Bug C — REAL egui hover round-trip (headless `Context::run` driving
-    /// `show` with genuine PointerMoved events): under stable alt the strip
-    /// hides (no history exemption rect — R6), a pointer over the band
-    /// reveals it the same frame (hover is the explainer, R4), parking the
-    /// pointer back in the grid re-hides, and alt-exit restores the strip
-    /// with the pointer nowhere near the band. This exercises the exact
-    /// production path: RawInput → pointer_latest_pos → strip_hidden →
-    /// paint/interaction gating.
+    /// C2 — REAL egui hover round-trip (headless `Context::run` driving
+    /// `show` with genuine PointerMoved events) pinning PEEK-IS-LOOK-ONLY:
+    /// while collapsed the band exposes NO interaction surface (no history
+    /// exemption rect, `clicked()` can never fire — the pixels belong to
+    /// the grid); a pointer over the band raises the OVERLAY (`strip_peek`)
+    /// the same frame without creating controls; un-hover drops it; and the
+    /// un-collapsed frame after alt-exit restores the full strip with the
+    /// pointer nowhere near the band. Exercises the exact production path:
+    /// RawInput → pointer_latest_pos → peek/paint gating.
     #[test]
-    fn show_hides_and_hover_reveals_under_alt() {
+    fn show_peeks_without_interaction_while_collapsed() {
         let mut b = TermBackend::new(GridSize::default());
         b.set_stream_pos(0);
         b.advance_live(b"\x1b[?1049h\x1b[2J\x1b[Htui frame");
@@ -3595,8 +3701,11 @@ mod tests {
 
         let ctx = egui::Context::default();
         let strip = Rect::from_min_max(Pos2::new(0.0, 564.0), Pos2::new(800.0, 600.0));
-        let grid = Rect::from_min_max(Pos2::ZERO, Pos2::new(800.0, 564.0));
-        let frame = |st: &mut ComposerState, b: &TermBackend, pointer: Pos2| {
+        let grid = Rect::from_min_max(Pos2::ZERO, Pos2::new(800.0, 600.0));
+        let frame = |st: &mut ComposerState,
+                     b: &TermBackend,
+                     collapsed: bool,
+                     pointer: Pos2| {
             let mut raw = egui::RawInput {
                 screen_rect: Some(Rect::from_min_max(
                     Pos2::ZERO,
@@ -3618,6 +3727,7 @@ mod tests {
                         &recs,
                         1,
                         true,
+                        collapsed,
                         false,
                         FontId::monospace(13.0),
                         None,
@@ -3628,20 +3738,42 @@ mod tests {
             out.unwrap()
         };
 
-        // Pointer parked in the grid: hidden (no history exemption rect).
-        let out = frame(&mut st, &b, Pos2::new(400.0, 300.0));
-        assert!(out.history_btn.is_none(), "stable alt + parked pointer ⇒ hidden");
-        // Pointer over the band: revealed the same frame.
-        let out = frame(&mut st, &b, Pos2::new(400.0, 582.0));
-        assert!(out.history_btn.is_some(), "hover over the band ⇒ revealed");
-        // Pointer leaves the band: hidden again.
-        let out = frame(&mut st, &b, Pos2::new(400.0, 300.0));
-        assert!(out.history_btn.is_none(), "un-hover ⇒ re-hidden");
-        // TUI exits (alt falls): strip back with the pointer still parked.
+        // The caller's verdict this frame — the same predicate central and
+        // layout_for evaluate (single source).
+        let collapsed = strip_hidden(&st, true, true, false, Instant::now());
+        assert!(collapsed, "stable alt ⇒ the grid owns the band");
+        // Pointer parked in the grid: nothing painted, nothing interactive.
+        let out = frame(&mut st, &b, collapsed, Pos2::new(400.0, 300.0));
+        assert!(out.history_btn.is_none(), "collapsed ⇒ no exemption rect");
+        assert!(!out.strip_peek, "no hover ⇒ no overlay");
+        // Pointer over the band: the overlay peeks the SAME frame — and
+        // stays look-only (no controls, no geometry: `collapsed` is
+        // unchanged by hover, so the PTY size question can't even move).
+        let out = frame(&mut st, &b, collapsed, Pos2::new(400.0, 582.0));
+        assert!(out.strip_peek, "hover over the band ⇒ overlay");
+        assert!(
+            out.history_btn.is_none(),
+            "peek is look-only: still no interaction surface"
+        );
+        assert!(
+            strip_hidden(&st, true, true, false, Instant::now()),
+            "hover must not un-collapse — peek never resizes"
+        );
+        // Pointer leaves the band: overlay drops.
+        let out = frame(&mut st, &b, collapsed, Pos2::new(400.0, 300.0));
+        assert!(!out.strip_peek, "un-hover ⇒ overlay gone");
+        // TUI exits (alt falls): the predicate flips the same tick; the
+        // strip is a real reserved band again, full interaction restored.
         b.advance_live(b"\x1b[?1049l");
         st.tick(&b, &recs, true, false, Instant::now());
-        let out = frame(&mut st, &b, Pos2::new(400.0, 300.0));
-        assert!(out.history_btn.is_some(), "alt exit ⇒ strip back, no hover needed");
+        let collapsed = strip_hidden(&st, true, false, false, Instant::now());
+        assert!(!collapsed, "alt exit ⇒ reserved band back, same tick");
+        let out = frame(&mut st, &b, collapsed, Pos2::new(400.0, 300.0));
+        assert!(
+            out.history_btn.is_some(),
+            "un-collapsed strip exposes its controls again, no hover needed"
+        );
+        assert!(!out.strip_peek);
     }
 
     /// §11 episode rules: raw input at a prompt uses the episode and

@@ -696,6 +696,17 @@ impl App {
         }
 
         for a in actions {
+            // C2: sleep verbs get the freeze-geometry pre-pass — a collapsed
+            // strip (rows reclaimed under a TUI) resizes back FIRST so the
+            // daemon's freeze-frame capture matches the asleep/wake
+            // presentation (the asleep lane holds the strip visible).
+            match &a {
+                C2D::SleepTerminal { id } => self.prepare_sleep_geometry(*id),
+                C2D::SleepFolder { folder } => {
+                    self.prepare_sleep_geometry_folder(*folder)
+                }
+                _ => {}
+            }
             self.send(a);
         }
         if keep {
