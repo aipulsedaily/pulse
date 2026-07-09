@@ -120,6 +120,21 @@ const WINDOW_STALE: Duration = Duration::from_millis(2000);
 /// visible-buffering newline (fusion guard) instead of growing the queue.
 const PENDING_CAP: usize = 16;
 
+/// D2 heuristic prompt latch: output must have been quiet this long with the
+/// cursor parked after a prompt-shaped row before the latch mints. Above
+/// REVEAL (180ms) so the strip never flashes through the arm, and matching
+/// the daemon's own CMD_QUIET precedent (`cmd_prompt_evidence`).
+const HEUR_QUIET: Duration = Duration::from_millis(300);
+
+/// D2: the post-submit typeahead flush threshold DURING a heuristic episode.
+/// Resolution (c)'s "shell is back at a prompt" signal is a fresh heuristic
+/// latch, which structurally takes echo + output + the 300ms quiet window
+/// (≈400-500ms for instant commands) — the integrated 300ms threshold would
+/// always lose and dump buffered typing raw. Typing into a genuinely
+/// long-running inner command buffers up to this long before flushing as
+/// type-ahead; the editor keeps the keys visible the whole time.
+const HEUR_FLUSH: Duration = Duration::from_millis(1000);
+
 /// Per-terminal composer mode. Raw is the default and the fallback.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ComposerMode {
@@ -349,6 +364,79 @@ pub(crate) fn nested_shell_line(cursor_row: &str) -> NestedShellLine {
     }
 }
 
+/// D2: grid-observed shell-prompt shape at the cursor (the heuristic
+/// composer's arm signal in markerless nested shells — validated against 20
+/// real captured prompt shapes and 17 adversarial negatives in the D2
+/// research's docker rig). `prefix` is `cursor_prefix_gap().0` (cells LEFT
+/// of the cursor, trim-end'd); `col_gap` = cursor col − rendered prefix
+/// length (a prompt's trailing space ⇒ 1; 0 for no-space prompts; >2 ⇒ the
+/// cursor was parked away from the text — not a prompt tail).
+///
+/// The input contract gives the dirty check for free: typed text after the
+/// sigil ends the prefix with a non-sigil char → no match → no arm. This
+/// classifier IS the cursor_clean check in heuristic mode. Documented
+/// residual: zsh's PS2 (`quote> `) classifies as a prompt — typing there
+/// goes into the continuation, functionally where raw typing would go
+/// (record mislabel only).
+pub(crate) fn looks_like_shell_prompt(prefix: &str, col_gap: usize) -> bool {
+    let t = prefix.trim_end();
+    if t.is_empty() {
+        return false;
+    }
+    // The cursor must sit ON or just past the text (prompt trailing space).
+    if col_gap > 2 {
+        return false;
+    }
+    // Leading-glyph prompts (oh-my-zsh robbyrussell `➜  ~`, pure/starship
+    // multiline tails start the row with the glyph and may END with a dir).
+    if t.starts_with('\u{279c}') || t.starts_with('\u{276f}') {
+        return true;
+    }
+    let Some(last) = t.chars().last() else {
+        return false;
+    };
+    match last {
+        '$' | '#' | '\u{276f}' | '\u{3009}' => true,
+        // zsh `%` — but never a percentage tail (`100%`, `45%`).
+        '%' => !t
+            .chars()
+            .rev()
+            .nth(1)
+            .is_some_and(|c| c.is_ascii_digit()),
+        // fish/pwsh/nushell/cmd `>` — but never bash/zsh PS2 (a bare `>`
+        // continuation row) and never an echoed `>>` redirect tail.
+        '>' => t != ">" && !t.ends_with(">>"),
+        // Everything else — colons (every password/passphrase prompt), `?`,
+        // `]`, plain words — refuses.
+        _ => false,
+    }
+}
+
+/// D2: best-effort cwd parsed from the PROMPT TEXT itself (display only —
+/// never persisted, never fed to completion). Handles the two dominant
+/// shapes: `user@host:path$ ` (the segment between the last `:` and the
+/// sigil, `@` required before the colon so `C:\…>` never parses) and the
+/// RHEL `[user@host dir]# ` bracket form (the last space-separated token).
+/// A miss returns None — the lane shows the bare sigil chip.
+pub(crate) fn heur_prompt_cwd(prefix: &str) -> Option<String> {
+    let t = prefix
+        .trim_end()
+        .strip_suffix(['$', '#', '%', '>', '\u{276f}', '\u{3009}'])?
+        .trim_end();
+    if let Some(stripped) = t.strip_suffix(']') {
+        let inner = stripped.rsplit('[').next().unwrap_or(stripped);
+        let dir = inner.rsplit(' ').next()?.trim();
+        return (!dir.is_empty()).then(|| dir.to_string());
+    }
+    let at = t.find('@')?;
+    let colon = t.rfind(':')?;
+    if colon <= at {
+        return None;
+    }
+    let dir = t[colon + 1..].trim();
+    (!dir.is_empty()).then(|| dir.to_string())
+}
+
 /// Submission encoding (§4.1): byte-identical to paste-then-Enter. Bracketed
 /// iff the shell requested DECSET 2004 (PSReadLine 2.0 on PS 5.1 never does —
 /// unconditional brackets would leak literal `ESC[200~` into its buffer);
@@ -515,6 +603,32 @@ struct SubmitWindow {
     /// `pre_seen` at dispatch: resolution (c) requires a STRICTLY fresh pre.
     pre0: u64,
     since: Instant,
+    /// D2: the submission rode the heuristic (marker-silent nested-shell)
+    /// lane — resolution (c) closes on a FRESH heuristic latch instead of a
+    /// pre (none can arrive mid-episode), and the flush threshold stretches
+    /// to HEUR_FLUSH (a fresh latch takes echo + output + the 300ms quiet).
+    heur: bool,
+}
+
+/// D2 heuristic prompt latch: live only inside a marker-silent nested-shell
+/// episode. The cell is the composer's `prompt_end` surrogate — cover row,
+/// SubmitHold column and the clean check all read it. Dropped on ANY
+/// output/marker/alt/mouse/resize edge (drop, never drift — the hold_row
+/// doctrine).
+struct HeurPrompt {
+    /// Grid line at mint (shifts with history growth, like `hold_row`).
+    line: i32,
+    /// Cursor column at mint — where submitted text will start.
+    col: usize,
+    since: Instant,
+    /// history_size at mint: the shift baseline.
+    history: usize,
+    /// Grid (cols, rows) at mint: a resize reflows rows unpredictably ⇒ drop.
+    grid: (u16, u16),
+    /// Backend feed generation at mint: ANY parsed byte after the mint bumps
+    /// it — the strongest single disarm (prompt-shaped OUTPUT mid-command
+    /// tears down the instant more output flows).
+    feed_gen: u64,
 }
 
 /// Presentational-only handoff after submit (Bug 3): the just-submitted
@@ -722,6 +836,17 @@ pub struct ComposerState {
     /// paint and PTY size can never disagree because they ask the same
     /// question. The 400ms wait doubles as the resize debounce (HIDE_AFTER).
     alt_since: Option<Instant>,
+    /// D2: the live heuristic prompt latch, if any (see `HeurPrompt`).
+    /// Minted by `tick` (quiet 300ms + prompt-shape classifier + cursor
+    /// anchor), scoped strictly to marker-silent nested-shell episodes.
+    heur: Option<HeurPrompt>,
+    /// D2: a heuristic episode is live — the first latch minted against an
+    /// open `nested_shell_cmd` rec and no tokened marker has arrived since.
+    /// Keeps detection allowed once our own synthetic submissions replace
+    /// the open nested rec with inner-command recs (an ordinary busy command
+    /// must NEVER run the detector — this flag is the false-positive scope).
+    /// Cleared on any tokened marker edge, reset, exit, or all recs closing.
+    heur_episode: bool,
 }
 
 impl Default for ComposerState {
@@ -754,6 +879,8 @@ impl Default for ComposerState {
             last_activity: None,
             compose_broken_since: None,
             alt_since: None,
+            heur: None,
+            heur_episode: false,
         }
     }
 }
@@ -762,6 +889,126 @@ impl ComposerState {
     /// The prompt latch is live (a scanned `pre` with no `exec` after it).
     pub fn at_prompt_latched(&self) -> bool {
         self.at_prompt_since.is_some()
+    }
+
+    /// D2: the heuristic prompt latch is live AND intact — no byte parsed
+    /// since the mint (feed_gen), grid un-resized, history un-shrunk, primary
+    /// screen, and the cursor still exactly at the latched cell (shifted by
+    /// history growth — the hold_row rule: drop, never drift). Feeds the
+    /// gate's at_prompt/cursor_clean/settled and every dispatch readiness
+    /// check; `tick` clears a latch this returns false for.
+    pub(crate) fn heur_live(&self, backend: &TermBackend) -> bool {
+        let Some(h) = &self.heur else { return false };
+        if backend.feed_gen != h.feed_gen {
+            return false; // any output byte after the mint tears it down
+        }
+        if (backend.size.cols, backend.size.rows) != h.grid {
+            return false;
+        }
+        let mode = backend.mode();
+        if mode.contains(TermMode::ALT_SCREEN) || mode.intersects(TermMode::MOUSE_MODE) {
+            return false;
+        }
+        let hist = backend.history_size();
+        if hist < h.history {
+            return false;
+        }
+        let line = h.line - (hist - h.history) as i32;
+        if line < -(hist as i32) {
+            return false;
+        }
+        backend.cursor_line() == line && backend.cursor_col() == h.col
+    }
+
+    /// The grid row the heuristic latch covers this frame, if live — the
+    /// armed cover's third source in `cover_line_for` (the detection cell IS
+    /// the prompt end: the cursor sits right after `# `).
+    fn heur_cover_line(&self, backend: &TermBackend) -> Option<i32> {
+        if !self.heur_live(backend) {
+            return None;
+        }
+        let h = self.heur.as_ref()?;
+        Some(h.line - (backend.history_size() - h.history) as i32)
+    }
+
+    /// D2 episode gate: heuristic detection is ALLOWED to run this frame.
+    /// The false-positive killer — the detector never runs at integrated
+    /// prompts (live pre latch), never during ordinary busy commands (the
+    /// open rec must classify `nested_shell_cmd`, or the episode must
+    /// already be live with our own synthetic inner recs open), never
+    /// pre-shell, never over TUIs.
+    fn heur_gate(&self, backend: &TermBackend, recs: &[BlockRec], running: bool) -> bool {
+        if !running || self.asleep || self.reconnecting || self.at_prompt_since.is_some() {
+            return false;
+        }
+        if !backend.feed_live() {
+            return false;
+        }
+        let mode = backend.mode();
+        if mode.contains(TermMode::ALT_SCREEN) || mode.intersects(TermMode::MOUSE_MODE) {
+            return false;
+        }
+        // Pre-shell is disjoint by construction (an open rec needs a scanned
+        // exec hook ⇒ exec_seen > 0); the explicit check documents intent.
+        let (pre_seen, exec_seen) = backend
+            .block_feed
+            .as_ref()
+            .map(|f| (f.pre_seen, f.exec_seen))
+            .unwrap_or((0, 0));
+        if pre_shell(running, false, pre_seen, exec_seen, false) {
+            return false;
+        }
+        let open = recs.iter().any(|r| r.end_off.is_none());
+        open && (self.heur_episode
+            || recs
+                .iter()
+                .any(|r| r.end_off.is_none() && nested_shell_cmd(&r.cmd)))
+    }
+
+    /// D2 latch mint (called from `tick`, before the gate reads inputs):
+    /// episode gate + output-quiet ≥ HEUR_QUIET + the prompt-shape classifier
+    /// on the cursor row + cursor on the primary on-screen grid. Returns the
+    /// quiet-window deadline while still pending (the caller schedules a
+    /// repaint — an idle terminal produces no frames to mint on). A mint
+    /// opens a fresh prompt episode: `episode_used` resets exactly as a
+    /// tokened pre would reset it.
+    fn maybe_mint_heur(
+        &mut self,
+        backend: &TermBackend,
+        recs: &[BlockRec],
+        running: bool,
+        now: Instant,
+    ) -> Option<Instant> {
+        if self.heur.is_some() || !self.heur_gate(backend, recs, running) {
+            return None;
+        }
+        let last = backend.last_output_at()?;
+        let deadline = last + HEUR_QUIET;
+        if now < deadline {
+            return Some(deadline);
+        }
+        let (prefix, gap) = backend.cursor_prefix_gap();
+        if !looks_like_shell_prompt(&prefix, gap) {
+            return None;
+        }
+        let line = backend.cursor_line();
+        if line < 0 || line >= backend.size.rows as i32 {
+            return None;
+        }
+        if trace_enabled() {
+            log::info!("[composer] heuristic prompt latch minted at ({line}, {})", backend.cursor_col());
+        }
+        self.heur = Some(HeurPrompt {
+            line,
+            col: backend.cursor_col(),
+            since: now,
+            history: backend.history_size(),
+            grid: (backend.size.cols, backend.size.rows),
+            feed_gen: backend.feed_gen,
+        });
+        self.heur_episode = true;
+        self.episode_used = false;
+        None
     }
 
     /// Counter-diff pump, called from drain_ipc for EVERY terminal on live
@@ -779,6 +1026,10 @@ impl ComposerState {
             self.last_exec = exec_seen;
             // Instant disarm signal, feed-time — beats the Blocks round-trip.
             self.at_prompt_since = None;
+            // D2: a tokened marker means integration is alive — the
+            // heuristic episode (if any) is over.
+            self.heur = None;
+            self.heur_episode = false;
             // Stable-chrome edges: the busy hysteresis clock starts here
             // (GUI-side, never rec.started_ms) and the quiet window opens.
             self.busy_since = Some(now);
@@ -800,6 +1051,11 @@ impl ComposerState {
             self.last_pre = pre_seen;
             self.at_prompt_since = Some(now);
             self.episode_used = false;
+            // D2 hand-back: the returning tokened pre ends the heuristic
+            // episode — the real latch takes over the same event (seamless
+            // re-integration, pinned by nested_shell_reattach/heur_handback).
+            self.heur = None;
+            self.heur_episode = false;
             // The prompt edge closes the busy clock and opens a quiet window
             // so the pre→133;B transient never switches strip content.
             self.busy_since = None;
@@ -852,6 +1108,8 @@ impl ComposerState {
         self.has_focus = false;
         self.submit_hold = None; // the world was rewritten — drop any ghost
         self.pending_history_cover = None;
+        self.heur = None;
+        self.heur_episode = false;
     }
 
     /// Session exited. Draft kept; queued submissions fold into it (a dead
@@ -877,6 +1135,8 @@ impl ComposerState {
         self.want_focus = false;
         self.has_focus = false;
         self.submit_hold = None;
+        self.heur = None;
+        self.heur_episode = false;
     }
 
     /// The post-submit typeahead buffer is engaged: a submit window is open
@@ -996,9 +1256,20 @@ impl ComposerState {
         let mode = backend.mode();
         let alt = mode.contains(TermMode::ALT_SCREEN);
         let mouse = mode.intersects(TermMode::MOUSE_MODE);
+        // D2: a heuristic submission's "shell is back at a prompt" signal is
+        // a FRESH heuristic latch (no pre can arrive mid-episode), and its
+        // flush threshold stretches to HEUR_FLUSH — the fresh latch takes
+        // echo + output + the 300ms quiet, so the integrated 300ms would
+        // always lose and dump buffered typing raw.
+        let heur_fresh = w.heur
+            && self
+                .heur
+                .as_ref()
+                .is_some_and(|h| h.since > w.since);
+        let flush_after = if w.heur { HEUR_FLUSH } else { POST_SUBMIT_FLUSH };
         if age >= WINDOW_STALE {
             self.fold_pending_into_draft();
-        } else if pre_now > w.pre0 {
+        } else if pre_now > w.pre0 || heur_fresh {
             self.post_submit = None;
         } else if alt || mouse {
             self.flush_to_pty(
@@ -1009,7 +1280,7 @@ impl ComposerState {
                 },
                 now,
             );
-        } else if age >= POST_SUBMIT_FLUSH {
+        } else if age >= flush_after {
             if self.pending.is_empty() && self.draft.trim().is_empty() {
                 // Nothing buffered: the command is simply long-running —
                 // yield to Raw(Busy) with no bytes. Typing from here on is
@@ -1029,7 +1300,7 @@ impl ComposerState {
                 // truly stopped prompting.
                 if trace_enabled() {
                     log::info!(
-                        "[composer] spacer queue abandoned: no fresh prompt within {POST_SUBMIT_FLUSH:?} ({} pending)",
+                        "[composer] spacer queue abandoned: no fresh prompt within {flush_after:?} ({} pending)",
                         self.pending.len()
                     );
                 }
@@ -1061,7 +1332,12 @@ impl ComposerState {
         {
             return None;
         }
-        if self.at_prompt_since.is_none() || !backend.cursor_at_prompt_end() {
+        // Provably clean fresh prompt: the integrated latch + captured
+        // prompt-end pair, or (D2) a live heuristic latch — the exact same
+        // state a hand-typed submit dispatches from in each mode.
+        let ready = (self.at_prompt_since.is_some() && backend.cursor_at_prompt_end())
+            || self.heur_live(backend);
+        if !ready {
             return None;
         }
         let text = self.pending.pop_front()?;
@@ -1104,6 +1380,11 @@ impl ComposerState {
                 log::info!("[composer] raw key → PTY at a prompt (+{ms}ms since latch)");
             }
         }
+        // D2: raw bytes at a heuristic prompt drop the latch IMMEDIATELY —
+        // the echo would tear it down a frame later anyway, but that frame
+        // is exactly where an AutoArm re-fire would fight the user for
+        // focus. Re-arm happens only at the NEXT mint (quiet + clean shape).
+        self.heur = None;
         if self.mode == ComposerMode::Compose {
             // The user chose the grid: queued blind submissions fold into
             // the draft (visible, nothing fires behind their back).
@@ -1136,7 +1417,11 @@ impl ComposerState {
             // submissions fold into the draft where the user can see them.
             self.fold_pending_into_draft();
             self.mode = ComposerMode::Raw(RawReason::UserRaw);
-            if self.at_prompt_since.is_some() {
+            // D2: a live heuristic latch counts as the prompt episode too —
+            // without consuming it the gate would auto-re-arm next frame and
+            // fight the user for focus (D7). The latch itself is KEPT: the
+            // ManualOnly path's ❯ Compose re-arms without any chord.
+            if self.at_prompt_since.is_some() || self.heur.is_some() {
                 self.episode_used = true;
             }
         }
@@ -1158,7 +1443,12 @@ impl ComposerState {
     /// what the user had at click time.
     pub fn activate(&mut self, backend: &TermBackend) -> Vec<u8> {
         let mut out = Vec::new();
-        if !backend.cursor_at_prompt_end() {
+        // D2: a live heuristic latch IS clean by construction (the classifier
+        // refuses dirty prompts, the cursor anchors the cell) — arm silently.
+        // There is no 133;B capture to compare against, so without this the
+        // chord path below would fire ^C at a prompt we can't certify: the
+        // honest-degradation contract forbids exactly that.
+        if !backend.cursor_at_prompt_end() && !self.heur_live(backend) {
             // v0.1.1 guards (the field `^C`-spam loop: a systematically-wrong
             // 133;B capture made every activation reclaim the PROMPT STRING
             // itself and ship a chord, whose fresh prompt was captured wrong
@@ -1347,20 +1637,27 @@ impl ComposerState {
         now: Instant,
     ) -> (Vec<u8>, bool) {
         let spacer = text.trim().is_empty();
+        // D2: heuristic-episode submissions ride the Cmd ledger lane — the
+        // daemon writes the bytes (bracketed-paste aware off its own mirror)
+        // AND opens the synthetic block at the pre-write journal head, so
+        // inner commands get real history/block records. Single-line only,
+        // like cmd (one record for N lines would be a lie).
+        let heur_sub = !self.is_cmd && self.heur_episode;
         // P6b §6 belt: a multi-line submission can never dispatch on a Cmd
-        // terminal (the Enter gating refuses it upstream; a multi-line
-        // history Run or a pasted-\n queued item lands here). Restore it to
-        // the visible draft — nothing fires uninspected, nothing is lost.
-        if self.is_cmd && !spacer && text.contains('\n') {
+        // terminal or in a heuristic episode (the Enter gating refuses it
+        // upstream; a multi-line history Run or a pasted-\n queued item lands
+        // here). Restore it to the visible draft — nothing fires uninspected,
+        // nothing is lost.
+        if (self.is_cmd || heur_sub) && !spacer && text.contains('\n') {
             self.draft = text.to_string();
             self.caret_to_end = true;
             return (Vec::new(), false);
         }
-        // P6b §5.2 routing: Cmd-family commands ship as SubmitCommand (the
-        // daemon writes the bytes AND records the synthetic block); spacers
-        // stay honest bare-`\r` Input (a blank line is not a command — no
-        // record). Every other family keeps the P3 byte path.
-        let bytes = if self.is_cmd && !spacer {
+        // P6b §5.2 routing: Cmd-family (and D2 heuristic-episode) commands
+        // ship as SubmitCommand (the daemon writes the bytes AND records the
+        // synthetic block); spacers stay honest bare-`\r` Input (a blank line
+        // is not a command — no record). Every other path keeps P3 bytes.
+        let bytes = if (self.is_cmd || heur_sub) && !spacer {
             self.pending_submit_cmd = Some(text.trim().to_string());
             Vec::new()
         } else {
@@ -1371,12 +1668,18 @@ impl ComposerState {
                 self.submit_hold = Some(SubmitHold {
                     ghost: text.trim_end().to_string(),
                     line,
-                    col: backend
-                        .block_feed
-                        .as_ref()
-                        .and_then(|f| f.prompt_end)
-                        .map(|(_, c)| c)
-                        .unwrap_or(0),
+                    // D2: in a heuristic episode the latched cursor cell IS
+                    // the prompt end (no 133;B capture exists to read).
+                    col: if heur_sub {
+                        self.heur.as_ref().map(|h| h.col).unwrap_or(0)
+                    } else {
+                        backend
+                            .block_feed
+                            .as_ref()
+                            .and_then(|f| f.prompt_end)
+                            .map(|(_, c)| c)
+                            .unwrap_or(0)
+                    },
                     cwd: cwd.map(str::to_owned),
                     since: now, // the dispatch's clock — not a second now()
                                 // (drift-prone under simulated-time tests)
@@ -1395,6 +1698,7 @@ impl ComposerState {
                 .map(|f| f.pre_seen)
                 .unwrap_or(0),
             since: now,
+            heur: heur_sub,
         });
         (bytes, spacer)
     }
@@ -1408,6 +1712,10 @@ impl ComposerState {
         now: Instant,
     ) -> GateInputs {
         let mode = backend.mode();
+        // D2: a live heuristic latch substitutes for the pre latch + 133;B
+        // capture inside marker-silent nested-shell episodes — the same
+        // AutoArm/cover/submit/hold machinery runs off it unmodified.
+        let heur_live = self.heur_live(backend);
         GateInputs {
             hooked: true, // a ComposerState exists only for epoch > 0
             running,
@@ -1418,14 +1726,17 @@ impl ComposerState {
             // block (launch()/on_block close dangling records on it), so a
             // live at_prompt latch overrules a not-yet-closed rec — the gate
             // used to sit Blocked(Busy) for an extra round-trip per submit
-            // (re-arm lag + a strip label flip).
+            // (re-arm lag + a strip label flip). The heuristic latch gets
+            // the same override: the open nested rec IS the episode.
             open_block: recs.iter().any(|r| r.end_off.is_none())
-                && self.at_prompt_since.is_none(),
-            at_prompt: self.at_prompt_since.is_some(),
+                && self.at_prompt_since.is_none()
+                && !heur_live,
+            at_prompt: self.at_prompt_since.is_some() || heur_live,
             settled: self
                 .at_prompt_since
-                .is_some_and(|t| now.duration_since(t) >= SETTLE),
-            cursor_clean: backend.cursor_at_prompt_end(),
+                .is_some_and(|t| now.duration_since(t) >= SETTLE)
+                || heur_live, // HEUR_QUIET already settled it
+            cursor_clean: backend.cursor_at_prompt_end() || heur_live,
             episode_used: self.episode_used,
             asleep: self.asleep,
         }
@@ -1454,6 +1765,19 @@ impl ComposerState {
         grid_focused: bool,
         now: Instant,
     ) -> Option<Instant> {
+        // D2 heuristic latch maintenance — BEFORE the gate reads inputs so
+        // this frame's verdict sees the fresh truth. Drop a dead latch
+        // (output byte / cursor move / resize / alt — heur_live's rules),
+        // close a finished episode (belt: the returning pre normally cleared
+        // it in on_stream_events already), then try to mint.
+        if self.heur.is_some() && !self.heur_live(backend) {
+            self.heur = None;
+        }
+        if self.heur_episode && !recs.iter().any(|r| r.end_off.is_none()) {
+            self.heur_episode = false;
+            self.heur = None;
+        }
+        let heur_wake = self.maybe_mint_heur(backend, recs, running, now);
         let inputs = self.gate_inputs(backend, recs, running, now);
         // Bug C: strip-hide hysteresis clock — stamp the ALT_SCREEN rising
         // edge, clear on the falling edge (a re-entry restarts the full
@@ -1680,8 +2004,17 @@ impl ComposerState {
         }
         // The typeahead window's flush threshold must fire on time even on
         // an output-quiet terminal (a hung command produces no repaints).
+        // D2: a heuristic window's threshold is HEUR_FLUSH.
         if let Some(w) = &self.post_submit {
-            let d = w.since + POST_SUBMIT_FLUSH;
+            let d = w.since + if w.heur { HEUR_FLUSH } else { POST_SUBMIT_FLUSH };
+            if now < d {
+                wake = Some(wake.map_or(d, |x| x.min(d)));
+            }
+        }
+        // D2: a pending heuristic mint (quiet window still running) must
+        // fire on time — the nested prompt painted its last byte and will
+        // never repaint on its own.
+        if let Some(d) = heur_wake {
             if now < d {
                 wake = Some(wake.map_or(d, |x| x.min(d)));
             }
@@ -1892,6 +2225,16 @@ pub fn cover_line_for(
                         .and_then(|f| f.prompt_end)
                         .map(|(line, _)| line)
                 })
+                .flatten()
+        })
+        .or_else(|| {
+            // D2: the heuristic latch's cell — the armed cover paints over
+            // the raw `root@…#` row exactly like an integrated prompt row.
+            // heur_cover_line embeds the full certainty chain (latch live,
+            // cursor anchored, un-resized); any failure ⇒ no blank, raw
+            // rendering (drop-don't-drift).
+            (comp_active)
+                .then(|| state.heur_cover_line(backend))
                 .flatten()
         })
         .or_else(|| {
@@ -2184,8 +2527,21 @@ pub(crate) fn paint_prompt_prefix(
     cwd: Option<&str>,
     font: &FontId,
 ) -> f32 {
+    paint_prompt_prefix_sigil(painter, row, cwd, font, "\u{276f}")
+}
+
+/// `paint_prompt_prefix` with a caller-chosen sigil glyph (D2: the heuristic
+/// episode's honesty garnish — the lane chip shows `#` + the best-effort
+/// prompt-text cwd instead of claiming a hook-certified `❯ cwd`).
+pub(crate) fn paint_prompt_prefix_sigil(
+    painter: &egui::Painter,
+    row: Rect,
+    cwd: Option<&str>,
+    font: &FontId,
+    sigil: &str,
+) -> f32 {
     let mut x = row.min.x;
-    let glyph = painter.layout_no_wrap("\u{276f}".into(), font.clone(), super::ACCENT);
+    let glyph = painter.layout_no_wrap(sigil.into(), font.clone(), super::ACCENT);
     let gy = row.center().y - glyph.size().y / 2.0;
     let gw = glyph.size().x;
     painter.galley(Pos2::new(x, gy), glyph, super::ACCENT);
@@ -2256,6 +2612,12 @@ pub fn show(
     };
     let now = Instant::now();
     let inputs = state.gate_inputs(backend, recs, running, now);
+    // D2: this terminal is inside a marker-silent nested-shell episode
+    // (heuristic composer), and whether the latch is live RIGHT NOW. The
+    // episode flag outlives per-cycle latch drops (echo output tears the
+    // latch down; the episode spans the whole nested visit).
+    let heur_episode = state.heur_episode;
+    let heur_armed = heur_episode && state.heur_live(backend);
     // SLEEP §7.3: the lane presents asleep this frame — swaps the Run slot
     // to the accent `Wake ▸` (same fixed slot, stable chrome F3). The flag
     // check covers the one-frame Snapshot-before-tick window.
@@ -2371,7 +2733,9 @@ pub fn show(
     // neither submit nor queue on a Cmd terminal (the strip hint says why);
     // Enter keeps buffering it visibly in the TextEdit (the fusion guard's
     // InsertNewline path). The user splits or edits it back to one line.
-    let cmd_multiline = state.is_cmd && state.draft.contains('\n');
+    // D2: heuristic episodes share the constraint (the synthetic-block
+    // ledger records one command per submission — N lines would be a lie).
+    let cmd_multiline = (state.is_cmd || heur_episode) && state.draft.contains('\n');
     // Submission gating: an external submit / spoofed exec disables Enter
     // until the next prompt (inv. 4 — the editor never loses focus over it),
     // and the typeahead window holds Enter until its resolution.
@@ -2461,7 +2825,17 @@ pub fn show(
                     let editor_sel = egui::text_edit::TextEditState::load(ui.ctx(), ed_id)
                         .and_then(|s| s.cursor.char_range())
                         .is_some_and(|r| r.primary != r.secondary);
-                    if !editor_sel && state.at_prompt_since.is_none() && inputs.running {
+                    // D2: a live heuristic latch counts as "at a prompt" —
+                    // the interrupt chord must NEVER fire at a prompt we
+                    // only detected heuristically (honest degradation: no
+                    // ^C at an uncertain prompt). With the latch down the
+                    // inner command is genuinely running and the deliberate
+                    // Ctrl+C interrupt stays the universal cancel.
+                    if !editor_sel
+                        && state.at_prompt_since.is_none()
+                        && !heur_armed
+                        && inputs.running
+                    {
                         ui.input_mut(|i| {
                             i.events.retain(|e| !matches!(e, egui::Event::Copy))
                         });
@@ -2655,7 +3029,38 @@ pub fn show(
             // the strip as a Foreground overlay so the grid keeps its
             // geometry (D1); the lane prefix stays painted (F8: ❯ + cwd
             // never vanish when the draft grows a second line).
-            let x = paint_prompt_prefix(&painter, lane_rect, prompt_cwd, &font);
+            //
+            // D2 honesty garnish: in a heuristic episode the chip is
+            // `# {cwd-or-blank}` — cwd parsed best-effort from the prompt
+            // text itself (display only, never persisted), never the outer
+            // shell's hook-fed cwd (which would be a stale claim about a
+            // different shell). A parse miss shows the bare sigil.
+            let heur_cwd = heur_armed
+                .then(|| heur_prompt_cwd(&backend.cursor_row_text()))
+                .flatten();
+            let x = if heur_episode {
+                paint_prompt_prefix_sigil(&painter, lane_rect, heur_cwd.as_deref(), &font, "#")
+            } else {
+                paint_prompt_prefix(&painter, lane_rect, prompt_cwd, &font)
+            };
+            if heur_episode {
+                let chip = Rect::from_min_max(
+                    Pos2::new(lane_rect.min.x, strip_rect.min.y),
+                    Pos2::new(x.max(lane_rect.min.x + 16.0), strip_rect.max.y),
+                );
+                ui.interact(chip, Id::new(("heur_chip", terminal_id)), Sense::hover())
+                    .on_hover_text(
+                        "prompt detected without shell integration; exit codes unavailable",
+                    );
+            }
+            // The cwd a heuristic submission's hold/history cover carries:
+            // the parsed prompt cwd (or none) — the outer shell's cwd would
+            // label inner commands with a different shell's directory.
+            let sub_cwd = if heur_episode {
+                heur_cwd.as_deref()
+            } else {
+                prompt_cwd
+            };
             // Frozen ghost through the submit handoff (Bug 3, static-input):
             // while the SubmitHold lives and the next command hasn't been
             // typed yet, the lane keeps showing the just-submitted text — at
@@ -2781,7 +3186,7 @@ pub fn show(
             if submit_now {
                 // Focus is NOT surrendered: the post-submit typeahead
                 // window keeps the editor live for the next command.
-                let (bytes, spacer) = state.submit(backend, cover_line, prompt_cwd);
+                let (bytes, spacer) = state.submit(backend, cover_line, sub_cwd);
                 out.write = bytes;
                 out.spacer_gesture = spacer;
             } else if out.write.is_empty() {
@@ -2791,7 +3196,7 @@ pub fn show(
                 // the caller marks the spacer cover exactly like a
                 // submit-time gesture.
                 if let Some((bytes, spacer)) =
-                    state.pump_pending(backend, cover_line, prompt_cwd, now)
+                    state.pump_pending(backend, cover_line, sub_cwd, now)
                 {
                     out.write = bytes;
                     out.spacer_gesture = spacer;
@@ -2811,8 +3216,12 @@ pub fn show(
             let hint = if lane_ghost.is_some() {
                 None
             } else if cmd_multiline {
-                // P6b §6: the refusal is announced, never silent.
-                Some("cmd runs one line at a time")
+                // P6b §6 / D2: the refusal is announced, never silent.
+                Some(if state.is_cmd {
+                    "cmd runs one line at a time"
+                } else {
+                    "one line at a time in this shell"
+                })
             } else if !can_submit {
                 (!quiet).then_some("waiting for prompt\u{2026}")
             } else if state.has_focus && state.draft.is_empty() {
@@ -2859,7 +3268,7 @@ pub fn show(
                             // Run ▸ is gated on a non-empty draft, so this is
                             // never the spacer gesture (that is Enter only).
                             // Focus stays in the editor (typeahead window).
-                            let (bytes, _) = state.submit(backend, cover_line, prompt_cwd);
+                            let (bytes, _) = state.submit(backend, cover_line, sub_cwd);
                             out.write = bytes;
                         } else if buffering
                             && has_draft
@@ -2997,7 +3406,11 @@ pub fn show(
                         ui.ctx().request_repaint_after(d);
                     }
                 }
-                LaneContent::Busy if open_rec.is_some_and(|r| nested_shell_cmd(&r.cmd)) => {
+                LaneContent::Busy
+                    if open_rec.is_some()
+                        && (heur_episode
+                            || open_rec.is_some_and(|r| nested_shell_cmd(&r.cmd))) =>
+                {
                     // Bug D: the open block is a NESTED SHELL episode
                     // (`sudo su`, `su`, plain `bash`, …) — no hooks exist in
                     // that shell, the rec stays open the whole visit, and
@@ -4102,6 +4515,435 @@ mod tests {
         assert!(st.at_prompt_latched());
         assert!(!st.episode_used, "pre edge resets the episode");
         assert_eq!(gate(&gi(&st, true)), GateVerdict::AutoArm);
+    }
+
+    // ── D2: heuristic composer in marker-silent nested shells ────────────
+
+    /// The §5.2 classifier truth table, ported from the validated prototype
+    /// (`scratchpad\d2\heur_proto.rs`, 0 failures against the docker-rig
+    /// corpus): 20 real prompt positives, 16 adversarial negatives, plus the
+    /// one documented residual (zsh PS2) and the cwd-parse rows.
+    #[test]
+    fn heur_prompt_truth_table() {
+        // Positives: every shape captured live in the D2 docker rig
+        // (ubuntu 24.04 / alpine 3) plus the documented default families.
+        let positives: &[(&str, usize)] = &[
+            ("root@0b0dbe2a869c:/#", 1),  // ubuntu root, the sudo su shape
+            ("tcp@0b0dbe2a869c:~$", 1),   // ubuntu user bash
+            ("bash-5.2#", 1),             // bash --norc compiled default
+            ("sh-5.1$", 1),               // sh POSIX-mode user
+            ("[root@rocky9 ~]#", 1),      // RHEL/Rocky root default
+            ("/ #", 1),                   // alpine busybox ash root
+            ("~ $", 1),                   // alpine busybox ash user
+            ("0b0dbe2a869c#", 1),         // zsh default root %m%#
+            ("0b0dbe2a869c%", 1),         // zsh default user
+            ("user@grml ~ %", 1),         // grml/debian zsh
+            ("root@0b0dbe2a869c /#", 1),  // fish default root
+            ("tcp@0b0dbe2a869c />", 1),   // fish default user
+            ("PS /home/tcp>", 1),         // pwsh on linux
+            ("C:\\Users\\zany>", 1),      // cmd default
+            ("\u{276f}", 1),              // starship/p10k multiline tail
+            ("$", 1),                     // dash bare user prompt
+            ("#", 1),                     // dash bare root prompt
+            ("\u{279c}  ~", 1),           // oh-my-zsh robbyrussell (ends with a DIR)
+            ("~/src/pulse\u{3009}", 1),   // nushell default indicator
+            ("root@web-01:/var/log#", 0), // no-trailing-space custom prompt
+        ];
+        for (p, gap) in positives {
+            assert!(looks_like_shell_prompt(p, *gap), "{p:?} must arm");
+        }
+        // Adversarial negatives: auth/consent prompts, output shapes, a
+        // dirty prompt, the row under an echoed fake prompt, a parked
+        // cursor. All must refuse — a false arm covers a live row.
+        let negatives: &[(&str, usize)] = &[
+            ("[sudo] password for tcp:", 1),
+            ("Password:", 1),
+            ("Enter passphrase for key '/root/.ssh/id':", 1),
+            ("Do you want to continue? [Y/n]", 1),
+            (
+                "Are you sure you want to continue connecting (yes/no/[fingerprint])?",
+                1,
+            ),
+            ("Downloading... 100%", 1),
+            ("resolving deltas: 45%", 0),
+            (">", 1),                                    // bash/zsh PS2 continuation
+            ("cat file.txt >>", 1),                      // echoed redirect tail
+            ("make[1]: Entering directory '/src'", 1),
+            ("Total 15 (delta 3), reused 15 (delta 3)", 1),
+            ("-- INSERT --", 1),                         // vim modeline (alt-blocked anyway)
+            ("Reading package lists... Done", 1),
+            ("root@0b0dbe2a869c:/# whoami", 1),          // dirty prompt = no auto-arm
+            ("", 0),                                     // row under an echoed fake prompt
+            ("root@box:/#", 20),                         // cursor parked away from text
+        ];
+        for (p, gap) in negatives {
+            assert!(!looks_like_shell_prompt(p, *gap), "{p:?} must refuse");
+        }
+        // The 17th research negative — DOCUMENTED residual: zsh's PS2
+        // renders `name> ` and classifies as a prompt. Typing there goes
+        // into the continuation, functionally where raw typing would go
+        // (record mislabel only, no wrong bytes).
+        assert!(looks_like_shell_prompt("quote>", 1));
+
+        // Best-effort cwd parse (the display-only `# cwd` chip).
+        assert_eq!(
+            heur_prompt_cwd("root@box:/var/log#").as_deref(),
+            Some("/var/log")
+        );
+        assert_eq!(heur_prompt_cwd("tcp@host:~$").as_deref(), Some("~"));
+        assert_eq!(heur_prompt_cwd("[root@rocky9 ~]#").as_deref(), Some("~"));
+        assert_eq!(heur_prompt_cwd("bash-5.2#"), None, "no @ ⇒ bare sigil chip");
+        assert_eq!(
+            heur_prompt_cwd("C:\\Users\\zany>"),
+            None,
+            "a drive colon without @ never parses"
+        );
+        assert_eq!(heur_prompt_cwd("/ #"), None);
+    }
+
+    /// D2 test rig: a marker-silent nested-shell episode — hooked prompt
+    /// latched, `sudo su` exec'd (rec open, hook counters frozen from here),
+    /// the nested root prompt painted RAW (zero hook OSCs). `now` returned
+    /// is the real clock at the last output stamp; tests advance simulated
+    /// time from it.
+    fn heur_episode_setup() -> (TermBackend, ComposerState, Vec<BlockRec>, Instant) {
+        let mut b = backend_at_clean_prompt();
+        let now = Instant::now();
+        let mut st = ComposerState::default();
+        pump_counters(&mut st, &b, now);
+        b.advance_live(&hook_bytes("exec", r#"{"c":"sudo su"}"#));
+        pump_counters(&mut st, &b, now);
+        assert_eq!(st.mode, ComposerMode::Raw(RawReason::Busy));
+        b.advance_live(b"\r\nroot@box:/# ");
+        let recs = vec![BlockRec {
+            epoch: 1,
+            n: 0,
+            cmd: "sudo su".into(),
+            cwd: None,
+            exit: None,
+            started_ms: 0,
+            ended_ms: None,
+            start_off: 0,
+            end_off: None,
+            truncated: false,
+        }];
+        (b, st, recs, now)
+    }
+
+    /// D2 latch state machine: the quiet window gates the mint (with a
+    /// self-scheduled wakeup); a minted latch AutoArms the unmodified gate
+    /// and feeds the armed cover; any output byte disarms instantly; a
+    /// dirty prompt never re-arms; a fresh clean prompt re-mints; a tokened
+    /// marker edge ends the whole episode; and an ordinary busy command
+    /// never runs the detector at all.
+    #[test]
+    fn heur_latch_lifecycle() {
+        let (mut b, mut st, recs, t0) = heur_episode_setup();
+        // Quiet window still running: no latch, honest Blocked(Busy), and
+        // the pending mint schedules its own wakeup (the nested prompt will
+        // never repaint on its own).
+        let wake = st.tick(&b, &recs, true, true, t0);
+        assert!(!st.heur_live(&b));
+        assert_eq!(st.mode, ComposerMode::Raw(RawReason::Busy));
+        assert!(wake.is_some(), "pending mint must schedule a wakeup");
+        // Quiet elapsed + prompt-shaped cursor row + cursor anchor: minted.
+        let t1 = t0 + HEUR_QUIET + Duration::from_millis(100);
+        st.tick(&b, &recs, true, true, t1);
+        assert!(st.heur_live(&b));
+        assert_eq!(st.mode, ComposerMode::Compose, "AutoArm through the gate");
+        assert!(st.want_focus, "grid had focus ⇒ editor takes it");
+        assert!(!st.episode_used, "a mint opens a fresh prompt episode");
+        // The armed cover blanks the latched row — the detection cell IS
+        // the prompt end.
+        assert_eq!(
+            cover_line_for(&st, &b, true, t1),
+            Some(b.cursor_line()),
+            "heuristic cell feeds the armed cover"
+        );
+        // ANY output byte after the mint tears the latch down…
+        b.advance_live(b"x");
+        assert!(!st.heur_live(&b), "output burst disarms instantly");
+        assert_eq!(cover_line_for(&st, &b, true, t1), None, "cover drops with it");
+        // …and the now-dirty row (`root@box:/# x`) must NOT re-arm even
+        // after a full quiet window: the classifier IS the clean check.
+        let t2 = t1 + HEUR_QUIET + Duration::from_millis(200);
+        st.tick(&b, &recs, true, true, t2);
+        assert!(!st.heur_live(&b), "dirty prompt never arms");
+        // A fresh CLEAN prompt row re-mints after quiet.
+        b.advance_live(b"\r\nroot@box:/# ");
+        let t3 = t2 + HEUR_QUIET + Duration::from_millis(500);
+        st.tick(&b, &recs, true, true, t3);
+        assert!(st.heur_live(&b), "fresh clean prompt re-mints");
+        // A tokened marker edge (the returning pre) ends the EPISODE, not
+        // just the latch — integration owns the prompt again.
+        st.on_stream_events(2, 1, t3);
+        assert!(!st.heur_live(&b));
+        assert!(!st.heur_episode, "marker edge closes the episode");
+        assert!(st.at_prompt_latched(), "the real latch takes over");
+
+        // Scope pin (the false-positive killer): the SAME grid state under
+        // an ordinary busy command must never run the detector — `cargo
+        // build` stalling ≥300ms with a `#`-tailed row is not our episode.
+        let (b2, mut st2, _, t0b) = heur_episode_setup();
+        let busy = vec![BlockRec {
+            epoch: 1,
+            n: 0,
+            cmd: "cargo build".into(),
+            cwd: None,
+            exit: None,
+            started_ms: 0,
+            ended_ms: None,
+            start_off: 0,
+            end_off: None,
+            truncated: false,
+        }];
+        let t1b = t0b + HEUR_QUIET + Duration::from_millis(100);
+        st2.tick(&b2, &busy, true, true, t1b);
+        assert!(
+            !st2.heur_live(&b2),
+            "detection is scoped to classified nested-shell episodes"
+        );
+        assert_eq!(st2.mode, ComposerMode::Raw(RawReason::Busy));
+    }
+
+    /// D2 submissions ride the Cmd-family synthetic-block ledger: dispatch
+    /// in a heuristic episode sets `pending_submit_cmd` (zero PTY bytes from
+    /// the GUI), pins the SubmitHold at the heuristic cell, and opens a
+    /// HEURISTIC post-submit window; multi-line drafts are refused back to
+    /// the visible draft; spacers stay honest bare-`\r` Input with no record
+    /// and no hold.
+    #[test]
+    fn heur_submit_routes_ledger() {
+        let (b, mut st, recs, t0) = heur_episode_setup();
+        let t1 = t0 + HEUR_QUIET + Duration::from_millis(100);
+        st.tick(&b, &recs, true, true, t1);
+        assert_eq!(st.mode, ComposerMode::Compose);
+        let cover = cover_line_for(&st, &b, true, t1);
+        assert!(cover.is_some());
+        let heur_col = b.cursor_col();
+
+        // Multi-line: refused back to the draft — nothing fires uninspected.
+        let (bytes, spacer) = st.dispatch_submission(&b, cover, None, "a\nb", t1);
+        assert!(bytes.is_empty() && !spacer);
+        assert_eq!(st.draft, "a\nb", "multi-line restored to the visible draft");
+        assert!(st.take_submit_cmd().is_none());
+        assert!(st.post_submit.is_none(), "no window for a refused dispatch");
+        st.draft.clear();
+
+        // Single line: the ledger lane.
+        let (bytes, spacer) = st.dispatch_submission(&b, cover, Some("/"), "whoami", t1);
+        assert!(bytes.is_empty(), "GUI ships zero PTY bytes — the daemon writes");
+        assert!(!spacer);
+        assert_eq!(st.take_submit_cmd().as_deref(), Some("whoami"));
+        let h = st.submit_hold.as_ref().expect("hold pinned");
+        assert_eq!(h.line, cover.unwrap(), "hold pinned at the heuristic row");
+        assert_eq!(h.col, heur_col, "hold column = the latched cursor cell");
+        let w = st.post_submit.expect("window open");
+        assert!(w.heur, "the window resolves heuristically");
+        assert_eq!(st.mode, ComposerMode::Compose, "submit never yields raw");
+
+        // Spacer: plain `\r` Input — no record, no hold (no pre geometry
+        // exists to heal the row it leaves behind; raw is honest).
+        st.submit_hold = None;
+        let (bytes, spacer) = st.dispatch_submission(&b, cover, None, "", t1);
+        assert_eq!(bytes, b"\r");
+        assert!(spacer);
+        assert!(st.take_submit_cmd().is_none(), "a blank line is not a command");
+        assert!(st.submit_hold.is_none());
+    }
+
+    /// D2 post-submit window: resolves on the FRESH heuristic latch (draft
+    /// kept, Compose held); the integrated 300ms threshold must NOT fire
+    /// mid-episode; with no fresh latch by HEUR_FLUSH the buffer flushes in
+    /// order as type-ahead and the composer yields Raw(Busy).
+    #[test]
+    fn heur_post_submit_resolution() {
+        let (mut b, mut st, recs, t0) = heur_episode_setup();
+        let t1 = t0 + HEUR_QUIET + Duration::from_millis(100);
+        st.tick(&b, &recs, true, true, t1);
+        let cover = cover_line_for(&st, &b, true, t1);
+        let _ = st.dispatch_submission(&b, cover, None, "whoami", t1);
+        assert!(st.post_submit.is_some());
+        // Echo + output land (no prompt yet): the latch tears down.
+        b.advance_live(b"whoami\r\nroot\r\n");
+        assert!(!st.heur_live(&b));
+        // Type-ahead into the next command buffers in the editor.
+        st.draft = "id".into();
+        // 350ms after dispatch — past the INTEGRATED threshold: the
+        // heuristic window must hold (300ms would always lose to the
+        // echo+output+quiet cycle a fresh latch needs).
+        st.tick(&b, &recs, true, true, t1 + Duration::from_millis(350));
+        assert_eq!(st.mode, ComposerMode::Compose);
+        assert!(st.post_submit.is_some(), "heuristic window outlives 300ms");
+        assert_eq!(st.draft, "id");
+        // The fresh nested prompt paints; quiet elapses; the fresh latch
+        // resolves the window — draft kept, Compose held, no bytes fired.
+        b.advance_live(b"root@box:/# ");
+        let t2 = t1 + Duration::from_millis(800);
+        st.tick(&b, &recs, true, true, t2);
+        assert!(st.heur_live(&b));
+        assert!(st.post_submit.is_none(), "fresh latch closes the window");
+        assert_eq!(st.mode, ComposerMode::Compose);
+        assert_eq!(st.draft, "id", "draft survives the resolution");
+        assert!(st.take_pending_clear().is_none(), "nothing flushed");
+
+        // Flush branch: no fresh latch by HEUR_FLUSH ⇒ ordered type-ahead
+        // flush, editor yields Raw(Busy) — the honest long-running story.
+        let (mut b, mut st, recs, t0) = heur_episode_setup();
+        let t1 = t0 + HEUR_QUIET + Duration::from_millis(100);
+        st.tick(&b, &recs, true, true, t1);
+        let cover = cover_line_for(&st, &b, true, t1);
+        let _ = st.dispatch_submission(&b, cover, None, "sleep 100", t1);
+        b.advance_live(b"sleep 100\r\n"); // echo, then silence — no prompt
+        st.draft = "id2".into();
+        st.tick(&b, &recs, true, true, t1 + HEUR_FLUSH + Duration::from_millis(10));
+        assert_eq!(st.mode, ComposerMode::Raw(RawReason::Busy));
+        assert_eq!(
+            st.take_pending_clear().as_deref(),
+            Some(b"id2".as_slice()),
+            "buffered typing flushes in order as shell type-ahead"
+        );
+    }
+
+    /// D2 hand-back (extends `nested_shell_reattach`): a heuristic-armed
+    /// Compose survives the `exit` transition WITHOUT a mode flap — the
+    /// returning tokened pre clears the heuristic state, the real latch +
+    /// 133;B recapture take over the same event, and the gate stays AutoArm
+    /// continuity through the still-open rec (F7).
+    #[test]
+    fn heur_handback() {
+        let (mut b, mut st, recs, t0) = heur_episode_setup();
+        let t1 = t0 + HEUR_QUIET + Duration::from_millis(100);
+        st.tick(&b, &recs, true, true, t1);
+        assert_eq!(st.mode, ComposerMode::Compose);
+        st.has_focus = true;
+        // `exit`: echo/output, then the login shell's tokened pre + prompt
+        // + 133;B — the bug D re-attach shape.
+        b.advance_live(b"exit\r\n");
+        let mut frame = hook_bytes("pre", r#"{"e":0,"n":3,"d":"C:"}"#);
+        frame.extend_from_slice(b"PS C:\\> ");
+        frame.extend_from_slice(b"\x1b]133;B\x07");
+        b.advance_live(&frame);
+        let t2 = t1 + Duration::from_millis(50);
+        pump_counters(&mut st, &b, t2);
+        assert!(!st.heur_episode, "the pre edge closes the episode");
+        assert!(!st.heur_live(&b));
+        assert!(st.at_prompt_latched(), "the real latch takes over");
+        assert_eq!(
+            st.mode,
+            ComposerMode::Compose,
+            "no mode flap through the hand-back"
+        );
+        // Gate continuity: the rec may still read open (Blocks round-trip
+        // in flight) — F7 keeps the composer armed; the recaptured 133;B
+        // certifies the cursor again.
+        assert!(b.cursor_at_prompt_end());
+        st.tick(&b, &recs, true, true, t2 + Duration::from_millis(16));
+        assert_eq!(st.mode, ComposerMode::Compose);
+    }
+
+    /// D2 end-to-end through the REAL `show()` path (headless egui, real
+    /// RawInput events — the Bug C test pattern): at a heuristically armed
+    /// composer, typed keys land in the DRAFT with zero PTY bytes, and
+    /// Enter dispatches through the SubmitCommand ledger outbox — the exact
+    /// production route central.rs drains into `send_cmd_submission`.
+    #[test]
+    fn show_heur_types_and_submits() {
+        let (b, mut st, recs, t0) = heur_episode_setup();
+        let t1 = t0 + HEUR_QUIET + Duration::from_millis(100);
+        st.tick(&b, &recs, true, true, t1);
+        assert_eq!(st.mode, ComposerMode::Compose);
+
+        let ctx = egui::Context::default();
+        let strip = Rect::from_min_max(Pos2::new(0.0, 564.0), Pos2::new(800.0, 600.0));
+        let grid = Rect::from_min_max(Pos2::ZERO, Pos2::new(800.0, 564.0));
+        let frame = |st: &mut ComposerState, events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_max(
+                    Pos2::ZERO,
+                    Pos2::new(800.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let mut out = None;
+            let _ = ctx.run_ui(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    out = Some(show(
+                        ui,
+                        strip,
+                        grid,
+                        Uuid::nil(),
+                        st,
+                        &b,
+                        &recs,
+                        1,
+                        true,
+                        false,
+                        FontId::monospace(13.0),
+                        None,
+                        None,
+                    ));
+                });
+            });
+            let o = out.unwrap();
+            st.has_focus = o.has_focus; // the app's per-frame sync
+            o
+        };
+        // Frame 1: the armed editor takes egui focus.
+        let o = frame(&mut st, vec![]);
+        assert!(o.has_focus, "armed editor must hold focus");
+        // Frame 2: typing lands in the draft — ZERO bytes reach the PTY.
+        let o = frame(&mut st, vec![egui::Event::Text("whoami".into())]);
+        assert!(o.write.is_empty(), "keystrokes never go raw while armed");
+        assert_eq!(st.draft, "whoami");
+        // Frame 3: Enter submits through the ledger lane.
+        let o = frame(
+            &mut st,
+            vec![egui::Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        assert!(
+            o.write.is_empty(),
+            "heuristic submissions ship zero GUI bytes — the daemon writes"
+        );
+        assert_eq!(st.take_submit_cmd().as_deref(), Some("whoami"));
+        assert!(st.draft.is_empty());
+        assert!(st.buffering(), "post-submit typeahead window opened");
+    }
+
+    /// D2 honest-degradation pin: no ^C is EVER fired at a heuristically
+    /// detected prompt. A yielded episode (Esc) re-arms through ❯ Compose
+    /// silently — activate() must neither chord nor reclaim (there is no
+    /// 133;B capture to certify against); and the used episode never
+    /// auto-re-arms to fight the user for focus.
+    #[test]
+    fn heur_activate_never_chords() {
+        let (b, mut st, recs, t0) = heur_episode_setup();
+        let t1 = t0 + HEUR_QUIET + Duration::from_millis(100);
+        st.tick(&b, &recs, true, true, t1);
+        assert_eq!(st.mode, ComposerMode::Compose);
+        // The user yields to the grid: episode consumed, latch kept.
+        st.blur_to_grid();
+        assert_eq!(st.mode, ComposerMode::Raw(RawReason::UserRaw));
+        assert!(st.episode_used);
+        st.tick(&b, &recs, true, true, t1 + Duration::from_millis(16));
+        assert_eq!(
+            st.mode,
+            ComposerMode::Raw(RawReason::UserRaw),
+            "a used episode must not auto-re-arm (D7)"
+        );
+        // ManualOnly ❯ Compose click: arms silently.
+        assert!(!b.cursor_at_prompt_end(), "no 133;B certainty exists here");
+        let bytes = st.activate(&b);
+        assert!(bytes.is_empty(), "never a chord at an uncertain prompt");
+        assert_eq!(st.mode, ComposerMode::Compose);
+        assert!(st.draft.is_empty(), "nothing reclaimed");
     }
 
     /// v0.1.1 (the wrong-capture `^C`-spam loop breaker): the activation

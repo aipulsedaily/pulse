@@ -953,6 +953,47 @@ impl TermBackend {
         self.row_prefix_text(cur.line.0, cur.column.0)
     }
 
+    /// D2 heuristic prompt detection: the cursor row's prefix (same contract
+    /// as `cursor_row_text`) plus the COLUMN GAP — how many cells the cursor
+    /// sits past the trimmed text (a prompt's trailing space ⇒ 1; 0 for
+    /// no-space prompts; large ⇒ the cursor was parked away from the text by
+    /// a full-screen paint / column alignment, not a prompt tail). Sibling of
+    /// `row_prefix_text`: NULs read as spaces, wide-char spacers skipped, so
+    /// the gap counts rendered cells of trailing whitespace.
+    pub fn cursor_prefix_gap(&self) -> (String, usize) {
+        let cur = self.term.grid().cursor.point;
+        let grid = self.term.grid();
+        let cols = self.size.cols as usize;
+        let row = &grid[Line(cur.line.0)];
+        let mut s = String::with_capacity(cur.column.0.min(cols));
+        for c in 0..cur.column.0.min(cols) {
+            let cell = &row[Column(c)];
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            s.push(if cell.c == '\0' { ' ' } else { cell.c });
+        }
+        let total = s.chars().count();
+        let t = s.trim_end();
+        let gap = total - t.chars().count();
+        (t.to_string(), gap)
+    }
+
+    /// The cursor's grid column (cell space). D2: the heuristic prompt
+    /// latch's anchor — with no 133;B in a markerless nested shell, the
+    /// cursor cell itself IS the prompt-end surrogate.
+    pub fn cursor_col(&self) -> usize {
+        self.term.grid().cursor.point.column.0
+    }
+
+    /// Instant of the last LIVE output frame (advance_live), if any — the
+    /// D2 heuristic latch's output-quiet clock (300ms of silence before a
+    /// prompt-shaped cursor row may arm). Replay/reconstruction feeds
+    /// (`advance`) deliberately don't stamp it: quiet is a LIVE property.
+    pub fn last_output_at(&self) -> Option<std::time::Instant> {
+        self.last_output_at
+    }
+
     /// Freshest feed-time cwd (the last `pre` hook payload that carried
     /// one). The lane label prefers this over Snapshot meta — it updates the
     /// frame the fresh prompt renders instead of waiting for a broadcast.
