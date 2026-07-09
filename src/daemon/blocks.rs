@@ -375,6 +375,15 @@ pub struct BlockStore {
     /// written); this proves the shell actually ran it. Runtime truth only:
     /// never persisted to the sidecar, reset on every launch() rotation.
     pub hooks_live: bool,
+    /// D2: the currently open block was opened SYNTHETICALLY (SubmitCommand
+    /// lane — no exec hook exists where it ran: cmd.exe, or a heuristic
+    /// nested-shell episode). The closing `pre` then closes it with
+    /// `exit = None` REGARDLESS of payload: in a nested episode the login
+    /// shell's returning pre carries the OUTER command's exit (`sudo su`'s
+    /// 0), which must never be misattributed to the last inner command. No
+    /// behavior change for cmd (its static pre is already `e:null`). Runtime
+    /// truth only — never persisted; cleared by hook-opened blocks.
+    pub synthetic_open: bool,
 }
 
 /// Sidecar file body: everything a restart needs to rehydrate.
@@ -421,6 +430,7 @@ impl BlockStore {
             open: None,
             last_cwd: None,
             hooks_live: false,
+            synthetic_open: false,
         }
     }
 
@@ -462,6 +472,7 @@ impl BlockStore {
         self.epoch += 1;
         self.token = token;
         self.hooks_live = false;
+        self.synthetic_open = false;
     }
 
     /// Atomic tmp+rename write (same pattern as SharedState::save), so a
@@ -511,8 +522,11 @@ impl BlockStore {
 
     /// Open a new block. Returns the indices of changed records (a dangling
     /// open block is closed with exit=None at the new block's offset first —
-    /// two exec without an intervening pre).
+    /// two exec without an intervening pre). Hook-opened by default: a real
+    /// exec hook proves the shell can announce boundaries again, so the
+    /// synthetic flag clears (D2).
     pub fn open_block(&mut self, cmd: String, start_off: u64, now_ms: u64) -> Vec<usize> {
+        self.synthetic_open = false;
         let mut changed = Vec::new();
         if let Some(idx) = self.open.take() {
             if let Some(r) = self.recs.get_mut(idx) {
@@ -548,8 +562,20 @@ impl BlockStore {
         changed
     }
 
+    /// D2: open a SYNTHETIC block (the SubmitCommand lane) — `open_block`
+    /// plus the flag that makes the closing pre honest about exit codes
+    /// (see `synthetic_open`).
+    pub fn open_block_synthetic(&mut self, cmd: String, start_off: u64, now_ms: u64) -> Vec<usize> {
+        let changed = self.open_block(cmd, start_off, now_ms);
+        self.synthetic_open = true;
+        changed
+    }
+
     /// A prompt hook: refreshes cwd, and if a block is open, closes it.
-    /// Returns the changed index, if any.
+    /// Returns the changed index, if any. A synthetic-opened block closes
+    /// with `exit = None` regardless of payload (D2 misattribution guard —
+    /// the pre that closes the LAST inner command of a nested-shell episode
+    /// is the login shell's, carrying the OUTER command's exit).
     pub fn on_pre(
         &mut self,
         exit: Option<i64>,
@@ -562,8 +588,9 @@ impl BlockStore {
             self.last_cwd = Some(PathBuf::from(cwd));
         }
         let idx = self.open.take()?;
+        let synth = std::mem::take(&mut self.synthetic_open);
         let r = self.recs.get_mut(idx)?;
-        r.exit = exit;
+        r.exit = if synth { None } else { exit };
         r.n = n;
         r.end_off = Some(end_off);
         r.ended_ms = Some(now_ms);
@@ -575,6 +602,7 @@ impl BlockStore {
     /// the truth is the session never reported one.
     pub fn close_dangling(&mut self, end_off: u64, now_ms: u64) -> Vec<usize> {
         self.open = None;
+        self.synthetic_open = false;
         let mut changed = Vec::new();
         for (i, r) in self.recs.iter_mut().enumerate() {
             if r.end_off.is_none() {
@@ -880,6 +908,7 @@ mod tests {
             open: Some(2),
             last_cwd: None,
             hooks_live: false,
+            synthetic_open: false,
         };
         st.evict(100);
         assert_eq!(st.base, 100);
@@ -906,6 +935,7 @@ mod tests {
             open: None,
             last_cwd: None,
             hooks_live: false,
+            synthetic_open: false,
         };
         st.open_block("first".into(), 10, 1);
         let changed = st.open_block("second".into(), 90, 2);
@@ -920,6 +950,41 @@ mod tests {
         // A pre with no open block just refreshes cwd.
         assert_eq!(st.on_pre(Some(0), 8, "C:\\x".into(), 300, 4), None);
         assert_eq!(st.last_cwd.as_deref(), Some(std::path::Path::new("C:\\x")));
+    }
+
+    /// D2 misattribution guard: a SYNTHETIC-opened block (SubmitCommand lane
+    /// — heuristic nested-shell episode, or cmd) closes with `exit = None`
+    /// regardless of the closing pre's payload: the pre that ends a nested
+    /// episode is the LOGIN shell's, carrying the OUTER command's exit
+    /// (`sudo su`'s 0), which must never stamp the last inner command.
+    /// Hook-opened blocks (a real exec) keep taking the real exit — including
+    /// one that dangling-closes a synthetic predecessor.
+    #[test]
+    fn synthetic_close_exit_none() {
+        let mut st = BlockStore::load(Uuid::new_v4()); // no sidecar
+        st.rotate(TOK.into());
+        // Inner command via the synthetic lane; the returning login-shell
+        // pre carries exit 0 (sudo su's) — the rec must close exit None.
+        st.open_block_synthetic("whoami".into(), 100, 1);
+        assert_eq!(st.on_pre(Some(0), 7, "/root".into(), 200, 2), Some(0));
+        assert_eq!(st.recs[0].exit, None, "outer exit must not misattribute");
+        assert_eq!(st.recs[0].end_off, Some(200));
+        // Integration is back: a hook-opened block takes its real exit.
+        st.open_block("false".into(), 300, 3);
+        assert_eq!(st.on_pre(Some(1), 8, "/root".into(), 400, 4), Some(1));
+        assert_eq!(st.recs[1].exit, Some(1), "hook-opened keeps the real exit");
+        // A hook exec dangling-closing a synthetic predecessor CLEARS the
+        // flag: the successor's pre stamps its real exit again.
+        st.open_block_synthetic("inner".into(), 500, 5);
+        st.open_block("outer".into(), 600, 6);
+        assert_eq!(st.recs[2].end_off, Some(600), "dangling close at successor");
+        assert_eq!(st.recs[2].exit, None);
+        assert_eq!(st.on_pre(Some(9), 9, String::new(), 700, 7), Some(3));
+        assert_eq!(st.recs[3].exit, Some(9), "hook open cleared the flag");
+        // close_dangling resets the flag too (launch rotation / exit).
+        st.open_block_synthetic("dangler".into(), 800, 8);
+        st.close_dangling(900, 9);
+        assert!(!st.synthetic_open);
     }
 
     /// P5 §15 hooks_live_lifecycle: load ⇒ false; a token-checked event sets
@@ -954,6 +1019,7 @@ mod tests {
             open: None,
             last_cwd: None,
             hooks_live: false,
+            synthetic_open: false,
         };
         st.open_block("ok".into(), 100, 1);
         st.on_pre(Some(0), 1, String::new(), 900, 2);

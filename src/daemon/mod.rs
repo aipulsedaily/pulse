@@ -2941,7 +2941,10 @@ impl Core {
             // cmd's static pre carries no cwd payload; last_cwd is kept fresh
             // from the adjacent OSC 9;9 (on_block_event's fill). Fall back to
             // the session's OSC cwd if no pre has landed yet this spawn.
-            let changed = store.open_block(cmd, at_off, now_ms());
+            // D2: SYNTHETIC open — the closing pre stamps exit None
+            // regardless of payload (a nested episode's returning login-shell
+            // pre carries the OUTER command's exit; misattribution guard).
+            let changed = store.open_block_synthetic(cmd, at_off, now_ms());
             let recs: Vec<_> = changed
                 .into_iter()
                 .filter_map(|i| store.recs.get(i).cloned())

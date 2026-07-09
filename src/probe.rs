@@ -5558,16 +5558,22 @@ fn case_wsl_composer_semantics() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Bug D pin `wsl_nested_shell` (option c — the recovery path): a plain
-/// nested `bash` is the SAME signal class as `sudo su` over ssh (staging-
-/// proven, no root needed in CI) — the integration is process-local to the
-/// outer shell, so the nested episode produces no hook events. Asserts the
-/// full episode contract: the `bash` rec stays open (the honest raw-shell
-/// lane's feed) while inner commands mint NO blocks and no prompt certifies;
-/// `exit` closes the rec with bash's real exit code and the prompt
-/// re-certifies immediately (Wait{Prompt} resolves on the open rec closing —
-/// the composer's F7 re-attach signal); one more command then forms and
-/// closes a normal block — full machinery recovered, zero re-arm code.
+/// Bug D pin `wsl_nested_shell` (option c — the recovery path), extended by
+/// D2 (the heuristic composer's submission lane): a plain nested `bash` is
+/// the SAME signal class as `sudo su` over ssh (staging-proven, no root
+/// needed in CI) — the integration is process-local to the outer shell, so
+/// the nested episode produces no hook events. Asserts the full episode
+/// contract: the `bash` rec stays open (the honest raw-shell lane's feed)
+/// while RAW-typed inner commands mint NO blocks and no prompt certifies;
+/// D2 submissions ride SubmitCommand{write:true} — the daemon writes the
+/// bytes and records synthetic inner recs (open at the pre-write head,
+/// closed by the next submission, exit None throughout — including the LAST
+/// one, which the returning login-shell pre must close WITHOUT stamping the
+/// outer command's exit on it); the outer rec dangles closed at the first
+/// inner submit; after `exit` the prompt re-certifies immediately
+/// (Wait{Prompt} resolves — the composer's F7 re-attach signal) and one
+/// more command forms and closes a normal hook block with a REAL exit code
+/// — full machinery recovered, zero re-arm code.
 fn case_wsl_nested_shell() -> anyhow::Result<()> {
     let Some(distro) = wsl_probe_distro() else {
         return Err(skip("no WSL distro in the Lxss registry".into()));
@@ -5606,9 +5612,9 @@ fn case_wsl_nested_shell() -> anyhow::Result<()> {
         "the nested-shell classifier must match the rec cmd"
     );
 
-    // Inside the nested shell: commands run but there are no hooks — no new
-    // rec may appear, and no prompt may certify (the composer's gate feed
-    // stays Blocked all visit).
+    // Inside the nested shell: RAW-typed commands run but there are no
+    // hooks — no rec may appear for them, and no prompt may certify (the
+    // composer's daemon-side gate feed stays uncertified all visit).
     c.send(&C2D::Input {
         id,
         bytes: b"echo tc-nested-marker\r".to_vec(),
@@ -5620,25 +5626,101 @@ fn case_wsl_nested_shell() -> anyhow::Result<()> {
         "no prompt may certify inside the hookless nested shell"
     );
 
-    // `exit`: the OUTER shell's PROMPT_COMMAND fires again — the pre closes
-    // the `bash` rec with its real exit code and re-latches the prompt.
+    // D2: the heuristic composer SUBMITS in the nested shell through the
+    // Cmd-family SubmitCommand{write:true} lane — the daemon writes the
+    // bytes (bracketed-paste aware off its mirror) and opens a synthetic
+    // rec at the pre-write journal head. The first inner submission
+    // dangling-closes the outer `bash` rec (exit None at the inner start —
+    // its exit can no longer be attributed once inner recs exist).
+    c.send(&C2D::SubmitCommand {
+        id,
+        cmd: "echo tc-heur-inner".into(),
+        write: true,
+    })?;
+    let recs = c.await_blocks(id, 30, |recs| {
+        recs.iter().any(|r| r.cmd.contains("tc-heur-inner"))
+    })?;
+    let bash_rec = recs.iter().find(|r| r.start_off == bash_off).unwrap();
+    anyhow::ensure!(
+        bash_rec.end_off.is_some(),
+        "the outer rec must dangling-close at the first inner submission"
+    );
+    anyhow::ensure!(
+        bash_rec.exit.is_none(),
+        "the dangled outer rec closes exit None (honest), got {:?}",
+        bash_rec.exit
+    );
+    let inner1 = recs
+        .iter()
+        .find(|r| r.cmd.contains("tc-heur-inner"))
+        .unwrap();
+    anyhow::ensure!(
+        inner1.start_off >= bash_rec.end_off.unwrap(),
+        "the inner rec opens at the pre-write head, at/after the outer close"
+    );
+    anyhow::ensure!(
+        inner1.end_off.is_none(),
+        "the inner rec stays open until the next boundary"
+    );
+    let inner1_off = inner1.start_off;
+    // The command actually RAN: its echoed output lands inside the rec.
+    std::thread::sleep(Duration::from_millis(1200));
+    // A second submission closes the first at its own pre-write head —
+    // output attribution: everything between two submissions belongs to
+    // the earlier one; exit stays None (no marker can prove it).
+    c.send(&C2D::SubmitCommand {
+        id,
+        cmd: "echo tc-heur-inner2".into(),
+        write: true,
+    })?;
+    let recs = c.await_blocks(id, 30, |recs| {
+        recs.iter()
+            .any(|r| r.start_off == inner1_off && r.end_off.is_some())
+    })?;
+    let inner1 = recs.iter().find(|r| r.start_off == inner1_off).unwrap();
+    anyhow::ensure!(
+        inner1.exit.is_none(),
+        "inner recs carry exit None (honest degradation), got {:?}",
+        inner1.exit
+    );
+    c.send(&C2D::BlockText {
+        id,
+        start_off: inner1_off,
+    })?;
+    let (text, _) = c.await_block_text(id, inner1_off, 15)?;
+    anyhow::ensure!(
+        text.contains("tc-heur-inner"),
+        "the submitted inner command must have run: {text:?}"
+    );
+    let inner2_off = recs
+        .iter()
+        .find(|r| r.cmd.contains("tc-heur-inner2"))
+        .map(|r| r.start_off)
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(800));
+
+    // `exit`: the OUTER shell's PROMPT_COMMAND fires again — the returning
+    // tokened pre closes the LAST inner rec. It carries `bash`'s real exit
+    // code (0), which belongs to the OUTER command — the D2 daemon flag
+    // must keep it off the inner rec (exit None, no misattribution).
     c.send(&C2D::Input {
         id,
         bytes: b"exit\r".to_vec(),
     })?;
     let recs = c.await_blocks(id, 30, |recs| {
         recs.iter()
-            .any(|r| r.start_off == bash_off && r.end_off.is_some())
+            .any(|r| r.start_off == inner2_off && r.end_off.is_some())
     })?;
-    let bash_rec = recs.iter().find(|r| r.start_off == bash_off).unwrap();
+    let inner2 = recs.iter().find(|r| r.start_off == inner2_off).unwrap();
     anyhow::ensure!(
-        bash_rec.exit == Some(0),
-        "nested bash must close with its real exit code, got {:?}",
-        bash_rec.exit
+        inner2.exit.is_none(),
+        "the returning pre must NOT misattribute the outer exit to the last \
+         inner command, got {:?}",
+        inner2.exit
     );
     anyhow::ensure!(
         recs.iter().all(|r| !r.cmd.contains("tc-nested-marker")),
-        "a command inside the hookless nested shell minted a block: {:?}",
+        "a RAW-typed command inside the hookless nested shell minted a block: {:?}",
         recs.iter().map(|r| &r.cmd).collect::<Vec<_>>()
     );
     // The prompt re-certifies immediately (Wait{Prompt} resolves once no
