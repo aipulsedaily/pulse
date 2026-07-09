@@ -97,6 +97,9 @@ impl App {
                     .show(ui, |ui| {
                         ui.add_space(4.0);
                         self.sidebar_tree(ui);
+                        // Bug B: edge-band autoscroll keeps off-screen drop
+                        // targets reachable while a drag is armed.
+                        self.drag_autoscroll(ui);
                     });
             });
 
@@ -300,7 +303,7 @@ impl App {
             let any_asleep = terms
                 .iter()
                 .any(|t| presented_status(t.status, t.asleep) == PresentedStatus::Asleep);
-            let (resp, action) = self.folder_row(ui, folder, terms.len(), asleep_n);
+            let (resp, action) = self.folder_row(ui, folder, terms.len(), asleep_n, gi);
             match action {
                 FolderAction::Delete => {
                     self.modal = Some(Modal::ConfirmDeleteFolder(folder.id));
@@ -382,12 +385,39 @@ impl App {
             ui.add_space(2.0);
         }
 
-        if !rows.loose.is_empty() {
+        // Bug B: while a TERMINAL drag is armed the UNGROUPED section is
+        // always revealed (TEXT_FAINT when it holds no rows — signal, not
+        // decoration) and registers as a drop band, so a terminal can
+        // always be dragged out of every folder.
+        let term_drag = matches!(
+            &self.drag,
+            Some(d) if matches!(d.payload, DragPayload::Term { .. })
+        );
+        if !rows.loose.is_empty() || (term_drag && !rows.folders.is_empty()) {
             if !rows.folders.is_empty() {
-                section_header(ui, "UNGROUPED");
+                let col = if rows.loose.is_empty() { TEXT_FAINT } else { TEXT_MUTED };
+                let hdr = section_header_col(ui, "UNGROUPED", col);
+                if term_drag {
+                    self.drop_rows.push(DropRow::LooseZone { rect: hdr });
+                }
             }
             for (i, t) in rows.loose.iter().enumerate() {
                 self.terminal_row(ui, t, None, i);
+            }
+        }
+        // Bug B: the empty tail below the last row is a "move out of
+        // folders" band too — a release there used to cancel silently.
+        if term_drag {
+            let top = ui.cursor().top();
+            let bottom = ui.clip_rect().bottom();
+            if bottom - top > 6.0 {
+                let x = ui.max_rect().x_range();
+                self.drop_rows.push(DropRow::LooseZone {
+                    rect: Rect::from_min_max(
+                        Pos2::new(x.min, top),
+                        Pos2::new(x.max, bottom),
+                    ),
+                });
             }
         }
 
@@ -411,19 +441,41 @@ impl App {
     /// Folder row (D21): painted rotating chevron, name, count. No status dot.
     /// Clicking the chevron zone collapses; clicking the name opens the folder
     /// dashboard (V-C); hover reveals ✕ (delete) and ✏ (inline rename, §5.4).
-    /// A drag hovering the row is a move-into target (§5.5).
+    /// A terminal drag hovering the row is a move-into target (§5.5); the row
+    /// itself arms a folder-reorder drag (Bug B). `gi` is the painted folder
+    /// ordinal (order-sorted).
     pub(super) fn folder_row(
         &mut self,
         ui: &mut egui::Ui,
         folder: &crate::state::Folder,
         count: usize,
         asleep_n: usize,
+        gi: usize,
     ) -> (egui::Response, FolderAction) {
         let (rect, resp) = ui.allocate_exact_size(
             Vec2::new(ui.available_width(), 30.0),
-            Sense::click(),
+            Sense::click_and_drag(),
         );
+        // Drag arming (Bug B, §5.5 grammar): egui's decided-drag threshold
+        // (~6px of travel) keeps clicks, the chevron/✕/✏ zones, and context
+        // menus unaffected. Ghost = dot-less "name · count".
+        if resp.drag_started() && self.drag.is_none() && self.renaming.is_none() {
+            let grab = resp
+                .interact_pointer_pos()
+                .map(|p| p - rect.min)
+                .unwrap_or(Vec2::new(20.0, 15.0));
+            self.drag = Some(DragState {
+                payload: DragPayload::Folder { id: folder.id },
+                name: format!("{} \u{b7} {}", folder.name, count),
+                dot: TEXT_MUTED,
+                grab,
+            });
+        }
         let dragging = self.drag.is_some();
+        let drag_source = matches!(
+            &self.drag,
+            Some(DragState { payload: DragPayload::Folder { id }, .. }) if *id == folder.id
+        );
         let t = ui.ctx().animate_bool_with_time(
             resp.id,
             resp.hovered() && !dragging,
@@ -533,10 +585,17 @@ impl App {
                 );
             }
         }
-        // Drop-slot map (§5.5): the whole folder row is a move-into target
-        // (collapsed or not).
+        // Drop-slot map (§5.5): for terminal drags the whole folder row is a
+        // move-into target (collapsed or not); for folder drags it splits at
+        // the midline into reorder slots (Bug B) — `slot_hit` picks per
+        // payload.
         if dragging {
-            self.drop_rows.push(DropRow::Folder { rect, id: folder.id });
+            self.drop_rows.push(DropRow::Folder { rect, id: folder.id, idx: gi });
+        }
+        // Source folder dims like source terminal rows while its ghost
+        // rides the pointer (Bug B).
+        if drag_source {
+            painter.rect_filled(rect, CornerRadius::same(6), BG_SIDEBAR_LIFT.gamma_multiply(0.6));
         }
         let action = if resp.clicked() {
             match resp.interact_pointer_pos() {
@@ -597,15 +656,17 @@ impl App {
                 Activity::Idle | Activity::Asleep | Activity::Dead => TEXT_MUTED,
             };
             self.drag = Some(DragState {
-                id: t.id,
-                from: t.folder,
+                payload: DragPayload::Term { id: t.id, from: t.folder },
                 name: t.name.clone(),
                 dot,
                 grab,
             });
         }
         let dragging = self.drag.is_some();
-        let drag_source = self.drag.as_ref().is_some_and(|d| d.id == t.id);
+        let drag_source = matches!(
+            &self.drag,
+            Some(DragState { payload: DragPayload::Term { id, .. }, .. }) if *id == t.id
+        );
 
         let hover_t = ui.ctx().animate_bool_with_time(
             resp.id,
