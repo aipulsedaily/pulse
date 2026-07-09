@@ -1,6 +1,6 @@
 [package]
 name = "pulse"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "Pulse: persistent terminal manager for Windows — daemon-owned ConPTY sessions, journaled scrollback, terminals that survive reboots"
 license = "MIT OR Apache-2.0"
