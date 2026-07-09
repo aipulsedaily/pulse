@@ -248,6 +248,91 @@ pub(crate) fn detect_auth_prompt(row: &str) -> AuthPrompt {
     AuthPrompt::None
 }
 
+/// Bug D (`sudo su` composer honesty): does this open block's command spawn
+/// a NESTED INTERACTIVE SHELL? The integration is process-local to the login
+/// shell (delivered via one-shot `--rcfile`), so `sudo su` / `su` / a plain
+/// nested `bash` produce NO hook events: the block rec stays open for the
+/// whole episode and nothing is "running" — the user is at a raw shell. The
+/// Busy lane's pulsing dot + forever-counting elapsed is the wrong story;
+/// this classifier picks the honest one. Render-only and conservative by
+/// design: a false negative degrades to today's Busy row, a false positive
+/// still shows a true statement ("typing goes to the terminal"). The gate,
+/// cover, and daemon never read it. v2 candidates (same table, deliberately
+/// out of v1): `ssh <dest>` with no command operand, `docker exec -it …`,
+/// `wsl`, `nix shell`.
+pub(crate) fn nested_shell_cmd(cmd: &str) -> bool {
+    let argv: Vec<&str> = cmd.split_whitespace().collect();
+    nested_shell_argv(&argv)
+}
+
+fn nested_shell_argv(argv: &[&str]) -> bool {
+    let Some(first) = argv.first() else {
+        return false;
+    };
+    // argv[0] stem: last path component, extension dropped (same shape as
+    // tracker::analyze_cmdline — works for "/usr/bin/bash" and bare "bash").
+    let stem = first
+        .rsplit(['/', '\\'])
+        .next()
+        .map(|c| c.strip_suffix(".exe").unwrap_or(c).to_ascii_lowercase())
+        .unwrap_or_default();
+    match stem.as_str() {
+        // su/login: non-flag operands are USERNAMES (`su - root`) — still an
+        // interactive shell; only an explicit -c command makes it finite.
+        "su" | "login" => !argv[1..]
+            .iter()
+            .any(|a| *a == "-c" || a.starts_with("--command")),
+        // Shells: interactive unless a -c command or a script/stdin operand
+        // follows (`bash -l` yes; `bash -c …` / `bash script.sh` / `bash -`
+        // no). A flag-value miss (`bash --rcfile x`) reads x as an operand
+        // and returns false — conservative, degrades to the Busy row.
+        "bash" | "zsh" | "sh" | "dash" | "fish" | "ksh" => !argv[1..]
+            .iter()
+            .any(|a| *a == "-c" || *a == "-" || !a.starts_with('-')),
+        // sudo: -i/-s mean "give me a shell" outright; otherwise skip sudo's
+        // own flags (value-consuming ones eat their operand) and classify
+        // the wrapped command. Bare `sudo` prints usage — false.
+        "sudo" => {
+            let mut i = 1;
+            while i < argv.len() {
+                match argv[i] {
+                    "-i" | "--login" | "-s" | "--shell" => return true,
+                    // Value-consuming short flags (sudo 1.9 table).
+                    "-u" | "-g" | "-U" | "-h" | "-p" | "-C" | "-D" | "-R" | "-T" | "-r"
+                    | "-t" | "-B" => i += 2,
+                    "--" => return nested_shell_argv(&argv[i + 1..]),
+                    a if a.starts_with('-') => i += 1, // -E, -H, -n, --user=x, -uroot
+                    _ => return nested_shell_argv(&argv[i..]),
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Which line the honest raw-shell lane shows, read from the grid CURSOR row
+/// only (render-only, same contract as the pre-shell labels: a miss degrades
+/// to the generic line, never a wrong cover — and `Password:` text sitting
+/// in mid-scrollback output can never select the lock line because it is
+/// simply never passed in).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum NestedShellLine {
+    /// `[sudo] password for alice:` / `Password:` at the cursor — echo is
+    /// off; keys go straight to the shell.
+    Password,
+    /// The generic honest statement: no integration here, typing is raw.
+    Generic,
+}
+
+pub(crate) fn nested_shell_line(cursor_row: &str) -> NestedShellLine {
+    if detect_auth_prompt(cursor_row) == AuthPrompt::Password {
+        NestedShellLine::Password
+    } else {
+        NestedShellLine::Generic
+    }
+}
+
 /// Submission encoding (§4.1): byte-identical to paste-then-Enter. Bracketed
 /// iff the shell requested DECSET 2004 (PSReadLine 2.0 on PS 5.1 never does —
 /// unconditional brackets would leak literal `ESC[200~` into its buffer);
@@ -2713,6 +2798,66 @@ pub fn show(
                         ui.ctx().request_repaint_after(d);
                     }
                 }
+                LaneContent::Busy if open_rec.is_some_and(|r| nested_shell_cmd(&r.cmd)) => {
+                    // Bug D: the open block is a NESTED SHELL episode
+                    // (`sudo su`, `su`, plain `bash`, …) — no hooks exist in
+                    // that shell, the rec stays open the whole visit, and
+                    // NOTHING is running: the user is at a raw prompt. The
+                    // pulsing-dot + forever-counting elapsed lane told the
+                    // wrong story ("sudo su · 1h 02m"); this one is honest.
+                    // Render-only: the gate stays Blocked(Busy) (typing must
+                    // go raw), the cover stays absent (drop-don't-drift),
+                    // and the daemon is untouched — `exit` re-attaches via
+                    // the ordinary pre edge + F7 override, no re-arm code.
+                    // The password sub-case reads the CURSOR row only (the
+                    // pre-shell lock-line contract): a miss degrades to the
+                    // generic line. No timers, no repaint asks — the row
+                    // text only changes with output, which repaints anyway.
+                    let rec = open_rec.expect("guard matched Some");
+                    let icon_c = Pos2::new(lane_x + 6.0, strip_rect.center().y);
+                    match nested_shell_line(&backend.cursor_row_text()) {
+                        NestedShellLine::Password => {
+                            draw_lock(&painter, icon_c, super::TEXT_FAINT);
+                            painter.text(
+                                Pos2::new(lane_x + 20.0, strip_rect.center().y),
+                                Align2::LEFT_CENTER,
+                                "password \u{2014} keys go straight to the shell, \
+                                 never shown or stored",
+                                FontId::proportional(12.0),
+                                super::TEXT_SECONDARY,
+                            );
+                        }
+                        NestedShellLine::Generic => {
+                            draw_keyboard(&painter, icon_c, super::TEXT_FAINT);
+                            let cmd = super::middle_ellipsize(
+                                &rec.cmd.replace(['\r', '\n'], " "),
+                                24,
+                            );
+                            let g = painter.layout_no_wrap(
+                                cmd,
+                                FontId::monospace(12.0),
+                                super::TEXT_SECONDARY,
+                            );
+                            let cw = g.size().x;
+                            painter.galley(
+                                Pos2::new(
+                                    lane_x + 20.0,
+                                    strip_rect.center().y - g.size().y / 2.0,
+                                ),
+                                g,
+                                super::TEXT_SECONDARY,
+                            );
+                            painter.text(
+                                Pos2::new(lane_x + 26.0 + cw, strip_rect.center().y),
+                                Align2::LEFT_CENTER,
+                                "\u{2014} no Pulse integration in this shell; \
+                                 typing goes to the terminal",
+                                FontId::proportional(12.0),
+                                super::TEXT_FAINT,
+                            );
+                        }
+                    }
+                }
                 LaneContent::Busy => {
                     if let Some(rec) = open_rec {
                         // Pulsing dot + running command + live elapsed. The
@@ -3365,6 +3510,135 @@ mod tests {
             "a bare trailing colon without a secret keyword"
         );
         assert_eq!(detect_auth_prompt(""), None);
+    }
+
+    /// Bug D: the nested-shell classifier truth table (§4.1 of the research
+    /// doc) — both directions. The table is deliberately conservative: a
+    /// false negative degrades to the Busy row, never a wrong statement.
+    #[test]
+    fn nested_shell_cmd_truth_table() {
+        // Shell spawners — the honest raw-shell lane.
+        for cmd in [
+            "sudo su",
+            "sudo su -",
+            "sudo su - root",
+            "sudo -i",
+            "sudo -s",
+            "sudo --login",
+            "sudo bash",
+            "sudo -u root bash",
+            "sudo -E -H zsh",
+            "sudo -- su -",
+            "su",
+            "su -",
+            "su - root",
+            "su root",
+            "login",
+            "bash",
+            "bash -l",
+            "bash -i",
+            "zsh -l",
+            "sh",
+            "dash",
+            "fish",
+            "ksh",
+            "/usr/bin/bash",
+            "/bin/su -",
+            "  bash  ",
+        ] {
+            assert!(nested_shell_cmd(cmd), "{cmd:?} must classify nested");
+        }
+        // Finite commands / lookalikes — today's Busy row stays.
+        for cmd in [
+            "sudo apt install x",
+            "sudo systemctl restart nginx",
+            "sudo vim /etc/sudoers",
+            "sudo",
+            "suite",
+            "visudo",
+            "sushi",
+            "bashful",
+            "echo bash",
+            "ssh host uptime",
+            "ssh devbox",
+            "bash -c 'sleep 5'",
+            "sh -c ls",
+            "bash script.sh",
+            "bash -",
+            "su -c whoami root",
+            "sudo bash -c 'apt update'",
+            "cat",
+            "python3",
+            "",
+        ] {
+            assert!(!nested_shell_cmd(cmd), "{cmd:?} must NOT classify nested");
+        }
+    }
+
+    /// Bug D: the raw-shell lane's password sub-case reads the CURSOR row
+    /// only — `[sudo] password for alice:` at the cursor selects the lock
+    /// line; a root prompt (or any non-password cursor row, even with
+    /// `Password:` sitting in mid-scrollback output that is never passed in)
+    /// selects the generic honest line.
+    #[test]
+    fn nested_shell_lane_line() {
+        use NestedShellLine::*;
+        assert_eq!(nested_shell_line("[sudo] password for alice: "), Password);
+        assert_eq!(nested_shell_line("Password:"), Password);
+        assert_eq!(nested_shell_line("root@devbox:/home/alice# "), Generic);
+        assert_eq!(nested_shell_line("cat password.txt"), Generic);
+        assert_eq!(nested_shell_line(""), Generic);
+    }
+
+    /// Bug D option (c) pin — nested-shell episode and re-attach, the exact
+    /// sequence staging proved: armed → exec edge (`sudo su` submitted)
+    /// drops the latch and goes Raw(Busy); the whole root-shell episode
+    /// (many frames, hook counters frozen, rec never closes — its close
+    /// signal IS the next tokened pre) holds Blocked(Busy); the `exit` pre
+    /// edge re-latches and the F7 open-block override unblocks the gate the
+    /// SAME event, even while the rec's Blocks-close round-trip is still in
+    /// flight. A future gate/latch refactor that breaks the recovery path
+    /// breaks this test.
+    #[test]
+    fn nested_shell_reattach() {
+        let now = Instant::now();
+        let mut st = ComposerState::default();
+        // Mirror gate_inputs' F7 formula: a live latch overrules an open rec.
+        let gi = |st: &ComposerState, open_rec: bool| GateInputs {
+            hooked: true,
+            running: true,
+            alt: false,
+            mouse: false,
+            open_block: open_rec && !st.at_prompt_latched(),
+            at_prompt: st.at_prompt_latched(),
+            settled: st.at_prompt_latched(),
+            cursor_clean: true,
+            episode_used: st.episode_used,
+            asleep: false,
+        };
+        // Hooked prompt: pre edge latches, gate arms.
+        st.on_stream_events(1, 0, now);
+        assert!(st.at_prompt_latched());
+        assert_eq!(gate(&gi(&st, false)), GateVerdict::AutoArm);
+        // `sudo su` submitted: exec edge — latch drops, mode Raw(Busy).
+        st.on_stream_events(1, 1, now);
+        assert!(!st.at_prompt_latched());
+        assert_eq!(st.mode, ComposerMode::Raw(RawReason::Busy));
+        // The nested-shell episode: output flows but the hook counters never
+        // move (no hooks in that shell) and the rec stays open — the gate
+        // must hold Blocked(Busy) for the whole visit (typing goes raw).
+        for _ in 0..10 {
+            st.on_stream_events(1, 1, now); // unchanged counters: no edges
+            assert!(!st.at_prompt_latched());
+            assert_eq!(gate(&gi(&st, true)), GateVerdict::Blocked(RawReason::Busy));
+        }
+        // `exit`: the login shell repaints its prompt → tokened pre edge.
+        // Latch live; the F7 override unblocks the gate the same frame even
+        // though the rec still reads open (Blocks round-trip in flight).
+        st.on_stream_events(2, 1, now);
+        assert!(st.at_prompt_latched());
+        assert!(!st.episode_used, "pre edge resets the episode");
+        assert_eq!(gate(&gi(&st, true)), GateVerdict::AutoArm);
     }
 
     /// v0.1.1 (the wrong-capture `^C`-spam loop breaker): the activation

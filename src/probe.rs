@@ -5511,6 +5511,113 @@ fn case_wsl_composer_semantics() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Bug D pin `wsl_nested_shell` (option c — the recovery path): a plain
+/// nested `bash` is the SAME signal class as `sudo su` over ssh (staging-
+/// proven, no root needed in CI) — the integration is process-local to the
+/// outer shell, so the nested episode produces no hook events. Asserts the
+/// full episode contract: the `bash` rec stays open (the honest raw-shell
+/// lane's feed) while inner commands mint NO blocks and no prompt certifies;
+/// `exit` closes the rec with bash's real exit code and the prompt
+/// re-certifies immediately (Wait{Prompt} resolves on the open rec closing —
+/// the composer's F7 re-attach signal); one more command then forms and
+/// closes a normal block — full machinery recovered, zero re-arm code.
+fn case_wsl_nested_shell() -> anyhow::Result<()> {
+    let Some(distro) = wsl_probe_distro() else {
+        return Err(skip("no WSL distro in the Lxss registry".into()));
+    };
+    let log0 = daemon_log_len();
+    let master = master_token()?;
+    let mut c = Conn::open()?;
+    let _ = c.first_snapshot()?;
+    let id = create_wsl_terminal(&mut c, "__probe_wsl_nested__", &distro)?;
+    c.send(&C2D::Attach { id, cols: 120, rows: 30 })?;
+    let mut ctl = Conn::open_ctl(&master, None)?;
+    let mut rid = 4300u64;
+    await_hooked_prompt(&mut ctl, &mut rid, id, 90)?;
+    std::thread::sleep(Duration::from_millis(400));
+
+    // Enter a nested interactive bash: the outer shell's DEBUG trap opens a
+    // rec for it — and that rec must NOT close (its close signal is the next
+    // tokened pre, which cannot arrive while we live inside the hookless
+    // nested shell).
+    c.send(&C2D::Input {
+        id,
+        bytes: b"bash\r".to_vec(),
+    })?;
+    let recs = c.await_blocks(id, 30, |recs| {
+        recs.iter().any(|r| r.cmd.trim() == "bash" && r.end_off.is_none())
+    })?;
+    let bash_off = recs
+        .iter()
+        .find(|r| r.cmd.trim() == "bash")
+        .map(|r| r.start_off)
+        .unwrap();
+    // The GUI-side classifier agrees this episode gets the honest raw-shell
+    // lane, not the forever-counting Busy row (Bug D option a).
+    anyhow::ensure!(
+        crate::gui::composer::nested_shell_cmd("bash"),
+        "the nested-shell classifier must match the rec cmd"
+    );
+
+    // Inside the nested shell: commands run but there are no hooks — no new
+    // rec may appear, and no prompt may certify (the composer's gate feed
+    // stays Blocked all visit).
+    c.send(&C2D::Input {
+        id,
+        bytes: b"echo tc-nested-marker\r".to_vec(),
+    })?;
+    std::thread::sleep(Duration::from_millis(1500));
+    let (at_in, _clean) = attach_prompt_state(id, 120, 30)?;
+    anyhow::ensure!(
+        !at_in,
+        "no prompt may certify inside the hookless nested shell"
+    );
+
+    // `exit`: the OUTER shell's PROMPT_COMMAND fires again — the pre closes
+    // the `bash` rec with its real exit code and re-latches the prompt.
+    c.send(&C2D::Input {
+        id,
+        bytes: b"exit\r".to_vec(),
+    })?;
+    let recs = c.await_blocks(id, 30, |recs| {
+        recs.iter()
+            .any(|r| r.start_off == bash_off && r.end_off.is_some())
+    })?;
+    let bash_rec = recs.iter().find(|r| r.start_off == bash_off).unwrap();
+    anyhow::ensure!(
+        bash_rec.exit == Some(0),
+        "nested bash must close with its real exit code, got {:?}",
+        bash_rec.exit
+    );
+    anyhow::ensure!(
+        recs.iter().all(|r| !r.cmd.contains("tc-nested-marker")),
+        "a command inside the hookless nested shell minted a block: {:?}",
+        recs.iter().map(|r| &r.cmd).collect::<Vec<_>>()
+    );
+    // The prompt re-certifies immediately (Wait{Prompt} resolves once no
+    // rec is open — the same signal the composer re-arms on).
+    await_hooked_prompt(&mut ctl, &mut rid, id, 30)?;
+
+    // Full recovery: the next command forms and closes a normal block.
+    c.send(&C2D::Input {
+        id,
+        bytes: b"echo tc-after-return\r".to_vec(),
+    })?;
+    let recs = c.await_blocks(id, 30, |recs| {
+        recs.iter()
+            .any(|r| r.cmd.contains("tc-after-return") && r.end_off.is_some())
+    })?;
+    let after = recs
+        .iter()
+        .find(|r| r.cmd.contains("tc-after-return"))
+        .unwrap();
+    anyhow::ensure!(after.exit == Some(0), "post-return exit {:?}", after.exit);
+
+    ensure_no_new_panics(log0)?;
+    delete_terminal(&mut c, id);
+    Ok(())
+}
+
 /// v0.1.1 `wsl_hostile_prompt_command` (the Arch/systemd-257 phantom-block
 /// class, reproduced on the default distro — CI never needs Arch): a foreign
 /// PROMPT_COMMAND element appended at RUNTIME lands AFTER `__tc_arm` in the
@@ -8768,6 +8875,7 @@ pub fn run(case: Option<&str>) -> anyhow::Result<()> {
         ("ctl_read", case_ctl_read),
         ("wsl_hooks", case_wsl_hooks),
         ("wsl_composer_semantics", case_wsl_composer_semantics),
+        ("wsl_nested_shell", case_wsl_nested_shell),
         ("wsl_hostile_prompt_command", case_wsl_hostile_prompt_command),
         ("wsl_restore", case_wsl_restore),
         ("cmd_hooks", case_cmd_hooks),
