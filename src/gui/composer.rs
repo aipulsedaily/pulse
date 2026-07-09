@@ -310,6 +310,27 @@ fn keystroke_bytes(s: &str) -> String {
     s.replace("\r\n", "\r").replace('\n', "\r")
 }
 
+/// Clipboard → draft normalization (Bug E): CRLF/CR become LF, control
+/// characters strip (same policy as submission's sanitize_paste), and
+/// TRAILING newlines trim — a copied line's trailing \n must not flip the
+/// lane editor into the upward multi-line popup. Interior newlines are
+/// preserved (real multi-line pastes still grow the editor upward).
+pub(crate) fn normalize_paste_text(s: &str) -> String {
+    let s = crate::strip::sanitize_paste(s); // keeps \r \n \t, strips ESC/C0/C1
+    s.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .trim_end_matches('\n')
+        .to_string()
+}
+
+/// How many rows the draft editor needs (Bug E belt): rows come from the
+/// TRIMMED content so a trailing-newline-only draft can never open the
+/// upward popup even if a future entry point forgets to normalize. The
+/// draft content itself is untouched.
+pub(crate) fn editor_rows(draft: &str) -> usize {
+    draft.trim_end_matches('\n').split('\n').count().max(1)
+}
+
 /// The click-gated clear chord (§4.2): Ctrl+C = PSReadLine `CancelLine`, the
 /// only edit-mode-independent line-kill (Escape is a meta prefix in Emacs
 /// mode and enters command mode in Vi mode — catastrophic before a paste).
@@ -1094,10 +1115,14 @@ impl ComposerState {
     /// post-submit buffering (the draft is live). Pointer-never-disarms:
     /// no episode consumed, no mode change.
     pub fn insert_dropped_text(&mut self, s: &str) {
+        // Bug E: menu-Paste / middle-click deliver clipboard text verbatim —
+        // normalize exactly like Ctrl+V so a trailing CRLF can't pop the
+        // multi-line editor. Drop-built inserts are already newline-free.
+        let s = normalize_paste_text(s);
         if !self.draft.is_empty() && !self.draft.ends_with(char::is_whitespace) {
             self.draft.push(' ');
         }
-        self.draft.push_str(s);
+        self.draft.push_str(&s);
         self.caret_to_end = true;
         self.recall = None; // an edit-equivalent: any recall walk resets
     }
@@ -2220,6 +2245,27 @@ pub fn show(
                 }
             }
 
+            // Normalize pasted text BEFORE the TextEdit sees it (Bug E):
+            // Windows clipboard text arrives verbatim (CRLF + trailing
+            // newline survive the arboard→winit→egui chain, and multiline
+            // TextEdit inserts pastes unmodified), so a copied line's
+            // trailing \r\n used to flip the lane editor into the upward
+            // multi-line popup — the "floating band above the strip"
+            // artifact. Rewrite the Paste event in place: same
+            // consume-before-show pattern as Copy above, gated like Tab on
+            // !overlay_open (an overlay's own text field keeps native
+            // paste). Genuinely multi-line pastes keep their interior
+            // newlines and still open the popup.
+            if !overlay_open {
+                ui.input_mut(|i| {
+                    for e in &mut i.events {
+                        if let egui::Event::Paste(t) = e {
+                            *t = normalize_paste_text(t);
+                        }
+                    }
+                });
+            }
+
             // Consume keys BEFORE showing the TextEdit (standard egui
             // pattern): plain Enter submits (Shift+Enter passes through as a
             // newline); Arrow Up/Down recall history only at the draft's
@@ -2389,7 +2435,7 @@ pub fn show(
                 .as_ref()
                 .filter(|_| state.draft.is_empty())
                 .map(|h| h.ghost.lines().next().unwrap_or("").to_string());
-            let n_lines = state.draft.split('\n').count().max(1);
+            let n_lines = editor_rows(&state.draft);
             let resp = if n_lines > 1 {
                 let h = (n_lines.min(EDITOR_MAX_ROWS) as f32) * row_h + 12.0;
                 let h = h.min(grid_rect.height().max(row_h + 12.0));
@@ -4413,6 +4459,82 @@ mod tests {
         assert_eq!(out.iter().filter(|&&b| b == 0x1b).count(), 2);
         assert!(out.ends_with(b"\x1b[201~\r"));
         assert!(!submission_bytes(&plain, "x\x1by").contains(&0x1b));
+    }
+
+    /// Bug E: clipboard → draft normalization — CRLF/CR to LF, TRAILING
+    /// newlines trimmed (a copied line's trailing \n must not pop the
+    /// multi-line editor), interior newlines/blank lines preserved, tabs
+    /// kept, sanitize_paste's control-strip composed in, idempotent.
+    #[test]
+    fn normalize_paste_text_table() {
+        assert_eq!(normalize_paste_text("cmd\r\n"), "cmd");
+        assert_eq!(normalize_paste_text("a\r\nb\r\n"), "a\nb");
+        assert_eq!(normalize_paste_text("a\n\n"), "a");
+        assert_eq!(normalize_paste_text("a\rb\r"), "a\nb");
+        // Interior blank lines are real content — kept.
+        assert_eq!(normalize_paste_text("a\n\nb"), "a\n\nb");
+        // Tabs pass through (same policy as sanitize_paste).
+        assert_eq!(normalize_paste_text("a\tb"), "a\tb");
+        // Already-clean text is untouched.
+        assert_eq!(normalize_paste_text("plain single line"), "plain single line");
+        // Injection: sanitize_paste strips ESC/C0/C1 before the trim.
+        assert_eq!(normalize_paste_text("x\x1b[201~y\r\n"), "x[201~y");
+        // Idempotent.
+        for s in ["cmd\r\n", "a\r\nb\r\n", "a\n\nb", "x\x1b[201~y\r\n", ""] {
+            let once = normalize_paste_text(s);
+            assert_eq!(normalize_paste_text(&once), once);
+        }
+    }
+
+    /// Bug E: the popup trigger predicate — a normalized single-line paste
+    /// stays in the strip lane (1 row); genuine multi-line drafts grow the
+    /// upward editor with the right row count; trailing newlines never
+    /// count as rows even unnormalized (the belt at the trigger).
+    #[test]
+    fn editor_rows_trigger_predicate() {
+        assert_eq!(editor_rows(""), 1);
+        assert_eq!(editor_rows("sentence"), 1);
+        assert_eq!(editor_rows(&normalize_paste_text("sentence\r\n")), 1);
+        assert_eq!(editor_rows("a\nb"), 2);
+        assert_eq!(editor_rows("a\nb\nc"), 3);
+        assert_eq!(editor_rows(&normalize_paste_text("echo one\r\necho two\r\necho three\r\n")), 3);
+        // Belt: even an unnormalized trailing-newline draft can't pop it.
+        assert_eq!(editor_rows("sentence\n"), 1);
+        assert_eq!(editor_rows("\n\n"), 1);
+    }
+
+    /// Bug E: submission encoding is unchanged by entry-point normalization —
+    /// a normalized multi-line draft still emits one `\r` per line inside
+    /// the brackets, accept-`\r` outside.
+    #[test]
+    fn submission_bytes_of_normalized_draft() {
+        let plain = TermBackend::new(GridSize::default());
+        let mut bracketed = TermBackend::new(GridSize::default());
+        bracketed.advance(b"\x1b[?2004h");
+        let draft = normalize_paste_text("a\r\nb\r\n");
+        assert_eq!(draft, "a\nb");
+        assert_eq!(
+            submission_bytes(&bracketed, &draft),
+            b"\x1b[200~a\rb\x1b[201~\r".to_vec()
+        );
+        let single = normalize_paste_text("dir\r\n");
+        assert_eq!(single, "dir");
+        assert_eq!(submission_bytes(&plain, &single), b"dir\r");
+    }
+
+    /// Bug E: the routed-paste seam (menu-Paste / middle-click →
+    /// insert_dropped_text) normalizes exactly like Ctrl+V — trailing CRLF
+    /// trimmed so it can't pop the multi-line editor, interior newlines
+    /// kept.
+    #[test]
+    fn insert_dropped_text_normalizes_clipboard() {
+        let mut st = ComposerState::default();
+        st.insert_dropped_text("ls -la\r\n");
+        assert_eq!(st.draft, "ls -la");
+        assert_eq!(editor_rows(&st.draft), 1);
+        let mut st = ComposerState::default();
+        st.insert_dropped_text("a\r\nb\r\n");
+        assert_eq!(st.draft, "a\nb");
     }
 
     // ── Submit-window frame walk (the third flicker report — kill the
