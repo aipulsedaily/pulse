@@ -50,6 +50,16 @@ impl Default for GridSize {
     }
 }
 
+/// Per-row content fingerprint of a grid (see `TermBackend::grid_digest`) —
+/// the unread dot's acknowledgment baseline: "what the user last saw / acked".
+#[derive(Clone, Debug, PartialEq)]
+pub struct GridDigest {
+    /// Scrollback depth at capture: growth ⇒ rows scrolled off = new content.
+    pub history: usize,
+    /// One FNV-1a hash per visible row, top to bottom, chars only.
+    pub rows: Vec<u64>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum MouseButton {
     Left = 0,
@@ -1581,6 +1591,35 @@ impl TermBackend {
     /// The cursor's grid line (screen space, 0-based).
     pub fn cursor_line(&self) -> i32 {
         self.term.grid().cursor.point.line.0
+    }
+
+    /// Visible-content fingerprint for the unread ack machine (one hash per
+    /// visible row + the scrollback depth at capture). Hashes CHARACTERS
+    /// only: SGR/color churn, cursor moves, mode flips and title-only OSCs
+    /// leave the digest untouched, so `gui::unread_should_mark` can count
+    /// how many rows of TEXT actually changed since the acked baseline.
+    /// O(rows×cols) — called on settle/ack transitions, never per idle frame.
+    pub fn grid_digest(&self) -> GridDigest {
+        let grid = self.term.grid();
+        let rows = grid.screen_lines();
+        let cols = grid.columns();
+        let mut hashes = Vec::with_capacity(rows);
+        for line in 0..rows as i32 {
+            let row = &grid[Line(line)];
+            // FNV-1a over the row's chars (UTF-8 bytes).
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            let mut buf = [0u8; 4];
+            for c in 0..cols {
+                for b in row[Column(c)].c.encode_utf8(&mut buf).bytes() {
+                    h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);
+                }
+            }
+            hashes.push(h);
+        }
+        GridDigest {
+            history: grid.history_size(),
+            rows: hashes,
+        }
     }
 
     /// True when grid row `line` contains the characters of `expect` starting

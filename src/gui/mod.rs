@@ -205,6 +205,20 @@ const CLI_ATTENTION_QUIET: Duration = Duration::from_secs(3);
 /// attention episode: attach-resize conhost repaints and respawn banners
 /// would otherwise light every reopened CLI terminal amber at boot.
 const CLI_ATTACH_SUPPRESS: Duration = Duration::from_secs(5);
+/// Unread ack machine: a live-output episode on an unselected terminal only
+/// QUEUES an unread check; the verdict runs once the stream has been quiet
+/// this long, by comparing the grid against the acked baseline
+/// (`unread_should_mark`). Claude Code's idle status-row chrome (updater
+/// "Checking for updates" paint/erase, statusline timer digit ticks) repaints
+/// well inside this window, so a whole chrome burst is judged as ONE settled
+/// state — which restores the acked text and never marks.
+const UNREAD_SETTLE: Duration = Duration::from_secs(2);
+/// Rows of changed text required for a settled episode to mark unread.
+/// Status chrome (Claude's updater line, prompt-refreshers, progress bars)
+/// rewrites ONE row in place; user-relevant output lands on ≥2 rows (output
+/// line(s) + the next prompt) or scrolls rows into history (which marks via
+/// `GridDigest::history` growth regardless of this floor).
+const UNREAD_MIN_ROWS: usize = 2;
 /// SLEEP S7 (GUI mirror of the daemon's SLEEP_QUIET_MS): output within this
 /// window is busy evidence — the Sleep click gets a confirm modal instead
 /// of firing. Quiet alt-screen never gates (the idle claude REPL is the
@@ -633,6 +647,30 @@ struct ActivityState {
     /// session Reset and sleep/wake (both deliberate user acts). Starts
     /// armed so a genuinely-waiting prompt alerts once at boot.
     armed: bool,
+    /// Unread ack machine (accent-dot cousin of Bug A): live output on an
+    /// unselected terminal sets this instead of marking unread directly;
+    /// once the stream settles (UNREAD_SETTLE) the grid is compared against
+    /// `unread_base` and only a real text change marks. Invisible/chrome
+    /// bytes (title-only OSCs, cursor churn, paint-then-erase status lines)
+    /// therefore never light the dot.
+    unread_pending: bool,
+    /// Output arrived inside the attach/Reset suppression window (conhost
+    /// attach-resize repaints, respawn banners): the next settle ADOPTS the
+    /// grid as the new baseline without a verdict. Without this, the
+    /// suppressed repaint silently drifts the grid away from the
+    /// replay-seeded baseline and the FIRST real episode after boot would
+    /// inherit that diff and false-mark.
+    unread_adopt: bool,
+    /// The acked visible-content baseline: what the user last saw (refreshed
+    /// while the terminal is selected) or the last settled state already
+    /// judged (refreshed after every settle verdict, marking or not — chrome
+    /// drift like a ticking status timer never accumulates into a mark).
+    /// None until the attach Replay seeds it; a None baseline ADOPTS the
+    /// current grid without marking, so restore/Reset replay comes up quiet.
+    unread_base: Option<term_backend::GridDigest>,
+    /// `TermBackend::feed_gen` at the last baseline refresh — skips the
+    /// O(rows×cols) digest while the selected terminal is quiet.
+    unread_base_gen: u64,
 }
 
 impl ActivityState {
@@ -650,8 +688,38 @@ impl ActivityState {
             // over a fresh backend), so "now" is attach time.
             cli_suppress_until: Instant::now() + CLI_ATTACH_SUPPRESS,
             armed: true,
+            unread_pending: false,
+            unread_adopt: false,
+            unread_base: None,
+            unread_base_gen: u64::MAX,
         }
     }
+}
+
+/// Pure unread verdict (unit-tested): does the settled grid differ from the
+/// acked baseline in a USER-RELEVANT way? Marks on scrollback growth (rows
+/// scrolled off = new content the user hasn't seen) or on ≥ UNREAD_MIN_ROWS
+/// rows of changed text. Never marks with no baseline (post-attach/Reset
+/// adoption — boot comes up quiet) or across a resize (row-count mismatch:
+/// reflow moves every hash without any new output; the caller adopts).
+fn unread_should_mark(
+    base: Option<&term_backend::GridDigest>,
+    cur: &term_backend::GridDigest,
+) -> bool {
+    let Some(base) = base else { return false };
+    if base.rows.len() != cur.rows.len() {
+        return false;
+    }
+    if cur.history > base.history {
+        return true;
+    }
+    let changed = base
+        .rows
+        .iter()
+        .zip(&cur.rows)
+        .filter(|(a, b)| a != b)
+        .count();
+    changed >= UNREAD_MIN_ROWS
 }
 
 /// Pure per-frame dot rule (task #22, unit-tested): status + signals →
@@ -2422,6 +2490,17 @@ impl App {
                     if let Some(backend) = self.terms.get_mut(&id) {
                         let t0 = self.perf3.is_some().then(Instant::now);
                         backend.advance(&bytes);
+                        // Unread baseline: the reconstruction IS the acked
+                        // state — restore/boot replay must come up quiet, and
+                        // the first LIVE change afterwards is judged against
+                        // this real content instead of a blind adoption.
+                        let digest = backend.grid_digest();
+                        let gen = backend.feed_gen;
+                        let ast = self.activity.entry(id).or_insert_with(ActivityState::new);
+                        ast.unread_base = Some(digest);
+                        ast.unread_base_gen = gen;
+                        ast.unread_pending = false;
+                        ast.unread_adopt = false;
                         if let (Some(p), Some(t0)) = (&mut self.perf3, t0) {
                             let us = t0.elapsed().as_micros() as u64;
                             p.parse_us += us;
@@ -2477,17 +2556,22 @@ impl App {
                     {
                         st.on_stream_events(pre, exec, Instant::now());
                     }
-                    if selected != Some(id) {
-                        self.unread.insert(id);
-                    }
-                    // V-A: mark live output; count a new burst when output resumes
-                    // after a quiet gap and the terminal isn't being watched.
+                    // V-A / unread ack: live output on an unwatched terminal
+                    // only QUEUES an unread check — update_activity runs the
+                    // verdict once the stream settles (UNREAD_SETTLE) by
+                    // diffing the grid against the acked baseline, so chrome
+                    // bytes (Claude's updater status paint/erase, statusline
+                    // timer ticks, title-only OSCs, cursor churn) never light
+                    // the dot. Post-attach/Reset repaints share the CLI
+                    // suppression window: a boot repaint never even queues.
                     let now = Instant::now();
                     let st = self.activity.entry(id).or_insert_with(ActivityState::new);
-                    if selected != Some(id)
-                        && now.duration_since(st.last_output) > Duration::from_millis(400)
-                    {
-                        st.bursts = st.bursts.saturating_add(1);
+                    if selected != Some(id) {
+                        if now >= st.cli_suppress_until {
+                            st.unread_pending = true;
+                        } else {
+                            st.unread_adopt = true;
+                        }
                     }
                     st.last_output = now;
                     // task #22: live output arms a CLI streaming episode —
@@ -2557,6 +2641,14 @@ impl App {
                     let ast = self.activity.entry(id).or_insert_with(ActivityState::new);
                     ast.cli_suppress_until = Instant::now() + CLI_ATTACH_SUPPRESS;
                     ast.cli_stream = false;
+                    // Unread: the daemon rewrote this terminal's world — the
+                    // stale baseline names dead content. Drop it; the fresh
+                    // serialized Replay (following this Reset) re-seeds it,
+                    // so the restore never marks unread (post-update boots
+                    // come up with zero dots).
+                    ast.unread_base = None;
+                    ast.unread_pending = false;
+                    ast.unread_adopt = false;
                     // Bug A: a fresh session may alert once (respawn is a
                     // deliberate user act, like boot).
                     ast.armed = true;
@@ -3112,6 +3204,11 @@ impl App {
                 st.needs_you = false;
                 st.bursts = 0;
                 st.cli_stream = false;
+                // Unread queue dies with the rest of the attention surface;
+                // the baseline may go stale — wake respawns through Reset,
+                // which drops and re-seeds it.
+                st.unread_pending = false;
+                st.unread_adopt = false;
                 // Bug A: wake requires a deliberate user act, so a woken
                 // session behaves like a fresh one — may alert once.
                 st.armed = true;
@@ -3148,6 +3245,42 @@ impl App {
             }
             if !st.needs_you {
                 self.attention_flashed.remove(&id);
+            }
+            // Unread ack machine (accent dot, Bug A's step_attention pattern):
+            // selection continuously re-bases the digest — "I saw this" — so
+            // the ack survives any later chrome cycle; an unselected terminal
+            // with a queued episode gets ONE verdict once the stream settles.
+            // The baseline refreshes after every verdict, marking or not:
+            // chrome drift (a ticking status timer, paint/erase status text)
+            // never accumulates into a mark, and a real change marks exactly
+            // once until the user views it.
+            if selected == Some(id) {
+                st.unread_pending = false;
+                st.unread_adopt = false;
+                // Selection alone drops the flag (select_terminal's rule) —
+                // this also covers the apply_snapshot auto-select path that
+                // bypasses select_terminal (B1).
+                self.unread.remove(&id);
+                if st.unread_base.is_none() || st.unread_base_gen != backend.feed_gen {
+                    st.unread_base = Some(backend.grid_digest());
+                    st.unread_base_gen = backend.feed_gen;
+                }
+            } else if (st.unread_pending || st.unread_adopt) && quiet >= UNREAD_SETTLE {
+                // Suppressed-window output (attach repaint / respawn banner)
+                // re-bases without a verdict, even when later bytes also
+                // queued one — boot noise never marks (task-#22 precedent).
+                let adopt = st.unread_adopt;
+                st.unread_pending = false;
+                st.unread_adopt = false;
+                let cur = backend.grid_digest();
+                if !adopt && unread_should_mark(st.unread_base.as_ref(), &cur) {
+                    self.unread.insert(id);
+                    // Burst badge counts CONFIRMED content bursts only —
+                    // consistent with the dot it annotates.
+                    st.bursts = st.bursts.saturating_add(1);
+                }
+                st.unread_base = Some(cur);
+                st.unread_base_gen = backend.feed_gen;
             }
             match derive_activity(
                 t.status == TermStatus::Dead,
@@ -5596,7 +5729,11 @@ impl eframe::App for App {
             ctx.request_repaint_after(deadline.saturating_duration_since(Instant::now()));
         }
 
-        let focused = ctx.input(|i| i.focused);
+        // TC_DIAG_ASSUME_FOCUS (staging rigs): display-detached sessions
+        // never deliver WM_SETFOCUS, so the view-ack (selected AND focused)
+        // would be unreachable there — the knob stands in for focus exactly
+        // like it does for the PTY-resize gate. Never set in normal use.
+        let focused = ctx.input(|i| i.focused) || self.diag_assume_focus;
         self.update_activity(ctx, focused);
 
         // Idle heartbeat (R7): ping periodically to notice a dead daemon.
@@ -7007,6 +7144,100 @@ mod tests {
         st.armed = false;
         step_attention(&mut st, false, true, false, ms(0), false);
         assert!(!st.needs_you, "pill ack is durable, not a one-frame clear");
+    }
+
+    /// Unread ack machine: the pure verdict table (`unread_should_mark`).
+    /// No baseline adopts quietly (restore/Reset boots), identical grids and
+    /// single-row chrome drift never mark, ≥2 changed rows or scrollback
+    /// growth mark, resize (row-count mismatch) and scrollback clears adopt.
+    #[test]
+    fn unread_verdict_state_table() {
+        let d = |history, rows: Vec<u64>| term_backend::GridDigest { history, rows };
+        // Restore/Reset replay lands on a None baseline: adopt, never mark.
+        assert!(!unread_should_mark(None, &d(0, vec![1, 2, 3])));
+        // Identical settled grid (title-only OSC, cursor churn, keepalives,
+        // paint-then-erase status chrome): no mark.
+        assert!(!unread_should_mark(Some(&d(0, vec![1, 2, 3])), &d(0, vec![1, 2, 3])));
+        // One row of drift = status chrome (updater line, timer digits,
+        // progress bars, prompt refreshers): no mark.
+        assert!(!unread_should_mark(Some(&d(0, vec![1, 2, 3])), &d(0, vec![9, 2, 3])));
+        // Two rows of changed text = user-relevant output: mark.
+        assert!(unread_should_mark(Some(&d(0, vec![1, 2, 3])), &d(0, vec![9, 8, 3])));
+        // Scrollback growth = content the user never saw, even if the
+        // visible rows ended up identical: mark.
+        assert!(unread_should_mark(Some(&d(0, vec![1, 2, 3])), &d(5, vec![1, 2, 3])));
+        // Scrollback SHRINK (clear-scrollback / idle shrink): not new output.
+        assert!(!unread_should_mark(Some(&d(9, vec![1, 2, 3])), &d(3, vec![1, 2, 3])));
+        // Resize reflow moves every hash without any new output: adopt.
+        assert!(!unread_should_mark(Some(&d(0, vec![1, 2, 3])), &d(0, vec![9, 8, 7, 6])));
+    }
+
+    /// The Q1 root-cause bytes, replayed verbatim: idle Claude Code terminals
+    /// emit status-row chrome — auto-updater "Checking for updates ·"
+    /// paint/erase cycles and per-second statusline timer digit ticks
+    /// (captured from live journals, rows 47/49 of a 160-col session). A
+    /// whole settled chrome burst must never mark unread, ack must survive
+    /// further cycles, and REAL output must still mark.
+    #[test]
+    fn unread_chrome_replay_state_table() {
+        const CHROME_UPDATES: &[u8] = include_bytes!("testdata/chrome_updates.bin");
+        const CHROME_GOAL: &[u8] = include_bytes!("testdata/chrome_goal_tick.bin");
+        // Tall enough that the captured CUPs (rows 47-51 of the live
+        // sessions) land on their true rows instead of clamping onto each
+        // other at the grid's bottom edge.
+        let size = GridSize {
+            cols: 160,
+            rows: 60,
+            ..GridSize::default()
+        };
+        let mut b = TermBackend::new(size);
+        // A lived-in screen: prompt + prior output, plus ONE chrome cycle so
+        // the persistent statusline furniture ("⏵⏵ auto mode", the goal
+        // widget) is already painted — exactly what the user's acked screen
+        // shows before the next periodic burst arrives.
+        b.advance_live(b"PS C:\\Users\\zany> claude\r\n\r\nWelcome back.\r\n");
+        b.advance_live(CHROME_UPDATES);
+        b.advance_live(CHROME_GOAL);
+        let base = b.grid_digest();
+
+        // Updater chrome burst settles ⇒ no mark.
+        b.advance_live(CHROME_UPDATES);
+        assert!(
+            !unread_should_mark(Some(&base), &b.grid_digest()),
+            "updater status paint/erase must not mark unread"
+        );
+        // Statusline timer digit ticks ⇒ still no mark (same status row).
+        b.advance_live(CHROME_GOAL);
+        assert!(
+            !unread_should_mark(Some(&base), &b.grid_digest()),
+            "statusline timer ticks must not mark unread"
+        );
+
+        // Select clears durably: the view-ack re-bases, and ANOTHER full
+        // periodic cycle after the ack stays dark.
+        let acked = b.grid_digest();
+        b.advance_live(CHROME_UPDATES);
+        b.advance_live(CHROME_GOAL);
+        assert!(
+            !unread_should_mark(Some(&acked), &b.grid_digest()),
+            "ack must survive the next periodic chrome cycle"
+        );
+
+        // Real output (new text on ≥2 rows) marks.
+        let before = b.grid_digest();
+        b.advance_live(b"\x1b[10;1Herror: build failed\r\n\x1b[11;1H1 error emitted\r\n");
+        assert!(
+            unread_should_mark(Some(&before), &b.grid_digest()),
+            "real multi-row output must mark unread"
+        );
+
+        // Replay-style reconstruction into a fresh backend: baseline is
+        // seeded FROM the replayed grid (drain_ipc Replay arm), so the
+        // reconstruction itself never marks — post-update boots are quiet.
+        let mut fresh = TermBackend::new(size);
+        fresh.advance(b"PS C:\\Users\\zany> claude\r\n\r\nWelcome back.\r\n");
+        let seeded = fresh.grid_digest();
+        assert!(!unread_should_mark(Some(&seeded), &fresh.grid_digest()));
     }
 
     /// SLEEP §7.1: the presented-status → lifecycle-menu table. Running gets
