@@ -557,10 +557,11 @@ fn build_sidebar_rows(state: &SharedState, gen: u64) -> SidebarRows {
             terms
         })
         .collect();
+    let folder_ids: HashSet<Uuid> = folders.iter().map(|f| f.id).collect();
     let mut loose: Vec<_> = state
         .terminals
         .iter()
-        .filter(|t| t.folder.is_none() || !folders.iter().any(|f| Some(f.id) == t.folder))
+        .filter(|t| t.folder.is_none_or(|fid| !folder_ids.contains(&fid)))
         .cloned()
         .collect();
     loose.sort_by_key(|t| t.order);
@@ -3217,11 +3218,12 @@ impl App {
             in_folder.sort_by_key(|t| t.order);
             ids.extend(in_folder.iter().map(|t| t.id));
         }
+        let folder_ids: HashSet<Uuid> = folders.iter().map(|f| f.id).collect();
         let mut loose: Vec<_> = self
             .state
             .terminals
             .iter()
-            .filter(|t| t.folder.is_none() || !folders.iter().any(|f| Some(f.id) == t.folder))
+            .filter(|t| t.folder.is_none_or(|fid| !folder_ids.contains(&fid)))
             .collect();
         loose.sort_by_key(|t| t.order);
         ids.extend(loose.iter().map(|t| t.id));
