@@ -2069,7 +2069,10 @@ fn render(
                         Pos2::new(grid_rect.max.x - 20.0 - cw, sep_y - chh / 2.0),
                         Pos2::new(grid_rect.max.x - 20.0, sep_y + chh / 2.0),
                     );
-                    if chip.min.y >= grid_rect.min.y {
+                    // Whole-chip-or-nothing at BOTH edges: a block whose
+                    // anchor sits on the last visible row would otherwise
+                    // paint a half-cut chip against the view's bottom.
+                    if chip.min.y >= grid_rect.min.y && chip.max.y <= grid_rect.max.y {
                         chip_shapes.push(Shape::Rect(RectShape::filled(
                             chip,
                             CornerRadius::same(4),
