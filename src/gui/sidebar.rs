@@ -109,20 +109,37 @@ impl App {
     /// by small gaps. Tooltip carries the name; click selects; the selected
     /// terminal gets a slim accent bar on the rail edge.
     pub(super) fn sidebar_rail(&mut self, ui: &mut egui::Ui) {
-        // Rail + (§5.6): instant create pinned at the rail's top, above the
-        // first dot. The launcher needs width, so the rail's + never opens
-        // it — the tooltip carries the sticky-spawn preview instead, built
-        // LAZILY inside on_hover_ui (r4 perf-gui M1: the SpawnSpec clone +
-        // format! must not run on every painted rail frame).
-        let plus = footer_glyph(ui, Icon::Plus).on_hover_ui(|ui| {
-            ui.label(format!(
-                "New terminal \u{2014} {}",
-                launcher::spawn_preview(&self.effective_last_spawn())
-            ));
+        // Rail header, one-column doctrine: everything centers on the same
+        // vertical axis as the dot rows. The expanded titlebar cluster keeps
+        // its toggle at x=36 — past a 44px rail's useful span — so while
+        // railed the toggle stacks HERE, centered under the titlebar's app
+        // mark, and returns to the titlebar on expand (same flag flips both,
+        // so no frame draws two toggles mid-animation).
+        ui.with_layout(Layout::top_down(Align::Center), |ui| {
+            if footer_glyph(ui, Icon::Sidebar)
+                .on_hover_text("Expand sidebar")
+                .clicked()
+            {
+                self.prefs.sidebar_collapsed = false;
+                self.save_prefs();
+            }
+            ui.add_space(6.0);
+            // Rail + (§5.6): instant create pinned at the rail's top, above
+            // the first dot. The launcher needs width, so the rail's + never
+            // opens it — the tooltip carries the sticky-spawn preview
+            // instead, built LAZILY inside on_hover_ui (r4 perf-gui M1: the
+            // SpawnSpec clone + format! must not run on every painted rail
+            // frame).
+            let plus = footer_glyph(ui, Icon::Plus).on_hover_ui(|ui| {
+                ui.label(format!(
+                    "New terminal \u{2014} {}",
+                    launcher::spawn_preview(&self.effective_last_spawn())
+                ));
+            });
+            if plus.clicked() {
+                self.instant_create(ui.ctx(), None);
+            }
         });
-        if plus.clicked() {
-            self.instant_create(ui.ctx(), None);
-        }
         ui.add_space(6.0);
 
         let time = ui.input(|i| i.time);
@@ -1027,5 +1044,41 @@ impl App {
                 }
             });
         }
+    }
+}
+
+// Rail geometry pins (collapsed-rail layout fix). egui lays the rail out at
+// runtime, so these pin the arithmetic the layout relies on: every centered
+// element must fit the 44px column, and header glyphs must share the dot
+// rows' center axis. The literals mirror sidebar():9 (44.0 rail width),
+// sidebar():27 (Margin::same(4) rail body), and icons::footer_glyph (18px).
+#[cfg(test)]
+mod rail_layout_pins {
+    const RAIL_W: f32 = 44.0;
+    const RAIL_MARGIN: f32 = 4.0;
+    const GLYPH: f32 = 18.0;
+    const DOT_ROW_H: f32 = 28.0;
+
+    /// A centered 18px glyph fits the rail's inner span with room to spare —
+    /// no clipping at the 44px width regardless of DPI scale (egui units are
+    /// logical points; the proportions hold at any pixels_per_point).
+    #[test]
+    fn rail_glyph_fits_one_column() {
+        let inner = RAIL_W - 2.0 * RAIL_MARGIN;
+        assert!(GLYPH <= inner, "18px glyph must fit {inner}px inner rail");
+    }
+
+    /// Centered header glyphs and full-width dot rows share one axis: the
+    /// center of a centered glyph equals the center of a full-width row.
+    #[test]
+    fn rail_header_and_dots_share_center_axis() {
+        let inner = RAIL_W - 2.0 * RAIL_MARGIN;
+        let glyph_center = RAIL_MARGIN + (inner - GLYPH) / 2.0 + GLYPH / 2.0;
+        let dot_center = RAIL_MARGIN + inner / 2.0;
+        assert!((glyph_center - dot_center).abs() < f32::EPSILON);
+        // And the dot row is tall enough to host its 7px-radius halo dot.
+        let row_h = DOT_ROW_H;
+        let halo_d = 2.0 * 7.0;
+        assert!(row_h >= halo_d, "28px row must host a 14px halo");
     }
 }

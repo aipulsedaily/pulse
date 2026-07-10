@@ -4667,9 +4667,12 @@ impl App {
                 }
 
                 // App mark (glyph only; it carries the brand by itself and the
-                // row gets the wordmark's space back).
+                // row gets the wordmark's space back). Railed, it centers
+                // exactly over the 44px rail's glyph axis (x=22) so the
+                // collapsed column reads as one centered stack.
+                let mark_x = if self.prefs.sidebar_collapsed { 13.0 } else { 12.0 };
                 let gr = Rect::from_min_size(
-                    Pos2::new(rect.min.x + 12.0, rect.center().y - 9.0),
+                    Pos2::new(rect.min.x + mark_x, rect.center().y - 9.0),
                     Vec2::splat(18.0),
                 );
                 draw_icon(ui.painter(), gr, Icon::Terminal, ACCENT);
@@ -4823,15 +4826,16 @@ impl App {
                         .layout(Layout::left_to_right(Align::Center)),
                 );
                 lui.spacing_mut().item_spacing.x = 4.0;
-                if icon_button(&mut lui, Icon::Sidebar, false)
-                    .on_hover_text(if self.prefs.sidebar_collapsed {
-                        "Expand sidebar"
-                    } else {
-                        "Collapse sidebar"
-                    })
-                    .clicked()
+                // The toggle's x=36 slot straddles the 44px rail boundary, so
+                // while railed it lives in the rail itself (sidebar_rail's
+                // centered header stack); the titlebar hosts it only at full
+                // width. Same flag flips both sites — never two toggles.
+                if !self.prefs.sidebar_collapsed
+                    && icon_button(&mut lui, Icon::Sidebar, false)
+                        .on_hover_text("Collapse sidebar")
+                        .clicked()
                 {
-                    self.prefs.sidebar_collapsed = !self.prefs.sidebar_collapsed;
+                    self.prefs.sidebar_collapsed = true;
                     self.save_prefs();
                 }
 
