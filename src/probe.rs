@@ -66,6 +66,12 @@
 //!                 resized to the attacher BEFORE serialization, the
 //!                 restore-resync push is suppressed for proto-12 clients
 //!                 (Reset only; they re-attach) and kept for legacy ones
+//!   attach_alt_flood  pw1 attach lock-split coherence: attach a proto-12
+//!                 client to a live alt-screen TUI MID-FLOOD (the serialize
+//!                 runs outside the journal lock; hold 2 appends the raw
+//!                 ingest delta + StreamPos atomically) and pin the client
+//!                 reconstruction == daemon-mirror ReadScreen, every row +
+//!                 cursor + alt flag — a split gap/dup diverges them
 //!   compact_crash journal compaction is crash-atomic: flood past MAX_LEN,
 //!                 TerminateProcess the daemon right after the compaction,
 //!                 assert journal present (no remove+rename window), no .tmp
@@ -3782,6 +3788,253 @@ fn case_width_mismatch_replay() -> anyhow::Result<()> {
 
     ensure_no_new_panics(log0)?;
     delete_terminal(&mut c2, id);
+    Ok(())
+}
+
+/// pw1 attach lock-split coherence: attaching to a session LIVE on the alt
+/// screen WHILE it floods must reconstruct byte-coherent state. The split
+/// serializes the journal tail OUTSIDE the journal lock (hold 1 snapshots
+/// tail+offset, hold 2 appends the raw delta ingested in between and takes
+/// StreamPos atomically), so a split bug shows up here as a gapped or
+/// doubled stream: garbled counter rows, a wrong final row, or a cursor
+/// that disagrees with the daemon mirror. Pins client-reconstructed screen
+/// == daemon-mirror ReadScreen (all rows + cursor + alt flag) after
+/// Replay + delta + live Output settle, with the attach demonstrably
+/// landing mid-flood (live Output frames follow StreamPos).
+fn case_attach_alt_flood() -> anyhow::Result<()> {
+    use alacritty_terminal::grid::Dimensions;
+    use alacritty_terminal::index::{Column, Line};
+    use alacritty_terminal::term::{self, test::TermSize, Term, TermMode};
+
+    let log0 = daemon_log_len();
+    let master = master_token()?;
+    let mut c1 = Conn::open()?;
+    let _ = c1.first_snapshot()?;
+    let id = create_probe_terminal(&mut c1, "__probe_attach_alt_flood__")?;
+    c1.send(&C2D::Attach { id, cols: 120, rows: 40 })?;
+    c1.await_blocks(id, 10, |_| true)?;
+    let mut ctl = Conn::open_ctl(&master, None)?;
+    let mut rid = 7400u64;
+
+    // A synthetic TUI (temp script — no escape bytes survive prompt
+    // quoting): enter the alt screen, paint an SGR-dense prefill so the
+    // attach-time serialize has real work, then WAIT for a go-file, flood
+    // absolutely-addressed counter rows, stamp a done marker, park. The
+    // final screen is deterministic once quiet.
+    let go = std::env::temp_dir().join(format!("tc_probe_aaf_go_{id}"));
+    let _ = std::fs::remove_file(&go);
+    let script = std::env::temp_dir().join("tc_probe_attach_alt_flood.ps1");
+    std::fs::write(
+        &script,
+        format!(
+            concat!(
+                "$e=[char]27\n",
+                "[Console]::Write(\"$e[?1049h$e[2J$e[H\")\n",
+                "foreach ($i in 1..1200) {{\n",
+                "  $r = ($i % 36) + 2\n",
+                "  $k = ($i % 7) + 31\n",
+                "  [Console]::Write(\"$e[$r;1H$e[0;1;$($k)mPRE $('{{0:D6}}' -f $i) \" + ('p' * 80) + \"$e[0m\")\n",
+                "}}\n",
+                "[Console]::Write(\"$e[1;1HPREFILL_DONE\")\n",
+                "while (-not (Test-Path \"{go}\")) {{ Start-Sleep -Milliseconds 25 }}\n",
+                "foreach ($i in 1..6000) {{\n",
+                "  $r = ($i % 36) + 2\n",
+                "  $k = ($i % 7) + 31\n",
+                "  [Console]::Write(\"$e[$r;1H$e[0;1;$($k)mFLD $('{{0:D6}}' -f $i) \" + ('f' * 80) + \"$e[0m\")\n",
+                // Pace the flood to a multi-second window so the attach
+                // deterministically lands INSIDE it (an unpaced PS loop
+                // finishes in well under a second).
+                "  if ($i % 100 -eq 0) {{ Start-Sleep -Milliseconds 25 }}\n",
+                "}}\n",
+                "[Console]::Write(\"$e[40;1H$e[0mFLOOD_DONE_MARK\")\n",
+                "Start-Sleep 180\n",
+            ),
+            go = go.display()
+        ),
+    )?;
+    match ctl_run_retry(
+        &mut ctl,
+        &mut rid,
+        id,
+        &format!(
+            "powershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
+            script.display()
+        ),
+        None,
+        25,
+    )? {
+        CtlBody::RunStarted { .. } => {}
+        other => anyhow::bail!("TUI Run returned {other:?}"),
+    }
+    // Prefill painted, mirror on the alt screen.
+    {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            rid += 1;
+            let ready = match ctl.ctl(rid, CtlRequest::ReadScreen { id }, 10)? {
+                CtlBody::Screen { lines, alt_screen, .. } => {
+                    alt_screen && lines.iter().any(|l| l.contains("PREFILL_DONE"))
+                }
+                other => anyhow::bail!("ReadScreen returned {other:?}"),
+            };
+            if ready {
+                break;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "prefill never settled");
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+
+    // GO: start the flood, then attach mid-stream (the paced flood runs
+    // ≥1.5s; 300ms in it is solidly under way, so ingest keeps appending
+    // across the split's two lock holds).
+    std::fs::write(&go, b"go")?;
+    std::thread::sleep(Duration::from_millis(300));
+    let mut c2 = Conn::open_v2()?;
+    let _ = c2.first_snapshot()?;
+    c2.send(&C2D::Attach { id, cols: 120, rows: 40 })?;
+
+    // Ordered attach sequence, then live Output until the flood settles.
+    // `view` accumulates Replay + Output verbatim — parsing the
+    // concatenation reproduces exactly what the GUI's backend would hold.
+    let mut view: Vec<u8> = Vec::new();
+    let mut live_frames = 0usize;
+    {
+        let mut saw_replay = false;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            anyhow::ensure!(Instant::now() < deadline, "no attach Replay/StreamPos");
+            match c2.recv() {
+                Ok(D2C::Replay { id: rid2, bytes }) if rid2 == id => {
+                    anyhow::ensure!(
+                        memchr::memmem::find(&bytes, b"\x1b[?1049h").is_some(),
+                        "live-alt replay must enter the alternate screen"
+                    );
+                    view.extend_from_slice(&bytes);
+                    saw_replay = true;
+                }
+                Ok(D2C::StreamPos { id: rid2, .. }) if rid2 == id => {
+                    anyhow::ensure!(saw_replay, "StreamPos before the Replay");
+                    break;
+                }
+                Ok(D2C::Output { id: rid2, .. }) if rid2 == id => {
+                    anyhow::bail!("live Output before StreamPos on attach");
+                }
+                _ => {}
+            }
+        }
+    }
+    // Drain live output until FLOOD_DONE_MARK has been ingested, then until
+    // 700ms of silence (the parked script emits nothing more).
+    {
+        let mut stripper = AnsiStripper::default();
+        let mut pending = String::new();
+        let mut done = memchr::memmem::find(&view, b"FLOOD_DONE_MARK").is_some();
+        let mut last_data = Instant::now();
+        let deadline = Instant::now() + Duration::from_secs(90);
+        c2.stream.set_read_timeout(Some(Duration::from_millis(200)))?;
+        loop {
+            anyhow::ensure!(Instant::now() < deadline, "flood never settled");
+            match c2.recv() {
+                Ok(D2C::Output { id: rid2, bytes }) if rid2 == id => {
+                    live_frames += 1;
+                    stripper.feed(&bytes, &mut pending);
+                    view.extend_from_slice(&bytes);
+                    if pending.contains("FLOOD_DONE_MARK") {
+                        done = true;
+                    }
+                    if let Some(p) = pending.rfind('\n') {
+                        pending.drain(..=p);
+                    }
+                    last_data = Instant::now();
+                }
+                _ => {
+                    if done && last_data.elapsed() >= Duration::from_millis(700) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    anyhow::ensure!(
+        live_frames > 0,
+        "attach must land mid-flood (live Output after StreamPos) — the case \
+         exercises the delta path; got zero live frames"
+    );
+
+    // Client-side reconstruction: exactly the GUI's parse (fresh grid at
+    // the attach dims, one deterministic advance over Replay+Output).
+    let mut term = Term::new(
+        term::Config {
+            scrolling_history: 10_000,
+            ..term::Config::default()
+        },
+        &TermSize::new(120, 40),
+        NullListener,
+    );
+    let mut parser = crate::daemon::ImmediateProcessor::new();
+    parser.advance(&mut term, &view);
+    let client_alt = term.mode().contains(TermMode::ALT_SCREEN);
+    let client_rows: Vec<String> = (0..term.screen_lines() as i32)
+        .map(|l| {
+            let row = &term.grid()[Line(l)];
+            let mut s = String::with_capacity(term.columns());
+            for c in 0..term.columns() {
+                let cell = &row[Column(c)];
+                if cell
+                    .flags
+                    .contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                s.push(cell.c);
+            }
+            s.trim_end().to_string()
+        })
+        .collect();
+    let cur = term.grid().cursor.point;
+    let (client_cur_row, client_cur_col) = (cur.line.0.max(0) as u16, cur.column.0 as u16);
+
+    // Daemon mirror, same moment (both sides are quiet): ReadScreen walks
+    // the live mirror's visible grid with the identical cell rules.
+    rid += 1;
+    let (d_lines, d_cur_row, d_cur_col, d_alt) =
+        match ctl.ctl(rid, CtlRequest::ReadScreen { id }, 10)? {
+            CtlBody::Screen { lines, cursor_row, cursor_col, alt_screen } => {
+                (lines, cursor_row, cursor_col, alt_screen)
+            }
+            other => anyhow::bail!("ReadScreen returned {other:?}"),
+        };
+
+    anyhow::ensure!(d_alt, "daemon mirror must still be on the alt screen");
+    anyhow::ensure!(client_alt, "client reconstruction must end on the alt screen");
+    anyhow::ensure!(
+        client_rows.iter().any(|r| r.contains("FLOOD_DONE_MARK")),
+        "client screen must carry the settle marker: {client_rows:?}"
+    );
+    anyhow::ensure!(
+        d_lines.len() == client_rows.len(),
+        "row-count mismatch: daemon {} vs client {}",
+        d_lines.len(),
+        client_rows.len()
+    );
+    for (i, (d, cl)) in d_lines.iter().zip(&client_rows).enumerate() {
+        anyhow::ensure!(
+            d == cl,
+            "row {i} diverged after Replay+delta+Output (stream gap/dup!):\n \
+             daemon: {d:?}\n client: {cl:?}"
+        );
+    }
+    anyhow::ensure!(
+        (client_cur_row, client_cur_col) == (d_cur_row, d_cur_col),
+        "cursor diverged: daemon ({d_cur_row},{d_cur_col}) vs client \
+         ({client_cur_row},{client_cur_col})"
+    );
+
+    ensure_no_new_panics(log0)?;
+    let _ = std::fs::remove_file(&go);
+    let _ = std::fs::remove_file(&script);
+    delete_terminal(&mut c1, id);
     Ok(())
 }
 
@@ -9633,6 +9886,7 @@ pub fn run(case: Option<&str>) -> anyhow::Result<()> {
         ("cold_attach", case_cold_attach),
         ("restore_fidelity", case_restore_fidelity),
         ("width_mismatch_replay", case_width_mismatch_replay),
+        ("attach_alt_flood", case_attach_alt_flood),
         ("compact_crash", case_compact_crash),
         ("boot_cover", case_boot_cover),
         ("reclaim_extract", case_reclaim_extract),

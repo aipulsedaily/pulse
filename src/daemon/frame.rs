@@ -52,16 +52,35 @@ pub fn path(id: Uuid) -> PathBuf {
     crate::state::journals_dir().join(format!("{id}.frame"))
 }
 
-/// IEEE CRC-32 (bitwise — the payload is ≤2MB and this runs once per sleep /
-/// once per dead attach, never on the ingest or paint paths).
+/// IEEE CRC-32, byte-at-a-time table variant (pw1 LOW-2). The read path
+/// runs INSIDE the attach journal-lock hold for asleep terminals (dead
+/// session ⇒ no ingest contention, but conn-thread + boot-window time):
+/// bitwise cost was measured at 6.3ms for the 2MB cap / 185µs at the 60KB
+/// typical — the 256-entry table is ~8× faster with no dependency. The
+/// table is const-built from the same reflected 0xEDB88320 polynomial, so
+/// the checksum value is bit-identical to the bitwise implementation
+/// (existing .frame sidecars keep verifying; pinned by `crc32_known_vector`).
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
 fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &b in data {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
+        crc = (crc >> 8) ^ CRC32_TABLE[((crc ^ b as u32) & 0xFF) as usize];
     }
     !crc
 }
@@ -164,6 +183,34 @@ pub fn remove(id: Uuid) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// pw1 LOW-2: the table variant must be bit-identical to the bitwise
+    /// implementation it replaced — existing on-disk .frame sidecars keep
+    /// verifying across the upgrade. Pinned against the standard IEEE
+    /// CRC-32 check vector and a reference bitwise computation over
+    /// VT-shaped bytes.
+    #[test]
+    fn crc32_known_vector() {
+        // The canonical IEEE 802.3 check value.
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32(b""), 0);
+
+        fn bitwise(data: &[u8]) -> u32 {
+            let mut crc = 0xFFFF_FFFFu32;
+            for &b in data {
+                crc ^= b as u32;
+                for _ in 0..8 {
+                    let mask = (crc & 1).wrapping_neg();
+                    crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+                }
+            }
+            !crc
+        }
+        let vt = b"\x1b[?1049h\x1b[2J\x1b[5;3H\x1b[38;5;153mfrozen frame\x1b[0m\xff\x00\x7f";
+        assert_eq!(crc32(vt), bitwise(vt));
+        let big: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+        assert_eq!(crc32(&big), bitwise(&big));
+    }
 
     #[test]
     fn roundtrip_preserves_geometry_and_bytes() {

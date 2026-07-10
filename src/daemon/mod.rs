@@ -397,6 +397,63 @@ impl HintPool {
     }
 }
 
+/// pw5-F3: trailing coalesce window for RELABEL-class state.json saves.
+/// A power cut then restores a ≤(window + one flush tick)-stale cwd label /
+/// heuristic adapter verdict — never a lost session or wrong resume token
+/// (identity saves stay inline at their sites).
+const STATE_SAVE_COALESCE: Duration = Duration::from_secs(2);
+
+/// pw5-F3: state.json save debounce for relabel-class changes ONLY
+/// (live_cwd folds, tracker inner_cli verdicts). An agent-driven session
+/// flips cwd/children constantly — measured 242 full serialize+fsync
+/// rewrites/hour under ONE active claude, each under the state mutex on the
+/// ingest/tracker threads (r1-F6's lock-tail shape). Sites mark dirty here
+/// instead; the 250ms flush tick performs one coalesced save, serialize AND
+/// write still under the state mutex, so saves stay totally ordered with
+/// the immediate identity-save sites (no save-generation guard needed — the
+/// guard becomes mandatory only if the write ever moves outside the mutex).
+/// The deadline anchors at the FIRST unsaved change: later marks never
+/// extend it, so the power-loss staleness bound is hard. Identity classes
+/// (claude pins, inner_cli set/explicit/beacon, nested chain open/append/
+/// clear, create, mutate_state, resize catch-up) keep capture-on-change
+/// inline saves — and any such full save flushes pending relabel changes by
+/// construction (the whole state serializes), so shutdown / sleep /
+/// WM_ENDSESSION finals close the window for free. The blocks sidecar
+/// (ssh open-record + exit saves, r3-disk) is a DIFFERENT persistence
+/// contract — never generalize this debounce to it.
+#[derive(Default)]
+struct StateSaveDebounce {
+    dirty_since: Mutex<Option<Instant>>,
+}
+
+impl StateSaveDebounce {
+    fn mark(&self) {
+        self.mark_at(Instant::now());
+    }
+
+    fn take_due(&self) -> bool {
+        self.take_due_at(Instant::now())
+    }
+
+    fn mark_at(&self, now: Instant) {
+        let mut d = self.dirty_since.lock();
+        if d.is_none() {
+            *d = Some(now);
+        }
+    }
+
+    fn take_due_at(&self, now: Instant) -> bool {
+        let mut d = self.dirty_since.lock();
+        match *d {
+            Some(t0) if now.saturating_duration_since(t0) >= STATE_SAVE_COALESCE => {
+                *d = None;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 pub struct Core {
     state: Mutex<SharedState>,
     sessions: Mutex<HashMap<Uuid, Session>>,
@@ -510,6 +567,9 @@ pub struct Core {
     snapshot_order: Mutex<()>,
     /// r2 boot-perf 1: anchor-hint worker pool — see `HintJob`.
     hints: HintPool,
+    /// pw5-F3: relabel-class state.json save coalescer (LEAF lock; only
+    /// ever held alone). Flushed by the 250ms flush tick.
+    state_save: StateSaveDebounce,
 }
 
 /// How long an accepted claude self-report outranks a contradicting
@@ -1851,8 +1911,11 @@ impl Core {
         self.broadcast_snapshot();
     }
 
-    /// Fold a tracker pass into a Shell/Custom terminal, saving only on change
-    /// (capture-on-change is the power-loss guarantee for restore metadata).
+    /// Fold a tracker pass into a Shell/Custom terminal. Identity changes
+    /// (the claude-registry re-pin) save inline (capture-on-change is the
+    /// power-loss guarantee for resume identity); relabel-class changes
+    /// (cwd label, heuristic adapter verdict) coalesce via the pw5-F3
+    /// debounce — a ≤2s-stale label on a power cut, never a lost identity.
     /// Returns whether GUI-visible metadata (live_cwd / inner_cli) changed —
     /// the caller coalesces one Snapshot broadcast per tracker tick so the
     /// lane/row labels update without waiting for an unrelated broadcast
@@ -1926,7 +1989,13 @@ impl Core {
             changed = true;
         }
         if changed {
-            state.save_logged("inner_cli track sample");
+            // pw5-F3: relabel-class — a cwd label or a heuristic adapter
+            // verdict, never a resume identity (the claude-registry re-pin
+            // above returns via its own inline save, and the keep_explicit
+            // guard protects hook-set Explicit tokens from tracker clobber).
+            // Coalesced: an agent-driven session sustained ~4 full
+            // serialize+fsync rewrites/min through this site.
+            self.state_save.mark();
         }
         changed
     }
@@ -1945,7 +2014,9 @@ impl Core {
         };
         if t.live_cwd.as_ref() != Some(&cwd) {
             t.live_cwd = Some(cwd);
-            state.save_logged("live_cwd (posix fold)");
+            // pw5-F3: relabel-class, coalesced (the GUI label rides the
+            // caller's Snapshot broadcast — only the disk write debounces).
+            self.state_save.mark();
             return true;
         }
         false
@@ -1968,7 +2039,10 @@ impl Core {
         }
         if t.live_cwd.as_ref() != Some(&cwd) {
             t.live_cwd = Some(cwd);
-            state.save_logged("live_cwd (pre hook)");
+            // pw5-F3: relabel-class, coalesced (the caller broadcasts the
+            // Snapshot that keeps the GUI label fresh; the disk write rides
+            // the flush tick).
+            self.state_save.mark();
             return true;
         }
         false
@@ -2845,10 +2919,59 @@ impl Core {
                 type HintInputs = (Vec<u8>, u64, Vec<u8>, Vec<crate::state::BlockRec>);
                 let mut hint_job: Option<HintInputs> = None;
                 if let Ok(journal) = self.journal(id) {
+                    // pw1 LOCK SPLIT (live-alt arm only): serialize_live_alt
+                    // scratch-parses the full 2MB tail — measured 19-24ms on
+                    // an SGR-dense claude tail, ~6× the primary arm — and it
+                    // used to run entirely under the journal lock, stalling
+                    // the terminal's INGEST (which holds this lock across
+                    // parse+append+fanout) for the whole parse on every
+                    // attach to a live TUI: GUI boot/reconnect with claudes
+                    // open. Split: hold 1 snapshots the tail + its end
+                    // offset (sub-ms, page-cached read), the parse runs with
+                    // NO lock held, and hold 2 (the `j` below) appends the
+                    // raw journal delta [off0, absolute_len()) to the
+                    // serialized bytes. Correctness: the serialization is a
+                    // pure function of the tail (the live mirror is
+                    // consulted only for the is_alt_screen routing), so
+                    // "serialize at off0 + raw delta off0→off1" ≡ "serialize
+                    // at off1" — the same argument that already justifies
+                    // live Output frames after StreamPos; post-`do_resize`
+                    // delta bytes are width-correct at the attacher's grid
+                    // by construction, and a session that exits alt inside
+                    // the window carries its own `?1049l` in the delta.
+                    // `delta_from` loop-drains read_range's cap and refuses
+                    // (None ⇒ full re-serialize under the lock, today's
+                    // path) when a compaction between the holds cut the head
+                    // past off0 — a truncated/gapped delta with a StreamPos
+                    // at absolute_len must be impossible.
+                    let live_alt_pre: Option<(u64, Vec<u8>)> = match &arcs {
+                        Some((term, ..)) if serialize::is_alt_screen(&term.lock()) => {
+                            let (tail, off0) = {
+                                let j = journal.lock(); // hold 1
+                                let tail = j.tail();
+                                (tail, j.absolute_len())
+                            };
+                            let parse_t0 = perf::on().then(Instant::now);
+                            let ser =
+                                serialize::serialize_live_alt(&tail, eff_cols, eff_rows);
+                            if let Some(t0) = parse_t0 {
+                                log::info!(
+                                    "[perf] attach live-alt parse id={id} tail={} us={} \
+                                     (outside the journal lock)",
+                                    tail.len(),
+                                    t0.elapsed().as_micros()
+                                );
+                            }
+                            Some((off0, ser))
+                        }
+                        _ => None,
+                    };
                     // The journal lock spans snapshot + subscribe + Replay
                     // enqueue; ingest holds it across parse+fanout, so the
                     // serialized state and the live stream can neither miss
-                    // nor double-apply a chunk.
+                    // nor double-apply a chunk. (For the live-alt arm this
+                    // is hold 2 of the split above: delta read + subscribe +
+                    // StreamPos share it while ingest is frozen.)
                     let j = journal.lock();
                     let ser_t0 = perf::on().then(Instant::now);
                     // Raw-tail replays (the never-engaging dead-alt belt)
@@ -2869,27 +2992,61 @@ impl Core {
                     let mut frame_overlay = false;
                     let mut bytes = match &arcs {
                         Some((term, preface, _, _, _)) => {
-                            let t = term.lock();
-                            if serialize::is_alt_screen(&t) {
+                            if let Some((off0, mut ser)) = live_alt_pre {
                                 // Live alt-screen: a raw journal tail is
                                 // width-honest only at its recorded geometry —
                                 // parsed into a client grid of a different
                                 // width, 175-col rows wrap early and absolute
                                 // CUPs land on the wrong rows (the restored-
-                                // claude field garble). Serialize instead:
-                                // scratch-parse the tail at its own XTWINOPS-
-                                // reported sizes and emit the primary underlay
-                                // + `?1049h` + the frozen alt frame
-                                // (capture_alt_frame — replayable at ANY
-                                // client size, clip semantics; the live TUI's
-                                // next repaint refreshes it). Same overlay
-                                // shape as the sleep freeze-frame ⇒ hints
-                                // skipped via frame_overlay.
-                                drop(t);
+                                // claude field garble). So the pre-parsed
+                                // serialization (hold 1 + outside parse,
+                                // above): primary underlay + `?1049h` + the
+                                // frozen alt frame (capture_alt_frame —
+                                // replayable at ANY client size, clip
+                                // semantics; the live TUI's next repaint
+                                // refreshes it). Same overlay shape as the
+                                // sleep freeze-frame ⇒ hints skipped via
+                                // frame_overlay. The reconstruction is a
+                                // pure function of the journal, so it stays
+                                // correct even if the session left the alt
+                                // screen inside the split window (the delta
+                                // carries the `?1049l`).
                                 frame_overlay = true;
-                                serialize::serialize_live_alt(&j.tail(), eff_cols, eff_rows)
+                                match j.delta_from(off0) {
+                                    Some(delta) => {
+                                        ser.extend_from_slice(&delta);
+                                        ser
+                                    }
+                                    // Compaction cut the head past off0
+                                    // between the holds (needs >REPLAY_MAX
+                                    // appended in ~20ms — contract-level),
+                                    // or a read error: never emit a gapped
+                                    // stream — redo the whole serialize
+                                    // under the lock, today's exact path.
+                                    None => serialize::serialize_live_alt(
+                                        &j.tail(),
+                                        eff_cols,
+                                        eff_rows,
+                                    ),
+                                }
                             } else {
-                                serialize::serialize_term(&t, Some(&preface.lock()))
+                                let t = term.lock();
+                                if serialize::is_alt_screen(&t) {
+                                    // Route raced (the session entered the
+                                    // alt screen in the µs between the
+                                    // split's probe and this lock): fall
+                                    // back to the pre-split under-lock
+                                    // serialize.
+                                    drop(t);
+                                    frame_overlay = true;
+                                    serialize::serialize_live_alt(
+                                        &j.tail(),
+                                        eff_cols,
+                                        eff_rows,
+                                    )
+                                } else {
+                                    serialize::serialize_term(&t, Some(&preface.lock()))
+                                }
                             }
                         }
                         None => {
@@ -4250,6 +4407,7 @@ pub fn run() -> anyhow::Result<()> {
         claude_reports: Mutex::new(HashMap::new()),
         snapshot_order: Mutex::new(()),
         hints: HintPool::new(),
+        state_save: StateSaveDebounce::default(),
     });
 
     // Reap per-terminal artifacts whose terminal no longer exists. Older
@@ -4334,6 +4492,15 @@ pub fn run() -> anyhow::Result<()> {
                 // SSH auto-reconnect backoff engine (no-op while the map is
                 // empty — one lock probe per tick).
                 flush_core.pump_reconnects();
+                // pw5-F3: coalesced state.json save for relabel-class
+                // changes (live_cwd folds, tracker verdicts). Serialize AND
+                // write stay under the state mutex — totally ordered with
+                // the inline identity saves, no generation guard needed —
+                // and the fsync latency tail moves off the ingest/tracker
+                // threads onto this one. Idle cost: one lock probe.
+                if flush_core.state_save.take_due() {
+                    flush_core.state.lock().save_logged("coalesced relabel (cwd/track)");
+                }
                 perf::dump_if_active();
             }));
             if let Err(e) = tick {
@@ -4536,6 +4703,48 @@ pub fn run() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod state_save_debounce_tests {
+    use super::*;
+
+    /// pw5-F3 save cadence: N rapid relabel folds coalesce into exactly one
+    /// save per STATE_SAVE_COALESCE window, the deadline anchors at the
+    /// FIRST unsaved change (later marks never extend the power-loss
+    /// staleness bound), and the coalescer goes clean after a flush until
+    /// the next mark. Identity saves are unaffected by construction — they
+    /// call `state.save_logged` inline at their sites and never touch this
+    /// struct (the daemon-restart durability window for pins / inner_cli /
+    /// nested chains / create is byte-identical to before).
+    #[test]
+    fn state_save_debounce_cadence() {
+        let d = StateSaveDebounce::default();
+        let t0 = Instant::now();
+
+        // Idle: never due.
+        assert!(!d.take_due_at(t0));
+        assert!(!d.take_due_at(t0 + Duration::from_secs(60)));
+
+        // A storm of folds inside the window: not due yet…
+        d.mark_at(t0);
+        d.mark_at(t0 + Duration::from_millis(300));
+        d.mark_at(t0 + Duration::from_millis(900));
+        d.mark_at(t0 + Duration::from_millis(1990));
+        assert!(!d.take_due_at(t0 + Duration::from_millis(1999)));
+        // …due exactly once at the window measured from the FIRST mark,
+        // even though the last mark was 10ms ago (trailing marks must not
+        // starve the write under constant churn).
+        assert!(d.take_due_at(t0 + STATE_SAVE_COALESCE));
+        // …and consumed: clean until the next mark.
+        assert!(!d.take_due_at(t0 + Duration::from_secs(60)));
+
+        // Next episode restarts the window from its own first mark.
+        let t1 = t0 + Duration::from_secs(120);
+        d.mark_at(t1);
+        assert!(!d.take_due_at(t1 + Duration::from_millis(500)));
+        assert!(d.take_due_at(t1 + STATE_SAVE_COALESCE));
+    }
 }
 
 #[cfg(test)]
