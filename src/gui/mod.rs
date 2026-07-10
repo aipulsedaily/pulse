@@ -557,10 +557,11 @@ fn build_sidebar_rows(state: &SharedState, gen: u64) -> SidebarRows {
             terms
         })
         .collect();
+    let folder_ids: HashSet<Uuid> = folders.iter().map(|f| f.id).collect();
     let mut loose: Vec<_> = state
         .terminals
         .iter()
-        .filter(|t| t.folder.is_none() || !folders.iter().any(|f| Some(f.id) == t.folder))
+        .filter(|t| t.folder.is_none_or(|fid| !folder_ids.contains(&fid)))
         .cloned()
         .collect();
     loose.sort_by_key(|t| t.order);
@@ -774,6 +775,33 @@ fn derive_activity(
         return Activity::Working;
     }
     Activity::Idle
+}
+
+/// The activity decision shared by `activity_from_meta` (meta in hand — the hot
+/// sidebar/dashboard path) and `activity_of` (id-only lookup): read the
+/// dot-relevant fields off the meta plus the O(1) signal-map entry, then defer
+/// to `derive_activity`. A missing meta is neither dead, asleep, nor a CLI (the
+/// id-only not-found fallback). Both callers route through here so the two paths
+/// cannot drift — asserted in `activity_meta_matches_lookup`.
+fn activity_for(meta: Option<&TerminalMeta>, sig: Option<&ActivityState>) -> Activity {
+    let dead = meta.is_some_and(|t| t.status == TermStatus::Dead);
+    let asleep = meta.is_some_and(|t| t.asleep);
+    let is_cli = meta.is_some_and(|t| {
+        matches!(t.kind, crate::state::TermKind::Claude { .. }) || t.inner_cli.is_some()
+    });
+    match sig {
+        Some(s) => derive_activity(
+            dead,
+            asleep,
+            s.needs_you,
+            s.last_output.elapsed(),
+            is_cli,
+            s.cli_stream,
+        ),
+        None if asleep => Activity::Asleep,
+        None if dead => Activity::Dead,
+        None => Activity::Idle,
+    }
 }
 
 /// Pure per-frame attention latch step (Bug A ack machine, unit-tested):
@@ -3190,11 +3218,12 @@ impl App {
             in_folder.sort_by_key(|t| t.order);
             ids.extend(in_folder.iter().map(|t| t.id));
         }
+        let folder_ids: HashSet<Uuid> = folders.iter().map(|f| f.id).collect();
         let mut loose: Vec<_> = self
             .state
             .terminals
             .iter()
-            .filter(|t| t.folder.is_none() || !folders.iter().any(|f| Some(f.id) == t.folder))
+            .filter(|t| t.folder.is_none_or(|fid| !folder_ids.contains(&fid)))
             .collect();
         loose.sort_by_key(|t| t.order);
         ids.extend(loose.iter().map(|t| t.id));
@@ -3203,35 +3232,18 @@ impl App {
 
     // ─────────────────────────── activity (V-A) ───────────────────────────
 
-    /// Derive the current activity for a terminal from its status and signals.
-    /// One meta lookup (the old shape found the meta twice — once here, once
-    /// in is_cli_kind).
+    /// Derive the current activity from a meta already in hand — the hot path
+    /// for the sidebar rows and dashboard cards, which loop over metas they hold
+    /// and would otherwise re-scan `state.terminals` (O(N)) per row for fields
+    /// already on the stack.
+    fn activity_from_meta(&self, t: &TerminalMeta) -> Activity {
+        activity_for(Some(t), self.activity.get(&t.id))
+    }
+
+    /// Derive the current activity for a terminal by id (the rare id-only
+    /// callers). Prefer `activity_from_meta` when the meta is already in hand.
     fn activity_of(&self, id: Uuid) -> Activity {
-        let (dead, asleep, is_cli) = self
-            .state
-            .terminal(id)
-            .map(|t| {
-                (
-                    t.status == TermStatus::Dead,
-                    t.asleep,
-                    matches!(t.kind, crate::state::TermKind::Claude { .. })
-                        || t.inner_cli.is_some(),
-                )
-            })
-            .unwrap_or((false, false, false));
-        match self.activity.get(&id) {
-            Some(s) => derive_activity(
-                dead,
-                asleep,
-                s.needs_you,
-                s.last_output.elapsed(),
-                is_cli,
-                s.cli_stream,
-            ),
-            None if asleep => Activity::Asleep,
-            None if dead => Activity::Dead,
-            None => Activity::Idle,
-        }
+        activity_for(self.state.terminal(id), self.activity.get(&id))
     }
 
     /// Drain per-frame signals: bell + prompt detection latch NeedsYou; viewing
@@ -7255,6 +7267,104 @@ mod tests {
         assert!(!quiet_enough(ms(2999), true));
         assert!(quiet_enough(ms(3000), true));
         assert!(!quiet_enough(ms(10_000), false));
+    }
+
+    /// perf wave 2 F1: `activity_from_meta` (meta in hand — the sidebar/dashboard
+    /// hot path) and `activity_of` (id lookup) both route through `activity_for`,
+    /// so a dot derived from a rows-cache meta is byte-identical to one derived
+    /// by re-scanning `state`. Asserts that equivalence across a seeded fleet
+    /// spanning every dot variant plus the has-signal / no-signal split.
+    #[test]
+    fn activity_meta_matches_lookup() {
+        use std::time::Duration;
+        let mk = |kind: TermKind, status: TermStatus, asleep: bool| TerminalMeta {
+            id: Uuid::new_v4(),
+            name: "t".into(),
+            folder: None,
+            kind,
+            program: "p".into(),
+            args: vec![],
+            cwd: PathBuf::from(r"C:\"),
+            order: 0,
+            auto_restore: true,
+            launched_once: true,
+            status,
+            last_cols: 80,
+            last_rows: 24,
+            live_cwd: None,
+            inner_cli: None,
+            hooked: false,
+            shell_cfg: None,
+            color_tag: None,
+            asleep,
+            reconnecting: false,
+            nested_chain: None,
+        };
+        let sig = |needs_you: bool, quiet_ms: u64, cli_stream: bool| {
+            let mut s = ActivityState::new();
+            s.needs_you = needs_you;
+            s.last_output = Instant::now() - Duration::from_millis(quiet_ms);
+            s.cli_stream = cli_stream;
+            s
+        };
+        let claude = || TermKind::Claude {
+            session_id: Uuid::new_v4(),
+            extra_args: vec![],
+        };
+
+        // A fleet spanning every branch: working shell, idle shell, dead,
+        // asleep, a streaming CLI, and a latched CLI.
+        let fleet = vec![
+            mk(TermKind::Shell, TermStatus::Running, false),
+            mk(TermKind::Shell, TermStatus::Running, false),
+            mk(TermKind::Shell, TermStatus::Dead, false),
+            mk(TermKind::Shell, TermStatus::Running, true),
+            mk(claude(), TermStatus::Running, false),
+            mk(claude(), TermStatus::Running, false),
+        ];
+        let mut acts: HashMap<Uuid, ActivityState> = HashMap::new();
+        acts.insert(fleet[0].id, sig(false, 100, false)); // Working
+        acts.insert(fleet[1].id, sig(false, 5_000, false)); // Idle
+        acts.insert(fleet[2].id, sig(false, 5_000, false)); // Dead wins
+        acts.insert(fleet[3].id, sig(false, 100, false)); // Asleep wins
+        acts.insert(fleet[4].id, sig(false, 100, true)); // CLI streaming → Working
+        acts.insert(fleet[5].id, sig(true, 9_000, false)); // latched → NeedsYou
+
+        // The equivalence: meta in hand == re-scan by id (what `state.terminal`
+        // does), for every terminal — both with and without a signal entry.
+        for t in &fleet {
+            let by_id = fleet.iter().find(|x| x.id == t.id);
+            assert_eq!(
+                activity_for(Some(t), acts.get(&t.id)),
+                activity_for(by_id, acts.get(&t.id)),
+                "meta vs lookup diverged for {:?}",
+                t.kind
+            );
+            assert_eq!(activity_for(Some(t), None), activity_for(by_id, None));
+        }
+
+        // The fleet genuinely spans the variants (not all collapsed to Idle).
+        let variants: Vec<Activity> = fleet
+            .iter()
+            .map(|t| activity_for(Some(t), acts.get(&t.id)))
+            .collect();
+        for want in [
+            Activity::Working,
+            Activity::Idle,
+            Activity::Dead,
+            Activity::Asleep,
+            Activity::NeedsYou,
+        ] {
+            assert!(variants.contains(&want), "fleet missing {want:?}");
+        }
+
+        // A stale id (meta gone) resolves via the None-meta fallback: with no
+        // signal entry it is Idle, exactly as `activity_of` on an unknown id.
+        let ghost = Uuid::new_v4();
+        assert_eq!(
+            activity_for(fleet.iter().find(|x| x.id == ghost), acts.get(&ghost)),
+            Activity::Idle,
+        );
     }
 
     /// Bug A: the attention ack state machine (`step_attention`). Amber fires
