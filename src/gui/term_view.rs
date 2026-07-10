@@ -618,6 +618,18 @@ pub fn fmt_duration(ms: u64) -> String {
     }
 }
 
+/// End-row bound for a CLOSED block's failure chrome (gutter stripe / hover
+/// span): the block's own `end_line` if known, else the next anchor's start
+/// row. NEVER the live cursor row — a completed block does not extend to the
+/// terminal's live bottom, and a cursor-based bound is scroll-invariant, so it
+/// dragged the stripe across the viewport on scroll (the "bleed" field bug).
+/// `None` means the bound is unresolved (end_line unknown AND no successor
+/// anchor): callers draw the exit chip alone / restrict hover to the command
+/// row, and it self-heals once the successor anchor or 133;B lands.
+fn failure_end_bound(end_line: Option<i32>, next: Option<i32>) -> Option<i32> {
+    end_line.or(next)
+}
+
 /// Pure layout for the hover toolbar: pointer row (via `selection_point` —
 /// the SAME mapping drag-select uses, including negative-y history rows) →
 /// binary search for the block whose [line, end_bound) contains it → pill
@@ -646,10 +658,11 @@ fn hovered_block_layout(
     let row = backend.selection_point(rel.x, rel.y).line.0;
     let idx = feed.anchors.partition_point(|a| a.line <= row).checked_sub(1)?;
     let a = feed.anchors[idx];
-    let end_bound = a
-        .end_line
-        .or_else(|| feed.anchors.get(idx + 1).map(|n| n.line))
-        .unwrap_or(backend.term.grid().cursor.point.line.0 + 1);
+    // A CLOSED block never claims an unbounded hover region: with the bound
+    // unresolved, map hover to the command row ALONE (`a.line + 1`), never the
+    // live cursor row (which would over-extend the hover span on scroll).
+    let end_bound = failure_end_bound(a.end_line, feed.anchors.get(idx + 1).map(|n| n.line))
+        .unwrap_or(a.line + 1);
     if row >= end_bound && row != a.line {
         return None;
     }
@@ -1982,7 +1995,6 @@ fn render(
     if let Some(bctx) = blocks {
         if let Some(feed) = backend.block_feed.as_ref() {
             let grid = backend.term.grid();
-            let cursor_line = grid.cursor.point.line.0;
             let off = display_offset as i32;
             // Visible grid-line window, including the continuity-fill region.
             let lo = ((grid_rect.min.y - origin.y) / cell_h).floor() as i32 - off - 1;
@@ -2019,22 +2031,30 @@ fn render(
                 let failed =
                     rec.end_off.is_some() && rec.exit.is_some_and(|e| e != 0);
                 if failed {
-                    let end_bound = a
-                        .end_line
-                        .or_else(|| feed.anchors.get(i + 1).map(|n| n.line))
-                        .unwrap_or(cursor_line);
-                    let y_end = px(origin.y + cell_h * (end_bound + off) as f32);
-                    let gy0 = sep_y.max(grid_rect.min.y);
-                    if y_end > gy0 {
-                        let gx = grid_rect.min.x - PAD_L + 3.0;
-                        bg_shapes.push(Shape::Rect(RectShape::filled(
-                            Rect::from_min_max(
-                                Pos2::new(gx, gy0),
-                                Pos2::new(gx + 3.0, y_end),
-                            ),
-                            CornerRadius::ZERO,
-                            DANGER_GUTTER,
-                        )));
+                    // A CLOSED failed block must NEVER fall back to the live
+                    // cursor row: that span is scroll-invariant, so scrolling
+                    // up drags the whole stripe down across the viewport. When
+                    // the bound is unresolved (end_line unknown AND no
+                    // successor anchor — e.g. restore-before-133;B or a pruned
+                    // successor) draw the exit chip ALONE, no stripe; it
+                    // self-heals when the bound lands.
+                    if let Some(end_bound) = failure_end_bound(
+                        a.end_line,
+                        feed.anchors.get(i + 1).map(|n| n.line),
+                    ) {
+                        let y_end = px(origin.y + cell_h * (end_bound + off) as f32);
+                        let gy0 = sep_y.max(grid_rect.min.y);
+                        if y_end > gy0 {
+                            let gx = grid_rect.min.x - PAD_L + 3.0;
+                            bg_shapes.push(Shape::Rect(RectShape::filled(
+                                Rect::from_min_max(
+                                    Pos2::new(gx, gy0),
+                                    Pos2::new(gx + 3.0, y_end),
+                                ),
+                                CornerRadius::ZERO,
+                                DANGER_GUTTER,
+                            )));
+                        }
                     }
                     // Exit chip, riding ON the separator line (right-aligned,
                     // clear of the scrollbar lane).
@@ -2049,7 +2069,10 @@ fn render(
                         Pos2::new(grid_rect.max.x - 20.0 - cw, sep_y - chh / 2.0),
                         Pos2::new(grid_rect.max.x - 20.0, sep_y + chh / 2.0),
                     );
-                    if chip.min.y >= grid_rect.min.y {
+                    // Whole-chip-or-nothing at BOTH edges: a block whose
+                    // anchor sits on the last visible row would otherwise
+                    // paint a half-cut chip against the view's bottom.
+                    if chip.min.y >= grid_rect.min.y && chip.max.y <= grid_rect.max.y {
                         chip_shapes.push(Shape::Rect(RectShape::filled(
                             chip,
                             CornerRadius::same(4),
@@ -2470,6 +2493,19 @@ mod tests {
             b.advance(format!("line {i}\r\n").as_bytes());
         }
         b
+    }
+
+    /// Fix A regression pin: `failure_end_bound` resolves a CLOSED block's
+    /// stripe/hover bound as `end_line` then the successor anchor row, and
+    /// NEVER falls back to the live cursor row. `(None, None)` yields `None`
+    /// (chip-only / command-row hover), not an unbounded span that bled the
+    /// stripe across the viewport on scroll.
+    #[test]
+    fn failure_end_bound_never_cursor() {
+        assert_eq!(failure_end_bound(Some(7), Some(9)), Some(7), "own end wins");
+        assert_eq!(failure_end_bound(None, Some(9)), Some(9), "successor anchor");
+        assert_eq!(failure_end_bound(None, None), None, "unresolved ⇒ no bound");
+        assert_eq!(failure_end_bound(Some(3), None), Some(3), "own end, no successor");
     }
 
     /// R4-F2: the AltGr-synthesis polarity table. `true` must cover exactly
