@@ -281,67 +281,17 @@ pub(crate) fn detect_auth_prompt(row: &str) -> AuthPrompt {
 }
 
 /// Bug D (`sudo su` composer honesty): does this open block's command spawn
-/// a NESTED INTERACTIVE SHELL? The integration is process-local to the login
-/// shell (delivered via one-shot `--rcfile`), so `sudo su` / `su` / a plain
-/// nested `bash` produce NO hook events: the block rec stays open for the
-/// whole episode and nothing is "running" — the user is at a raw shell. The
-/// Busy lane's pulsing dot + forever-counting elapsed is the wrong story;
-/// this classifier picks the honest one. Render-only and conservative by
-/// design: a false negative degrades to today's Busy row, a false positive
-/// still shows a true statement ("typing goes to the terminal"). The gate,
-/// cover, and daemon never read it. v2 candidates (same table, deliberately
-/// out of v1): `ssh <dest>` with no command operand, `docker exec -it …`,
-/// `wsl`, `nix shell`.
-pub(crate) fn nested_shell_cmd(cmd: &str) -> bool {
-    let argv: Vec<&str> = cmd.split_whitespace().collect();
-    nested_shell_argv(&argv)
-}
-
-fn nested_shell_argv(argv: &[&str]) -> bool {
-    let Some(first) = argv.first() else {
-        return false;
-    };
-    // argv[0] stem: last path component, extension dropped (same shape as
-    // tracker::analyze_cmdline — works for "/usr/bin/bash" and bare "bash").
-    let stem = first
-        .rsplit(['/', '\\'])
-        .next()
-        .map(|c| c.strip_suffix(".exe").unwrap_or(c).to_ascii_lowercase())
-        .unwrap_or_default();
-    match stem.as_str() {
-        // su/login: non-flag operands are USERNAMES (`su - root`) — still an
-        // interactive shell; only an explicit -c command makes it finite.
-        "su" | "login" => !argv[1..]
-            .iter()
-            .any(|a| *a == "-c" || a.starts_with("--command")),
-        // Shells: interactive unless a -c command or a script/stdin operand
-        // follows (`bash -l` yes; `bash -c …` / `bash script.sh` / `bash -`
-        // no). A flag-value miss (`bash --rcfile x`) reads x as an operand
-        // and returns false — conservative, degrades to the Busy row.
-        "bash" | "zsh" | "sh" | "dash" | "fish" | "ksh" => !argv[1..]
-            .iter()
-            .any(|a| *a == "-c" || *a == "-" || !a.starts_with('-')),
-        // sudo: -i/-s mean "give me a shell" outright; otherwise skip sudo's
-        // own flags (value-consuming ones eat their operand) and classify
-        // the wrapped command. Bare `sudo` prints usage — false.
-        "sudo" => {
-            let mut i = 1;
-            while i < argv.len() {
-                match argv[i] {
-                    "-i" | "--login" | "-s" | "--shell" => return true,
-                    // Value-consuming short flags (sudo 1.9 table).
-                    "-u" | "-g" | "-U" | "-h" | "-p" | "-C" | "-D" | "-R" | "-T" | "-r"
-                    | "-t" | "-B" => i += 2,
-                    "--" => return nested_shell_argv(&argv[i + 1..]),
-                    a if a.starts_with('-') => i += 1, // -E, -H, -n, --user=x, -uroot
-                    _ => return nested_shell_argv(&argv[i..]),
-                }
-            }
-            false
-        }
-        _ => false,
-    }
-}
+/// a NESTED INTERACTIVE SHELL? The block rec stays open for the whole
+/// episode and nothing is "running" — the user is at a raw shell; this
+/// classifier picks the honest lane over the forever-counting Busy row.
+/// Render-only here and conservative by design: a false negative degrades to
+/// today's Busy row, a false positive still shows a true statement ("typing
+/// goes to the terminal"). The gate and cover never read it. The classifier
+/// BODY moved to `daemon::tracker` (F1: the daemon applies the same verdict
+/// in `track_hook_exec` to start the nested-chain breadcrumb) — re-exported
+/// so every composer/probe call site keeps its spelling and the truth-table
+/// test below pins the shared implementation.
+pub(crate) use crate::daemon::tracker::nested_shell_cmd;
 
 /// Which line the honest raw-shell lane shows, read from the grid CURSOR row
 /// only (render-only, same contract as the pre-shell labels: a miss degrades
@@ -4677,68 +4627,8 @@ mod tests {
         assert_eq!(detect_auth_prompt(""), None);
     }
 
-    /// Bug D: the nested-shell classifier truth table (§4.1 of the research
-    /// doc) — both directions. The table is deliberately conservative: a
-    /// false negative degrades to the Busy row, never a wrong statement.
-    #[test]
-    fn nested_shell_cmd_truth_table() {
-        // Shell spawners — the honest raw-shell lane.
-        for cmd in [
-            "sudo su",
-            "sudo su -",
-            "sudo su - root",
-            "sudo -i",
-            "sudo -s",
-            "sudo --login",
-            "sudo bash",
-            "sudo -u root bash",
-            "sudo -E -H zsh",
-            "sudo -- su -",
-            "su",
-            "su -",
-            "su - root",
-            "su root",
-            "login",
-            "bash",
-            "bash -l",
-            "bash -i",
-            "zsh -l",
-            "sh",
-            "dash",
-            "fish",
-            "ksh",
-            "/usr/bin/bash",
-            "/bin/su -",
-            "  bash  ",
-        ] {
-            assert!(nested_shell_cmd(cmd), "{cmd:?} must classify nested");
-        }
-        // Finite commands / lookalikes — today's Busy row stays.
-        for cmd in [
-            "sudo apt install x",
-            "sudo systemctl restart nginx",
-            "sudo vim /etc/sudoers",
-            "sudo",
-            "suite",
-            "visudo",
-            "sushi",
-            "bashful",
-            "echo bash",
-            "ssh host uptime",
-            "ssh devbox",
-            "bash -c 'sleep 5'",
-            "sh -c ls",
-            "bash script.sh",
-            "bash -",
-            "su -c whoami root",
-            "sudo bash -c 'apt update'",
-            "cat",
-            "python3",
-            "",
-        ] {
-            assert!(!nested_shell_cmd(cmd), "{cmd:?} must NOT classify nested");
-        }
-    }
+    // Bug D truth table: `nested_shell_cmd_truth_table` moved with the
+    // classifier body to daemon::tracker (F1) — one implementation, one pin.
 
     /// Bug D: the raw-shell lane's password sub-case reads the CURSOR row
     /// only — `[sudo] password for alice:` at the cursor selects the lock

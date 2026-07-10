@@ -1577,6 +1577,15 @@ pub fn term_json(t: &CtlTerm, is_self: bool) -> serde_json::Value {
             "adapter": c.adapter,
             "resume_token": c.resume_token,
             "cwd": c.cwd.display().to_string(),
+            // F1: attribution-only marker — automation must never compose a
+            // resume for a nested identity (spec I1).
+            "nested": c.nested,
+        })),
+        // F1 nested-shell breadcrumb (spec §5, additive).
+        "nested_chain": t.nested_chain.as_ref().map(|n| serde_json::json!({
+            "cmds": n.cmds,
+            "entered_cwd": n.entered_cwd.display().to_string(),
+            "cli_cwd": n.cli_cwd.as_ref().map(|p| p.display().to_string()),
         })),
         "program": t.program,
         "cwd": t.cwd,
@@ -1949,6 +1958,7 @@ mod tests {
                 exit: Some(0),
                 ended_ms: Some(1),
             }),
+            nested_chain: None,
         };
         let v = term_json(&t, false);
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
@@ -1967,6 +1977,7 @@ mod tests {
                 "kind",
                 "last_block",
                 "name",
+                "nested_chain",
                 "open_block",
                 "program",
                 "rows",

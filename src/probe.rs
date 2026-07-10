@@ -174,6 +174,16 @@
 //!                 startup + /clear-switch beacons ⇒ Explicit, probe-free
 //!                 wake-resume, anti-spoof drop, remote installer idempotence
 //!                 (needs the full ssh_cli_env staging; SKIPs without)
+//!   ssh_nested_claude  F1 nested-shell breadcrumb (nested-resume spec §7):
+//!                 `sudo su` opens the chain; a beacon-less nested claude
+//!                 stays unattributed and sleep/wake restores shell-only
+//!                 with the variant-C re-establish preface (never a resume);
+//!                 a v2-beacon root claude mints the nested:true identity +
+//!                 witnessed cli_cwd, a daemon restart boot-restores with
+//!                 the variant-A preface (`cd '/'; claude --resume <sid>`),
+//!                 no resume block, identity retired only by the restored
+//!                 prompt's own pre (needs ssh_cli_env staging +
+//!                 passwordless sudo; SKIPs without)
 //!   codex_beacon  the codex mirror of claude_beacon's WSL beacon lane +
 //!                 anti-spoof (SKIPs without a WSL distro)
 //!   cwd_broadcast a `cd` folds into live_cwd and broadcasts one Snapshot so
@@ -9216,6 +9226,297 @@ fn claude_beacon_body(host: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// F1 NESTED-SHELL CLAUDE BREADCRUMB (`ssh_nested_claude`, nested-resume
+/// spec §7): the user's `ssh → sudo su → cd → claude` chain over the WSL
+/// stand-in, both restore classes.
+/// A) beacon-less episode: the hook-witnessed `sudo su` opens the
+///    breadcrumb (nested_chain == ["sudo su"], inner_cli None) and a
+///    beacon-LESS nested claude changes nothing (no hooks in there — no
+///    guessing); sleep → wake restores SHELL-ONLY (I1: no `--resume` block,
+///    "shell-only restore" in daemon.log) with the variant-C re-establish
+///    preface riding the re-attach replay (I4: loss is never silent); one
+///    real Run later the first token-checked pre retires the breadcrumb
+///    (one-shot honesty, §2.5).
+/// B) beacon episode: a fake ROOT claude prints the v2 tcbeacon
+///    (hex(cwd)="/") ⇒ inner_cli{claude, Explicit, nested:true} +
+///    chain.cli_cwd witnessed; a full daemon RESTART boot-restores with the
+///    variant-A preface (`re-establish: sudo su; cd '/'; claude --resume
+///    <sid>`), STILL no resume block, and the identity survives INTO the
+///    restored session — the log ORDER (shell-only restore, THEN
+///    hooked-prompt retirement) proves the §2c erase-on-failed-resume path
+///    is unreachable (no resume was ever attempted).
+/// C) anti-spoof: plain-prompt beacons stay covered by claude_beacon leg C;
+///    the non-nested-overwrite/Claude-kind refusals are pinned unit-level.
+/// Needs the ssh_cli_env staging + passwordless sudo in the distro; SKIPs
+/// without. Root-side writes: NONE — the fake claude carries its own beacon
+/// (byte-identical on the wire to a root-installed hook script), staged
+/// under /tmp only.
+fn case_ssh_nested_claude() -> anyhow::Result<()> {
+    let host = ssh_cli_env()?;
+    ensure_isolated_daemon("ssh_nested_claude")?;
+    let sudo_ok = run_wsl_sh("sudo -n true >/dev/null 2>&1 && echo OK || echo NO")?;
+    if !sudo_ok.contains("OK") {
+        return Err(skip(
+            "passwordless sudo unavailable in the default distro".into(),
+        ));
+    }
+    let sid = Uuid::new_v4();
+    // Stage under /tmp only: a QUIET nested claude (leg A) and a v2-beacon
+    // claude (leg B; hex("/") = 2f). Both hold the foreground like the real
+    // TUI would.
+    let stage = format!(
+        "mkdir -p /tmp/tc-nested-probe\n\
+         cat > /tmp/tc-nested-probe/claude-quiet <<'EOF'\n\
+         #!/bin/sh\n\
+         sleep 300\n\
+         EOF\n\
+         cat > /tmp/tc-nested-probe/claude <<'EOF'\n\
+         #!/bin/sh\n\
+         printf '\\033]7717;tcbeacon;claude;SessionStart;startup;{sid};2f\\007' > /dev/tty 2>/dev/null || true\n\
+         sleep 300\n\
+         EOF\n\
+         chmod +x /tmp/tc-nested-probe/claude-quiet /tmp/tc-nested-probe/claude\n"
+    );
+    run_wsl_sh(&stage)?;
+    let result = ssh_nested_claude_body(&host, sid);
+    // ALWAYS clean, pass or fail (the fake root claude outlives the pty —
+    // root-owned, so the reap needs sudo -n; the stage dir must not linger).
+    let _ = run_wsl_sh(
+        "sudo -n pkill -f tc-nested-probe 2>/dev/null; rm -rf /tmp/tc-nested-probe; exit 0",
+    );
+    result
+}
+
+/// The ssh_nested_claude case body — every early return routes through the
+/// wrapper's unconditional stage cleanup above.
+fn ssh_nested_claude_body(host: &str, sid: Uuid) -> anyhow::Result<()> {
+    let master = master_token()?;
+    let log0 = daemon_log_len();
+    let mut c = Conn::open()?;
+    let _ = c.first_snapshot()?;
+    let mut ctl = Conn::open_ctl(&master, None)?;
+    let mut rid = 5400u64;
+    let cwd = "/tmp/tcprobe-home/nested";
+    let chain_open = |id: Uuid, secs: u64| {
+        ssh_cli_poll_state(secs, |s| {
+            s.terminals.iter().any(|t| {
+                t.id == id
+                    && t.nested_chain
+                        .as_ref()
+                        .is_some_and(|n| n.cmds == ["sudo su"])
+            })
+        })
+    };
+
+    // ── A) beacon-less nested episode → honest shell-only sleep/wake. ──
+    let id = ssh_cli_setup(&mut c, &mut ctl, &mut rid, "__probe_nested_a__", host, cwd)?;
+    c.send(&C2D::Input { id, bytes: b"sudo su\r".to_vec() })?;
+    chain_open(id, 30).map_err(|e| e.context("breadcrumb never opened (leg A)"))?;
+    let st: SharedState = serde_json::from_slice(&std::fs::read(state_path())?)?;
+    anyhow::ensure!(
+        st.terminals
+            .iter()
+            .find(|t| t.id == id)
+            .is_some_and(|t| t.inner_cli.is_none()),
+        "opening a nested shell must not mint an identity"
+    );
+    // Inside the hookless root shell: cd + a beacon-less claude — nothing
+    // may change (raw-typed lines are invisible by design).
+    c.send(&C2D::Input { id, bytes: b"cd /\r".to_vec() })?;
+    std::thread::sleep(Duration::from_millis(400));
+    c.send(&C2D::Input {
+        id,
+        bytes: b"/tmp/tc-nested-probe/claude-quiet\r".to_vec(),
+    })?;
+    std::thread::sleep(Duration::from_millis(1500));
+    let st: SharedState = serde_json::from_slice(&std::fs::read(state_path())?)?;
+    anyhow::ensure!(
+        st.terminals
+            .iter()
+            .find(|t| t.id == id)
+            .is_some_and(|t| t.inner_cli.is_none()),
+        "a beacon-less nested claude must not mint an identity (zero accepts)"
+    );
+    let wake0 = daemon_log_len();
+    c.send(&C2D::SleepTerminal { id })?;
+    c.snapshot_until(30, |s| {
+        s.terminals
+            .iter()
+            .any(|t| t.id == id && t.status == TermStatus::Dead && t.asleep)
+    })?;
+    c.send(&C2D::RestartTerminal { id })?;
+    c.snapshot_until(60, |s| {
+        s.terminals
+            .iter()
+            .any(|t| t.id == id && t.status == TermStatus::Running && !t.asleep)
+    })?;
+    // The variant-C preface rides the re-attach replay (Session.preface).
+    c.send(&C2D::Attach { id, cols: 120, rows: 30 })?;
+    c.await_output(id, 30, |l| {
+        l.contains("this terminal had a nested shell (sudo su)")
+            && l.contains("re-establish it manually")
+    })
+    .map_err(|e| e.context("variant-C preface never rendered (leg A)"))?;
+    let wake_log = log_since(wake0);
+    anyhow::ensure!(
+        wake_log.contains("shell-only restore (no auto-resume across a privilege boundary)"),
+        "wake must log the shell-only restore"
+    );
+    anyhow::ensure!(
+        !wake_log.contains("claude --resume"),
+        "a bare nested chain must never compose a resume (I1)"
+    );
+    await_hooked_prompt(&mut ctl, &mut rid, id, 90)?;
+    let recs = c.await_blocks(id, 30, |_| true)?;
+    anyhow::ensure!(
+        recs.iter().all(|r| !r.cmd.contains("--resume")),
+        "no resume block may exist after a nested wake: {:?}",
+        recs.iter().map(|r| &r.cmd).collect::<Vec<_>>()
+    );
+    // §2.5 one-shot: a real round-trip (token-checked pre) retires the chain.
+    let body = ctl_run_retry(
+        &mut ctl,
+        &mut rid,
+        id,
+        "echo tc-nested-done",
+        Some(RunWait { timeout_ms: 30_000, tail_bytes: 4096 }),
+        60,
+    )?;
+    anyhow::ensure!(
+        matches!(body, CtlBody::RunDone { .. }),
+        "post-wake run failed: {body:?}"
+    );
+    ssh_cli_poll_state(20, |s| {
+        s.terminals
+            .iter()
+            .any(|t| t.id == id && t.nested_chain.is_none())
+    })
+    .map_err(|e| e.context("the first hooked prompt must retire the breadcrumb"))?;
+    delete_terminal(&mut c, id);
+
+    // ── B) v2-beacon episode → daemon restart → variant-A preface, no
+    //       resume, identity survives into the restored session. ──
+    let idb = ssh_cli_setup(&mut c, &mut ctl, &mut rid, "__probe_nested_b__", host, cwd)?;
+    c.send(&C2D::Input { id: idb, bytes: b"sudo su\r".to_vec() })?;
+    chain_open(idb, 30).map_err(|e| e.context("breadcrumb never opened (leg B)"))?;
+    c.send(&C2D::Input { id: idb, bytes: b"cd /\r".to_vec() })?;
+    std::thread::sleep(Duration::from_millis(400));
+    c.send(&C2D::Input {
+        id: idb,
+        bytes: b"/tmp/tc-nested-probe/claude\r".to_vec(),
+    })?;
+    let sid_s = sid.to_string();
+    ssh_cli_poll_state(60, |s| {
+        s.terminals.iter().any(|t| {
+            t.id == idb
+                && t.inner_cli.as_ref().is_some_and(|cli| {
+                    cli.adapter == "claude"
+                        && cli.nested
+                        && cli.confidence == CliConfidence::Explicit
+                        && cli.resume_token.as_deref() == Some(sid_s.as_str())
+                })
+                && t.nested_chain
+                    .as_ref()
+                    .is_some_and(|n| n.cli_cwd.as_deref() == Some(std::path::Path::new("/")))
+        })
+    })
+    .map_err(|e| e.context("nested beacon never minted the tagged identity"))?;
+    anyhow::ensure!(
+        log_since(log0).contains(&format!(
+            "terminal {idb}: tcbeacon claude session {sid} tagged nested (source=startup)"
+        )),
+        "nested-beacon accept line missing"
+    );
+
+    // Graceful daemon restart with chain + nested identity persisted.
+    let restart0 = daemon_log_len();
+    c.send(&C2D::Shutdown)?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if c.recv().is_err() {
+            break;
+        }
+    }
+    let lock = crate::state::data_dir().join("daemon.lock");
+    for _ in 0..50 {
+        if !lock.exists() || std::fs::remove_file(&lock).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        std::process::Command::new(std::env::current_exe()?)
+            .arg("--daemon")
+            .creation_flags(DETACHED_PROCESS)
+            .spawn()?;
+    }
+    let mut c2 = {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            match Conn::open() {
+                Ok(conn) => break conn,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(250))
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    };
+    let _ = c2.first_snapshot()?;
+    c2.snapshot_until(90, |s| {
+        s.terminals
+            .iter()
+            .any(|t| t.id == idb && t.status == TermStatus::Running)
+    })?;
+    // Variant-A preface: the exact copy-pasteable chain, uuid included.
+    c2.send(&C2D::Attach { id: idb, cols: 120, rows: 30 })?;
+    c2.await_output(idb, 30, |l| {
+        l.contains("re-establish: sudo su; cd '/'; claude --resume") && l.contains(&sid_s)
+    })
+    .map_err(|e| e.context("variant-A preface never rendered (leg B)"))?;
+    let mut ctl2 = Conn::open_ctl(&master, None)?;
+    let mut rid2 = 5600u64;
+    await_hooked_prompt(&mut ctl2, &mut rid2, idb, 90)?;
+    let recs = c2.await_blocks(idb, 30, |_| true)?;
+    anyhow::ensure!(
+        recs.iter().all(|r| !r.cmd.contains("--resume")),
+        "no resume block may exist after a nested boot restore: {:?}",
+        recs.iter().map(|r| &r.cmd).collect::<Vec<_>>()
+    );
+    let rlog = log_since(restart0);
+    anyhow::ensure!(
+        rlog.contains("shell-only restore (no auto-resume across a privilege boundary)"),
+        "boot restore must log the shell-only lane"
+    );
+    anyhow::ensure!(
+        !rlog.contains(&format!("claude --resume {sid}")),
+        "the nested identity must never reach a restore command (I1)"
+    );
+    // §2c non-erasure, structurally: the identity survived INTO the restored
+    // session and retired at the first hooked prompt — restore line strictly
+    // BEFORE the retirement line, and no resume failure anywhere between.
+    let pos_restore = rlog
+        .find("shell-only restore")
+        .ok_or_else(|| anyhow::anyhow!("no restore line"))?;
+    let pos_retire = rlog
+        .find("nested-shell breadcrumb retired (hooked prompt returned)")
+        .ok_or_else(|| anyhow::anyhow!("no retirement line — identity never survived the restore"))?;
+    anyhow::ensure!(
+        pos_restore < pos_retire,
+        "retirement must come from the restored session's own prompt, after the restore"
+    );
+    ssh_cli_poll_state(20, |s| {
+        s.terminals
+            .iter()
+            .any(|t| t.id == idb && t.nested_chain.is_none() && t.inner_cli.is_none())
+    })?;
+    delete_terminal(&mut c2, idb);
+    ensure_no_new_panics(log0)?;
+    Ok(())
+}
+
 /// Delete every `__probe_*` terminal currently in the daemon's state. Runs
 /// before the suite (sweeps leftovers from prior/failed runs) and after every
 /// case (so cleanup happens even when a case fails or times out) — probe
@@ -9353,6 +9654,7 @@ pub fn run(case: Option<&str>) -> anyhow::Result<()> {
         ("ssh_cli_resume_fallback", case_ssh_cli_resume_fallback),
         ("ssh_cli_authdead", case_ssh_cli_authdead),
         ("claude_beacon", case_claude_beacon),
+        ("ssh_nested_claude", case_ssh_nested_claude),
         ("codex_beacon", case_codex_beacon),
         ("cwd_broadcast", case_cwd_broadcast),
         ("history_parity", case_history_parity),

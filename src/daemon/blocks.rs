@@ -69,6 +69,11 @@ pub enum HookVerb {
         event: String,
         source: String,
         sid: String,
+        /// F1 beacon v2: the CLI's own cwd, hex-encoded by the hook script
+        /// (field 4) and decoded here — accepted only when non-empty,
+        /// POSIX-absolute, and ≤1024 bytes; legacy 3-field scripts (and any
+        /// junk hex) yield None (preface variant B). APPENDED last.
+        cwd: Option<String>,
     },
 }
 
@@ -283,6 +288,16 @@ fn parse_hook(body: &[u8], offset_after: usize) -> Option<BlockEvent> {
             log::debug!("tcbeacon without a session id dropped");
             return None;
         }
+        // Beacon v2 (F1): optional 4th field = hex(claude's cwd). Hex so a
+        // cwd containing `;`/BEL/ESC can never split or terminate the OSC.
+        // Advisory display data only — sanity-gated (utf8, non-empty,
+        // POSIX-absolute, ≤1024 bytes) and None-on-anything-else, so a
+        // legacy 3-field script and a junk field behave identically.
+        let cwd = fields
+            .get(3)
+            .and_then(|h| hex_decode(h.trim()))
+            .and_then(|b| String::from_utf8(b).ok())
+            .filter(|c| !c.is_empty() && c.starts_with('/') && c.len() <= 1024);
         return Some(BlockEvent {
             token: String::new(),
             verb: HookVerb::Beacon {
@@ -290,6 +305,7 @@ fn parse_hook(body: &[u8], offset_after: usize) -> Option<BlockEvent> {
                 event,
                 source,
                 sid,
+                cwd,
             },
             offset_in_chunk: offset_after,
         });
@@ -818,13 +834,15 @@ mod tests {
                 event: "SessionStart".into(),
                 source: "resume".into(),
                 sid: sid.into(),
+                cwd: None,
             }],
             "legacy 3-field claude beacon defaults adapter to claude"
         );
         for chunk in [1, 3, 7, 64] {
             assert_eq!(collect(chunk), whole, "divergence at chunk size {chunk}");
         }
-        // ST-terminated + a trailing future field: sid still lands whole.
+        // ST-terminated + a trailing non-hex future field: sid still lands
+        // whole; the junk field 4 is NOT a cwd (F1 v2 gate ⇒ None).
         let mut sc = BlockScanner::new();
         let evs = sc.feed(
             format!("\x1b]7717;tcbeacon;SessionEnd;clear;{sid};v2\x1b\\").as_bytes(),
@@ -836,6 +854,7 @@ mod tests {
                 event: "SessionEnd".into(),
                 source: "clear".into(),
                 sid: sid.into(),
+                cwd: None,
             }
         );
         // The codex adapter-carrying form: `tcbeacon;codex;<event>;<source>;<sid>`.
@@ -848,8 +867,44 @@ mod tests {
                 event: "SessionStart".into(),
                 source: "startup".into(),
                 sid: sid.into(),
+                cwd: None,
             }
         );
+        // F1 beacon v2: the 4-field form carries hex(cwd) — decoded, gated.
+        let cwd_hex = crate::strip::hex_lower(b"/srv/app");
+        let mut sc = BlockScanner::new();
+        let evs = sc.feed(
+            format!("\x1b]7717;tcbeacon;claude;SessionStart;startup;{sid};{cwd_hex}\x07")
+                .as_bytes(),
+        );
+        assert_eq!(
+            evs[0].verb,
+            HookVerb::Beacon {
+                adapter: "claude".into(),
+                event: "SessionStart".into(),
+                source: "startup".into(),
+                sid: sid.into(),
+                cwd: Some("/srv/app".into()),
+            }
+        );
+        // v2 gates: non-absolute, empty, junk hex, oversized ⇒ cwd None.
+        let cwd = |payload: &str| -> Option<String> {
+            let mut sc = BlockScanner::new();
+            let evs = sc.feed(
+                format!("\x1b]7717;tcbeacon;claude;SessionStart;startup;{sid};{payload}\x07")
+                    .as_bytes(),
+            );
+            match &evs[0].verb {
+                HookVerb::Beacon { cwd, .. } => cwd.clone(),
+                v => panic!("not a beacon: {v:?}"),
+            }
+        };
+        assert_eq!(cwd(&crate::strip::hex_lower(b"relative/path")), None);
+        assert_eq!(cwd(""), None);
+        assert_eq!(cwd("zz"), None);
+        assert_eq!(cwd("abc"), None, "odd-length hex");
+        let huge = crate::strip::hex_lower(format!("/{}", "x".repeat(1100)).as_bytes());
+        assert_eq!(cwd(&huge), None, "oversized cwd is dropped");
         // sid-less beacons drop (both forms); a REAL token named "tcbeacon" is
         // impossible (tokens are 16 hex) so the plain-verb path stays unshadowed.
         assert!(sc.feed(b"\x1b]7717;tcbeacon;SessionStart\x07").is_empty());

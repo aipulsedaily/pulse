@@ -541,6 +541,17 @@ mtimes); drive `sftp.exe -q -b <batch> -D "C:/Windows/System32/wsl.exe -d Ubuntu
 multi-line quoting from git-bash — write staging scripts to a file and run
 `wsl -- sh /mnt/c/...` (MSYS_NO_PATHCONV=1).
 
+F1 additions (`ssh_nested_claude`): the case additionally requires PASSWORDLESS sudo
+in the default distro (`sudo -n true`) — SKIPs otherwise (never modify a user
+distro's sudoers to force it). It self-stages its two /tmp-only fakes
+(`/tmp/tc-nested-probe/claude-quiet`, and `claude` printing the v2 beacon —
+`tcbeacon;claude;SessionStart;startup;<sid>;<hex-cwd>`) and reaps them with
+`sudo -n pkill` (the nested fakes run as root). No /root or $HOME writes at all —
+the beacon is baked into the fake, byte-identical on the wire to a root-installed
+`~/.tc/claude-hook.sh`. The docker sshd rig (nested-claude investigation §6) remains
+the full-fidelity manual variant: real `ssh → sudo su → cd → claude --resume` with
+root-side v2 hooks staged in the container only.
+
 ---
 
 ## 10. Edges (behavior table)

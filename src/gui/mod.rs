@@ -6552,6 +6552,7 @@ mod tests {
             color_tag: None,
             asleep: false,
             reconnecting: false,
+            nested_chain: None,
         };
         let mut state = SharedState {
             folders: vec![folder(f_b, "B", 2), folder(f_a, "A", 1)],
@@ -6641,6 +6642,7 @@ mod tests {
             color_tag: Some(3),
             asleep: false,
             reconnecting: false,
+            nested_chain: None,
         };
         let nt = duplicate_spec(&t, &["claude"]);
         match &nt.kind {

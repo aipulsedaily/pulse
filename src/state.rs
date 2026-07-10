@@ -308,6 +308,55 @@ pub struct InnerCli {
     pub confidence: CliConfidence,
     /// The cwd the CLI was running in.
     pub cwd: PathBuf,
+    /// The CLI runs INSIDE a nested shell (`sudo su`/`su`/…) that Pulse's
+    /// process-local hooks cannot witness (F1, nested-resume spec). The
+    /// identity came from a tcbeacon accepted while a live nested-shell
+    /// episode was open; `cwd` is the beacon-carried cwd when the v2 script
+    /// reported one, else the outer shell's cwd at entry (best-effort).
+    /// Display/preface ONLY (spec I1): a nested identity must NEVER feed a
+    /// restore's auto-resume — the command would run as the ssh LOGIN user
+    /// against the nested account's session store (structurally the wrong
+    /// store; the failure used to consume the identity) — and the probe /
+    /// registry refine legs skip it (spec I3). Restores print the honest
+    /// re-establish preface instead. serde-default for pre-existing
+    /// state.json files (appended LAST — InnerCli rides the bincode
+    /// Snapshot; field order is wire order, same-exe GUI+daemon rule; no
+    /// proto bump).
+    #[serde(default)]
+    pub nested: bool,
+}
+
+/// F1 nested-shell breadcrumb: the chain a user built through a privilege /
+/// identity boundary (`ssh` → `sudo su` → `cd …` → `claude`) that the
+/// process-local hooks cannot witness. Recorded so a restore can be HONEST
+/// about what it did not re-establish — never so it can replay the chain
+/// (password prompts + keystroke injection into a privileged shell are both
+/// forbidden; see the restore doctrine).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NestedChain {
+    /// Commands in order: the hook-witnessed nested-shell OPENER (`sudo su`)
+    /// first, then further nested-shell spawns submitted through the D2
+    /// heuristic composer's synthetic lane (`su - deploy`…). A LOWER BOUND,
+    /// never claimed complete: raw-typed inner lines are invisible by design
+    /// (no hooks live inside the nested shell), and cd's / plain commands
+    /// are deliberately not recorded. Capped at 8.
+    #[serde(default)]
+    pub cmds: Vec<String>,
+    /// The OUTER shell's hook-tracked cwd when the nested shell was entered
+    /// (`sudo su`/`su` preserve $PWD, so this doubles as the best-effort
+    /// starting cwd of the nested shell itself).
+    #[serde(default)]
+    pub entered_cwd: PathBuf,
+    /// The nested CLI's own cwd — ONLY when a v2 beacon carried it (the
+    /// hook script inside the nested account reads it off claude's own
+    /// SessionStart payload). Never inferred: an absent value renders the
+    /// preface's variant B ("run it from the conversation's directory")
+    /// instead of a guessed cd.
+    #[serde(default)]
+    pub cli_cwd: Option<PathBuf>,
+    /// Wall-clock ms when the episode opened (diagnostics/staleness).
+    #[serde(default)]
+    pub opened_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -390,6 +439,17 @@ pub struct TerminalMeta {
     /// same-exe rule; proto 9 → 10).
     #[serde(default)]
     pub reconnecting: bool,
+    /// F1 nested-shell breadcrumb (see `NestedChain`): present while a
+    /// nested-shell episode (`sudo su`…) is open — persisted so a
+    /// sleep/wake/daemon-restart restore can print the honest re-establish
+    /// preface instead of silently dropping the chain. Cleared when the
+    /// episode ends live (the outer shell's next token-checked hook) or when
+    /// a fresh outer-shell CLI launch supersedes it. Never consumed by
+    /// restore composition for auto-resume. APPENDED after `reconnecting`
+    /// (bincode Snapshot field order is wire order; same-exe rule; no new
+    /// frames, no proto bump).
+    #[serde(default)]
+    pub nested_chain: Option<NestedChain>,
 }
 
 /// Derived presentation of (status, asleep) — NEVER persisted, NEVER on the
@@ -880,6 +940,7 @@ mod shell_family_tests {
             color_tag: None,
             asleep: false,
             reconnecting: false,
+            nested_chain: None,
         };
         // WSL, pre-first-hook: the `--cd ~` truth.
         assert_eq!(meta.display_cwd(), "~");
@@ -919,6 +980,83 @@ mod shell_family_tests {
         assert_eq!(meta.display_cwd(), "C:\\proj\\sub");
     }
 
+    /// F1: the nested fields are append-only serde-defaults — a pre-F1
+    /// state.json loads with them defaulted, values round-trip, and
+    /// `load_from` does NOT force-reset `nested_chain` (surviving restarts
+    /// is its purpose: the restore preface is built from it).
+    #[test]
+    fn state_serde_nested_defaults() {
+        let mut meta = TerminalMeta {
+            id: Uuid::new_v4(),
+            name: "t".into(),
+            folder: None,
+            kind: TermKind::Shell,
+            program: "ssh.exe".into(),
+            args: vec!["dev@host".into()],
+            cwd: PathBuf::new(),
+            order: 0,
+            auto_restore: true,
+            launched_once: true,
+            status: TermStatus::Running,
+            last_cols: 0,
+            last_rows: 0,
+            live_cwd: Some(PathBuf::from("/home/dev")),
+            inner_cli: Some(InnerCli {
+                adapter: "claude".into(),
+                resume_token: Some("11111111-2222-4333-8444-555555555555".into()),
+                confidence: CliConfidence::Explicit,
+                cwd: PathBuf::from("/"),
+                nested: true,
+            }),
+            hooked: true,
+            shell_cfg: None,
+            color_tag: None,
+            asleep: false,
+            reconnecting: false,
+            nested_chain: None,
+        };
+        meta.nested_chain = Some(NestedChain {
+            cmds: vec!["sudo su".into(), "su - deploy".into()],
+            entered_cwd: PathBuf::from("/home/dev"),
+            cli_cwd: Some(PathBuf::from("/")),
+            opened_ms: 42,
+        });
+        // Round-trip.
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: TerminalMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.nested_chain, meta.nested_chain);
+        assert!(back.inner_cli.as_ref().unwrap().nested);
+        // Pre-F1 file shape: the new fields absent ⇒ defaults.
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v.as_object_mut().unwrap().remove("nested_chain");
+        v["inner_cli"].as_object_mut().unwrap().remove("nested");
+        let old: TerminalMeta = serde_json::from_value(v).unwrap();
+        assert!(old.nested_chain.is_none());
+        assert!(!old.inner_cli.unwrap().nested);
+        // NestedChain itself is append-tolerant (partial objects load).
+        let partial: NestedChain =
+            serde_json::from_str(r#"{"cmds":["sudo su"],"entered_cwd":"/h"}"#).unwrap();
+        assert_eq!(partial.cli_cwd, None);
+        assert_eq!(partial.opened_ms, 0);
+        // load_from: the boot force-reset touches status/reconnecting ONLY —
+        // the breadcrumb and its nested identity survive.
+        let d = std::env::temp_dir().join(format!("tc-state-nested-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        let path = d.join("state.json");
+        let real = SharedState {
+            folders: vec![],
+            terminals: vec![meta.clone()],
+            next_order: 1,
+        };
+        std::fs::write(&path, serde_json::to_vec(&real).unwrap()).unwrap();
+        let (s, healthy) = SharedState::load_from(&path);
+        assert!(healthy);
+        assert_eq!(s.terminals[0].status, TermStatus::Dead, "boot force-reset");
+        assert_eq!(s.terminals[0].nested_chain, meta.nested_chain);
+        assert!(s.terminals[0].inner_cli.as_ref().unwrap().nested);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// Bug 1: the claude launch-command resume-branch selection. A pinned
     /// terminal uses `--resume <id>` ONLY when (a) it has launched before AND
     /// (b) the session transcript exists on disk at claude's own layout
@@ -955,6 +1093,7 @@ mod shell_family_tests {
             color_tag: None,
             asleep: false,
             reconnecting: false,
+            nested_chain: None,
         };
         // Never launched: --session-id regardless of disk state.
         let (_, args) = meta.launch_command();

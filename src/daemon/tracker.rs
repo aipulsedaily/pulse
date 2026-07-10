@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime};
 
 use uuid::Uuid;
 
-use crate::state::{claude_project_dir_name, CliConfidence, InnerCli};
+use crate::state::{claude_project_dir_name, CliConfidence, InnerCli, NestedChain};
 
 use super::procinfo;
 
@@ -356,6 +356,7 @@ pub fn analyze(
                     resume_token: token,
                     confidence,
                     cwd,
+                    nested: false,
                 });
                 break 'outer;
             }
@@ -412,10 +413,196 @@ pub fn analyze_cmdline(cmd: &str, cwd: &Path) -> Option<InnerCli> {
                 resume_token: token,
                 confidence,
                 cwd: cwd.to_path_buf(),
+                nested: false,
             });
         }
     }
     None
+}
+
+/// Bug D / F1: does this command spawn a NESTED INTERACTIVE SHELL? The
+/// integration is process-local to the login shell (delivered via one-shot
+/// rcfile), so `sudo su` / `su` / a plain nested `bash` produce NO hook
+/// events for anything typed inside them. Moved here from `gui::composer`
+/// (still re-exported there) because the daemon now uses the SAME verdict to
+/// start the F1 nested-chain breadcrumb in `track_hook_exec` — one
+/// classifier, zero drift between the composer's honesty lane and the
+/// breadcrumb. Pure and conservative by design: a false negative degrades to
+/// today's behavior (Busy row / no breadcrumb), a false positive still
+/// records a true statement. v2 candidates (same table, deliberately out of
+/// v1): `ssh <dest>` with no command operand, `docker exec -it …`, `wsl`,
+/// `nix shell`.
+pub fn nested_shell_cmd(cmd: &str) -> bool {
+    let argv: Vec<&str> = cmd.split_whitespace().collect();
+    nested_shell_argv(&argv)
+}
+
+fn nested_shell_argv(argv: &[&str]) -> bool {
+    let Some(first) = argv.first() else {
+        return false;
+    };
+    // argv[0] stem: last path component, extension dropped (same shape as
+    // tracker::analyze_cmdline — works for "/usr/bin/bash" and bare "bash").
+    let stem = first
+        .rsplit(['/', '\\'])
+        .next()
+        .map(|c| c.strip_suffix(".exe").unwrap_or(c).to_ascii_lowercase())
+        .unwrap_or_default();
+    match stem.as_str() {
+        // su/login: non-flag operands are USERNAMES (`su - root`) — still an
+        // interactive shell; only an explicit -c command makes it finite.
+        "su" | "login" => !argv[1..]
+            .iter()
+            .any(|a| *a == "-c" || a.starts_with("--command")),
+        // Shells: interactive unless a -c command or a script/stdin operand
+        // follows (`bash -l` yes; `bash -c …` / `bash script.sh` / `bash -`
+        // no). A flag-value miss (`bash --rcfile x`) reads x as an operand
+        // and returns false — conservative, degrades to the Busy row.
+        "bash" | "zsh" | "sh" | "dash" | "fish" | "ksh" => !argv[1..]
+            .iter()
+            .any(|a| *a == "-c" || *a == "-" || !a.starts_with('-')),
+        // sudo: -i/-s mean "give me a shell" outright; otherwise skip sudo's
+        // own flags (value-consuming ones eat their operand) and classify
+        // the wrapped command. Bare `sudo` prints usage — false.
+        "sudo" => {
+            let mut i = 1;
+            while i < argv.len() {
+                match argv[i] {
+                    "-i" | "--login" | "-s" | "--shell" => return true,
+                    // Value-consuming short flags (sudo 1.9 table).
+                    "-u" | "-g" | "-U" | "-h" | "-p" | "-C" | "-D" | "-R" | "-T" | "-r"
+                    | "-t" | "-B" => i += 2,
+                    "--" => return nested_shell_argv(&argv[i + 1..]),
+                    a if a.starts_with('-') => i += 1, // -E, -H, -n, --user=x, -uroot
+                    _ => return nested_shell_argv(&argv[i..]),
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// F1: is `key` an enabled CLI adapter? Gates the nested-beacon mint — a
+/// beacon may CREATE cli state there (no exec hook can precede it inside a
+/// nested shell), so the adapter slot must at least name a tool the
+/// registry knows.
+pub fn known_adapter(key: &str) -> bool {
+    ADAPTERS.iter().any(|a| a.enabled && a.key == key)
+}
+
+/// Cap on recorded breadcrumb commands — a re-establish line is a hint, not
+/// a transcript. Beyond this the chain stops growing (first links win: the
+/// opener and the early hops are the load-bearing part).
+pub const NESTED_CHAIN_MAX: usize = 8;
+
+/// F1 spec I1, factored so the invariant is testable as a table: may this
+/// identity feed a restore's AUTO-RESUME composition? Only a confident,
+/// NON-nested identity ever may — a nested one is display/preface-only (the
+/// resume would run as the ssh login user against the nested account's
+/// session store: structurally the wrong store, and the failure used to
+/// consume the identity).
+pub fn cli_wants_resume(cli: &InnerCli) -> bool {
+    !cli.nested
+        && matches!(
+            cli.confidence,
+            CliConfidence::Explicit | CliConfidence::Correlated
+        )
+}
+
+/// Char-safe display truncation: first `max` chars, with `…` marking a cut.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+/// F1 preface composition (spec §4.3, golden-tested byte-exact): the honest,
+/// copy-pasteable re-establish line a restore prints INSTEAD of
+/// auto-resuming into a privilege boundary. `cli` is the nested-tagged
+/// identity when a beacon attributed one (callers filter on `nested`).
+///
+/// Variants:
+/// - A (identity + beacon-witnessed cwd): chain; `cd '<cwd>'`; resume.
+/// - B (identity, no witnessed cwd — or an over-long one): chain; resume;
+///   "(run it from the conversation's directory)".
+/// - C (no identity / no token / unsafe token): chain only, manual hint.
+///
+/// Escaping choke points: the token prints only when `safe_resume_token`
+/// passes (r3-S1 — same charset gate every restore shares; unsafe ⇒ C, never
+/// a mangled command); the cd path comes ONLY from the beacon-witnessed
+/// `chain.cli_cwd`, single-quoted via `bootstrap::sh_single_quote`, and is
+/// dropped (⇒ B) when its quoted form exceeds 120 display chars; recorded
+/// commands are relayed as display text with control bytes stripped (no
+/// terminal-sequence smuggling into the preface), joined and truncated
+/// char-safe at 100 chars.
+pub fn nested_restore_notice(chain: &NestedChain, cli: Option<&InnerCli>) -> String {
+    let joined = chain
+        .cmds
+        .iter()
+        .map(|s| sanitize_display_cmd(s))
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let c = if joined.is_empty() {
+        "nested shell".to_string()
+    } else {
+        truncate_chars(&joined, 100)
+    };
+    let identity = cli.and_then(|cli| {
+        let t = cli.resume_token.as_deref()?;
+        safe_resume_token(t).then(|| (cli.adapter.clone(), t.to_string()))
+    });
+    let Some((a, t)) = identity else {
+        // Variant C.
+        return format!(
+            "── this terminal had a nested shell ({c}); anything running inside it was not restored — re-establish it manually ──"
+        );
+    };
+    let quoted_cd = chain
+        .cli_cwd
+        .as_ref()
+        .map(|p| super::bootstrap::sh_single_quote(&p.to_string_lossy()))
+        .filter(|q| q.chars().count() <= 120);
+    match quoted_cd {
+        // Variant A.
+        Some(q) => format!(
+            "── this terminal had a nested shell ({c}); its {a} session was not auto-resumed — re-establish: {c}; cd {q}; {a} --resume {t} ──"
+        ),
+        // Variant B.
+        None => format!(
+            "── this terminal had a nested shell ({c}); its {a} session was not auto-resumed — re-establish: {c}; {a} --resume {t} (run it from the conversation's directory) ──"
+        ),
+    }
+}
+
+/// Strip control bytes from a user-typed command destined for display text
+/// (preface). Keeps everything printable verbatim.
+fn sanitize_display_cmd(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// F1 spec §2.4: append a D2-lane nested-shell spawn to the breadcrumb.
+/// Pure so the cap+dedupe table is unit-testable: consecutive duplicates
+/// collapse (a retried `sudo su` is one hop), the chain never exceeds
+/// `NESTED_CHAIN_MAX`. Returns whether the chain changed.
+pub fn append_nested_cmd(cmds: &mut Vec<String>, cmd: &str) -> bool {
+    let cmd = cmd.trim();
+    if cmd.is_empty() || cmds.len() >= NESTED_CHAIN_MAX {
+        return false;
+    }
+    if cmds.last().is_some_and(|last| last == cmd) {
+        return false;
+    }
+    cmds.push(cmd.to_string());
+    true
 }
 
 /// Naive quote-aware whitespace split (P6 §7.2): single quotes literal,
@@ -945,6 +1132,193 @@ mod tests {
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// Bug D: the nested-shell classifier truth table (§4.1 of the research
+    /// doc) — both directions. The table is deliberately conservative: a
+    /// false negative degrades to the Busy row, never a wrong statement.
+    /// (Moved verbatim from gui::composer with the classifier body — F1.)
+    #[test]
+    fn nested_shell_cmd_truth_table() {
+        // Shell spawners — the honest raw-shell lane.
+        for cmd in [
+            "sudo su",
+            "sudo su -",
+            "sudo su - root",
+            "sudo -i",
+            "sudo -s",
+            "sudo --login",
+            "sudo bash",
+            "sudo -u root bash",
+            "sudo -E -H zsh",
+            "sudo -- su -",
+            "su",
+            "su -",
+            "su - root",
+            "su root",
+            "login",
+            "bash",
+            "bash -l",
+            "bash -i",
+            "zsh -l",
+            "sh",
+            "dash",
+            "fish",
+            "ksh",
+            "/usr/bin/bash",
+            "/bin/su -",
+            "  bash  ",
+        ] {
+            assert!(nested_shell_cmd(cmd), "{cmd:?} must classify nested");
+        }
+        // Finite commands / lookalikes — today's Busy row stays.
+        for cmd in [
+            "sudo apt install x",
+            "sudo systemctl restart nginx",
+            "sudo vim /etc/sudoers",
+            "sudo",
+            "suite",
+            "visudo",
+            "sushi",
+            "bashful",
+            "echo bash",
+            "ssh host uptime",
+            "ssh devbox",
+            "bash -c 'sleep 5'",
+            "sh -c ls",
+            "bash script.sh",
+            "bash -",
+            "su -c whoami root",
+            "sudo bash -c 'apt update'",
+            "cat",
+            "python3",
+            "",
+        ] {
+            assert!(!nested_shell_cmd(cmd), "{cmd:?} must NOT classify nested");
+        }
+    }
+
+    fn chain(cmds: &[&str], cli_cwd: Option<&str>) -> crate::state::NestedChain {
+        crate::state::NestedChain {
+            cmds: s(cmds),
+            entered_cwd: PathBuf::from("/home/dev"),
+            cli_cwd: cli_cwd.map(PathBuf::from),
+            opened_ms: 1,
+        }
+    }
+
+    fn nested_cli(adapter: &str, token: Option<&str>) -> InnerCli {
+        InnerCli {
+            adapter: adapter.into(),
+            resume_token: token.map(str::to_string),
+            confidence: CliConfidence::Explicit,
+            cwd: PathBuf::from("/"),
+            nested: true,
+        }
+    }
+
+    /// F1 spec §4.3 goldens — byte-exact variants A/B/C, the escaping choke
+    /// points, and the truncation degradations.
+    #[test]
+    fn nested_restore_notice_golden() {
+        // Variant A — the user's exact scenario from the investigation.
+        let cli = nested_cli("claude", Some("xyz"));
+        assert_eq!(
+            nested_restore_notice(&chain(&["sudo su"], Some("/")), Some(&cli)),
+            "── this terminal had a nested shell (sudo su); its claude session was not auto-resumed — re-establish: sudo su; cd '/'; claude --resume xyz ──"
+        );
+        // A with a quote-bearing witnessed cwd: sh_single_quote escaping.
+        assert_eq!(
+            nested_restore_notice(&chain(&["sudo su"], Some("/a'b")), Some(&cli)),
+            "── this terminal had a nested shell (sudo su); its claude session was not auto-resumed — re-establish: sudo su; cd '/a'\\''b'; claude --resume xyz ──"
+        );
+        // Variant B — identity but no beacon-witnessed cwd.
+        assert_eq!(
+            nested_restore_notice(&chain(&["sudo su"], None), Some(&cli)),
+            "── this terminal had a nested shell (sudo su); its claude session was not auto-resumed — re-establish: sudo su; claude --resume xyz (run it from the conversation's directory) ──"
+        );
+        // B via cd-truncation: a >120-char quoted path drops the cd.
+        let long = format!("/{}", "x".repeat(130));
+        let n = nested_restore_notice(&chain(&["sudo su"], Some(&long)), Some(&cli));
+        assert!(n.ends_with("claude --resume xyz (run it from the conversation's directory) ──"));
+        assert!(!n.contains("cd '"), "over-long witnessed cwd must drop the cd: {n}");
+        // Variant C — no identity at all.
+        assert_eq!(
+            nested_restore_notice(&chain(&["sudo su"], None), None),
+            "── this terminal had a nested shell (sudo su); anything running inside it was not restored — re-establish it manually ──"
+        );
+        // C — identity without a token.
+        assert_eq!(
+            nested_restore_notice(&chain(&["sudo su"], Some("/")), Some(&nested_cli("claude", None))),
+            "── this terminal had a nested shell (sudo su); anything running inside it was not restored — re-establish it manually ──"
+        );
+        // C — an UNSAFE token never prints (r3-S1 choke point).
+        let evil = nested_cli("claude", Some("x; rm -rf /"));
+        let n = nested_restore_notice(&chain(&["sudo su"], Some("/")), Some(&evil));
+        assert!(
+            n.contains("re-establish it manually") && !n.contains("rm -rf"),
+            "unsafe token must degrade to variant C: {n}"
+        );
+        // Multi-hop chain joins in order; control bytes are stripped.
+        assert_eq!(
+            nested_restore_notice(&chain(&["sudo su", "su - \x1b[31mdeploy"], None), None),
+            "── this terminal had a nested shell (sudo su; su - [31mdeploy); anything running inside it was not restored — re-establish it manually ──"
+        );
+        // Empty chain reads "nested shell"; 100-char chain truncation is
+        // char-safe and marked.
+        assert_eq!(
+            nested_restore_notice(&chain(&[], None), None),
+            "── this terminal had a nested shell (nested shell); anything running inside it was not restored — re-establish it manually ──"
+        );
+        let huge = "sudo su -- very long command ".repeat(10);
+        let n = nested_restore_notice(&chain(&[&huge], None), None);
+        assert!(n.contains('…'), "over-long chain must truncate: {n}");
+        assert!(n.chars().count() < 250);
+    }
+
+    /// F1 spec I1 regression table: only a confident NON-nested identity may
+    /// ever feed auto-resume composition — `nested: true` loses regardless
+    /// of confidence.
+    #[test]
+    fn nested_inner_cli_never_resumes() {
+        for conf in [
+            CliConfidence::Explicit,
+            CliConfidence::Correlated,
+            CliConfidence::Ambiguous,
+        ] {
+            for nested in [false, true] {
+                let cli = InnerCli {
+                    adapter: "claude".into(),
+                    resume_token: Some(Uuid::new_v4().to_string()),
+                    confidence: conf,
+                    cwd: PathBuf::from("/"),
+                    nested,
+                };
+                let want = !nested && !matches!(conf, CliConfidence::Ambiguous);
+                assert_eq!(
+                    cli_wants_resume(&cli),
+                    want,
+                    "confidence {conf:?} nested {nested}"
+                );
+            }
+        }
+    }
+
+    /// F1 spec §2.4: chain append cap + consecutive dedupe.
+    #[test]
+    fn nested_chain_cap_and_dedupe() {
+        let mut cmds = s(&["sudo su"]);
+        assert!(!append_nested_cmd(&mut cmds, "sudo su"), "consecutive dupe");
+        assert!(!append_nested_cmd(&mut cmds, "  sudo su  "), "trimmed dupe");
+        assert!(append_nested_cmd(&mut cmds, "su - deploy"));
+        assert!(append_nested_cmd(&mut cmds, "sudo su"), "non-consecutive repeat is a real hop");
+        assert!(!append_nested_cmd(&mut cmds, ""), "empty never records");
+        for i in cmds.len()..NESTED_CHAIN_MAX {
+            assert!(append_nested_cmd(&mut cmds, &format!("bash -l # {i}")));
+        }
+        assert_eq!(cmds.len(), NESTED_CHAIN_MAX);
+        assert!(!append_nested_cmd(&mut cmds, "zsh"), "cap holds");
+        assert_eq!(cmds.len(), NESTED_CHAIN_MAX);
     }
 
     /// Bug 1 (claude wake): the session-id re-pin evidence rules. Uses real
