@@ -7497,6 +7497,9 @@ mod tests {
         // The queued dispatch fires in Frame C's own tick/pump.
         let mut done = 0usize;
         let mut n = 2u32;
+        // `n` is a protocol sequence number that outlives early-break rounds,
+        // not a loop counter (clippy 1.97+ flags the pattern).
+        #[allow(clippy::explicit_counter_loop)]
         for _round in 0..(N * 6) {
             // Whatever command is live (just dispatched or the initial ls).
             // Frame A: exec OSC ahead of the echo (ConPTY reorder), then the
@@ -7581,6 +7584,8 @@ mod tests {
             st.queue_draft();
         }
         let mut n = 2u32;
+        // Protocol sequence number, not a loop counter (clippy 1.97+).
+        #[allow(clippy::explicit_counter_loop)]
         for _round in 0..(N * 8) {
             // exec ahead of echo (ConPTY reorder), echo, output scroll.
             b.advance_live(&hook_bytes("exec", r#"{"c":"ls"}"#));
