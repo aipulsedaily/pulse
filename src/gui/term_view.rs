@@ -385,7 +385,11 @@ pub fn show(
             .unwrap_or_default()
     });
 
-    if focused {
+    // Re-request only when focus is actually elsewhere: egui's request_focus
+    // fires interrupt_ime() even on an already-focused widget, which tears down
+    // and rebuilds the IME association every painted frame (a per-frame marshal
+    // to the window thread, and a live CJK-composition kill on any repaint).
+    if focused && !response.has_focus() {
         response.request_focus();
     }
     // While the grid has focus, Tab must reach the shell (not cycle egui

@@ -256,8 +256,13 @@ impl App {
                     .composers
                     .get(&id)
                     .is_some_and(|c| c.want_focus || c.has_focus);
-                if hold {
-                    let ed_id = Id::new(("composer", id));
+                let ed_id = Id::new(("composer", id));
+                // Skip the re-request once the editor already holds focus:
+                // request_focus interrupts IME every frame otherwise (see the
+                // grid guard in term_view). On the arm frame has_focus is still
+                // false (the grid held it last frame) so this fires exactly as
+                // before, handing focus to the editor created later this frame.
+                if hold && !ui.ctx().memory(|m| m.has_focus(ed_id)) {
                     ui.ctx().memory_mut(|m| m.request_focus(ed_id));
                 }
             }
