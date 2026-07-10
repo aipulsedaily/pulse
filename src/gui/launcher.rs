@@ -403,6 +403,66 @@ pub fn dir_spec(
     Some((nt, s))
 }
 
+/// The typed-path CLAUDE row (Shiro report #1: "specify the folder that
+/// claude session will run in"): a fresh Claude session in exactly the
+/// row's directory — the same §4.5 typed-path affordance shell rows get,
+/// as its own row so the choice is explicit, never inferred from
+/// last_spawn's kind.
+pub fn claude_dir_spec(
+    cwd: &Path,
+    folder: Option<Uuid>,
+    taken: &[&str],
+) -> Option<(NewTerminal, SpawnSpec)> {
+    let s = SpawnSpec {
+        kind_tag: "claude".into(),
+        program: "claude".into(),
+        args: Vec::new(),
+        cwd: cwd.to_path_buf(),
+    };
+    let nt = spec_from_spawn(&s, folder, taken)?;
+    Some((nt, s))
+}
+
+/// The typed-path SHELL row's effective sticky base: the row is labeled
+/// "Open shell in …", so a claude-kind `last_spawn` (which would silently
+/// spawn a Claude session there) heals to the PowerShell default — each
+/// typed row spawns exactly what it names, and the claude choice lives on
+/// its own row (`claude_dir_spec`).
+pub fn shell_last(last: &SpawnSpec) -> SpawnSpec {
+    if last.kind_tag == "claude" {
+        SpawnSpec {
+            kind_tag: "powershell".into(),
+            program: "powershell.exe".into(),
+            args: Vec::new(),
+            cwd: last.cwd.clone(),
+        }
+    } else {
+        last.clone()
+    }
+}
+
+/// Where `open_launcher` must route (field report #2: "the dropdown does
+/// nothing on the main screen until we run a session").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenTarget {
+    /// The §6.1 empty-state embed IS the launcher — target its query. Only
+    /// valid while the embed actually renders: zero terminals AND the
+    /// Terminal central view.
+    Embed,
+    /// Open the floating overlay — including on the DASHBOARD with zero
+    /// terminals, where no embed renders and mutating the invisible one
+    /// made every entry point a silent no-op.
+    Overlay,
+}
+
+pub fn open_target(terminals_empty: bool, dashboard: bool) -> OpenTarget {
+    if terminals_empty && !dashboard {
+        OpenTarget::Embed
+    } else {
+        OpenTarget::Overlay
+    }
+}
+
 /// Inline custom-command creation (§4.6). The program field's first token is
 /// the program; remaining tokens (both fields, quote-aware) are args.
 pub fn custom_spec(
@@ -560,12 +620,16 @@ pub fn spec_for(
 /// client-side); `sessions` = the open-time `import::scan` result (this fn
 /// re-filters already-imported ids against `state` so an import de-lists on
 /// the next rebuild without rescanning the filesystem).
+/// `last_cwd` = the effective sticky spawn's directory: the New-Claude row
+/// displays the directory it would actually open in (Shiro report #1 —
+/// the target dir used to be invisible until the session was running).
 pub fn build(
     state: &SharedState,
     blocks: &[(Uuid, &[BlockRec])],
     shells: &[ShellChoice],
     sessions: &[FoundSession],
     recents: &[SpawnSpec],
+    last_cwd: &Path,
 ) -> Vec<Candidate> {
     let mut out = Vec::new();
 
@@ -608,10 +672,13 @@ pub fn build(
         "ssh to\u{2026}".into(),
         String::new(),
     ));
+    // Secondary = the directory the session will actually start in (the
+    // same heal `spec_for` applies at activation) — honest, and it makes
+    // the row a hit for path-flavored queries.
     out.push(Candidate::new(
         CandKind::ClaudeNew,
         "New Claude session".into(),
-        String::new(),
+        nonempty_cwd(last_cwd).to_string_lossy().into_owned(),
     ));
 
     // Recent directories: union of terminal cwd/live_cwd + block-rec cwds,
@@ -898,6 +965,8 @@ pub struct ViewCtx<'a> {
 pub enum Activation {
     Cand(u32),
     Typed(PathBuf),
+    /// The typed-path claude row: a fresh Claude session in that directory.
+    TypedClaude(PathBuf),
     Custom { prog: String, args: String },
     /// Freeform ssh from the "ssh to…" expansion (P6c).
     Ssh { host_line: String, remote_hooks: bool },
@@ -940,6 +1009,8 @@ pub fn apply_folder_pick(st: &mut LauncherState, pick: FolderPick, out: &mut Lau
 
 enum RowRef {
     Typed,
+    /// "New Claude session in <typed path>" — rides the same §4.5 probe.
+    TypedClaude,
     Cand(u32),
 }
 
@@ -974,6 +1045,7 @@ fn build_plan(st: &LauncherState) -> Vec<Item> {
     let mut items = Vec::new();
     if st.typed.as_ref().is_some_and(|t| t.dir.is_some()) {
         items.push(Item::Row(RowRef::Typed));
+        items.push(Item::Row(RowRef::TypedClaude));
     }
     let empty_q = st.query.trim().is_empty();
     let mut custom_seen = false;
@@ -1175,6 +1247,13 @@ pub fn view(ui: &mut egui::Ui, st: &mut LauncherState, vc: &ViewCtx) -> Launcher
                                 out.activate = Some(Activation::Typed(p));
                             }
                         }
+                        RowRef::TypedClaude => {
+                            if let Some(p) =
+                                st.typed.as_ref().and_then(|t| t.dir.clone())
+                            {
+                                out.activate = Some(Activation::TypedClaude(p));
+                            }
+                        }
                         RowRef::Cand(i) => match st.cands[*i as usize].kind {
                             CandKind::Custom => toggle_custom = true,
                             CandKind::SshTo => toggle_ssh = true,
@@ -1221,6 +1300,21 @@ pub fn view(ui: &mut egui::Ui, st: &mut LauncherState, vc: &ViewCtx) -> Launcher
                                     .map(|p| p.display().to_string())
                                     .unwrap_or_default();
                                 (Icon::Folder, format!("Open shell in {p}"), String::new(), false, false)
+                            }
+                            RowRef::TypedClaude => {
+                                let p = st
+                                    .typed
+                                    .as_ref()
+                                    .and_then(|t| t.dir.as_ref())
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_default();
+                                (
+                                    Icon::ClaudeSpark,
+                                    format!("New Claude session in {p}"),
+                                    String::new(),
+                                    false,
+                                    false,
+                                )
                             }
                             RowRef::Cand(i) => {
                                 let c = &st.cands[*i as usize];
@@ -1304,6 +1398,14 @@ pub fn view(ui: &mut egui::Ui, st: &mut LauncherState, vc: &ViewCtx) -> Launcher
                                         st.typed.as_ref().and_then(|t| t.dir.clone())
                                     {
                                         out.activate = Some(Activation::Typed(pth));
+                                    }
+                                }
+                                RowRef::TypedClaude => {
+                                    if let Some(pth) =
+                                        st.typed.as_ref().and_then(|t| t.dir.clone())
+                                    {
+                                        out.activate =
+                                            Some(Activation::TypedClaude(pth));
                                     }
                                 }
                                 RowRef::Cand(i) => {
@@ -1857,7 +1959,14 @@ mod tests {
             session(Uuid::new_v4(), "C:\\Fresh", "fix the overlay bug"),
         ];
 
-        let cands = build(&state, &blocks, &degraded_shells(), &sessions, &recents);
+        let cands = build(
+            &state,
+            &blocks,
+            &degraded_shells(),
+            &sessions,
+            &recents,
+            Path::new("C:\\Sticky"),
+        );
 
         // Suggested: 3 distinct known combos, MRU-first == recents head.
         let sugg: Vec<&Candidate> = cands
@@ -1925,7 +2034,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let cands = build(&state, &[], &degraded_shells(), &[], &[]);
+        let cands = build(&state, &[], &degraded_shells(), &[], &[], Path::new("C:\\"));
         let dir = cands
             .iter()
             .find(|c| matches!(c.kind, CandKind::RecentDir { .. }))
@@ -1939,7 +2048,7 @@ mod tests {
         for i in 0..20 {
             state.terminals.push(term("t", &format!("C:\\D{i:02}"), TermKind::Shell));
         }
-        let cands = build(&state, &[], &degraded_shells(), &[], &[]);
+        let cands = build(&state, &[], &degraded_shells(), &[], &[], Path::new("C:\\"));
         let n = cands
             .iter()
             .filter(|c| matches!(c.kind, CandKind::RecentDir { .. }))
@@ -2269,5 +2378,126 @@ mod tests {
         // Esc layering in the embed: an open folder popup consumes the Esc
         // (CloseFolderMenu) — the embed itself still never closes.
         assert_eq!(esc_act(true, false, false), EscAct::CloseFolderMenu);
+    }
+
+    /// Shiro report #2 ("the dropdown does nothing on the main screen until
+    /// we run a session"): open_launcher's routing truth table. The embed
+    /// only renders in the Terminal central view with zero terminals — on
+    /// the dashboard the SAME zero-terminal state must open the overlay,
+    /// not mutate an invisible embed.
+    #[test]
+    fn open_target_truth_table() {
+        // Zero terminals, Terminal view: the §6.1 embed is showing — target it.
+        assert_eq!(open_target(true, false), OpenTarget::Embed);
+        // Zero terminals, DASHBOARD: no embed renders — THE reported bug;
+        // every entry point must open the overlay here.
+        assert_eq!(open_target(true, true), OpenTarget::Overlay);
+        // Terminals exist: always the overlay (embed never renders).
+        assert_eq!(open_target(false, false), OpenTarget::Overlay);
+        assert_eq!(open_target(false, true), OpenTarget::Overlay);
+    }
+
+    /// Shiro report #1: the typed-path CLAUDE row composes a fresh Claude
+    /// session in EXACTLY the chosen directory — fresh session id, cwd
+    /// verbatim, recorded SpawnSpec re-creates the same thing from recents.
+    #[test]
+    fn claude_dir_spec_maps() {
+        let dir = Path::new("C:\\ChosenProj");
+        let (nt, sp) = claude_dir_spec(dir, None, &[]).unwrap();
+        assert_eq!(nt.cwd, PathBuf::from("C:\\ChosenProj"), "the chosen dir, verbatim");
+        assert_eq!(nt.program, "claude");
+        assert!(!nt.already_launched, "a NEW session, not a resume");
+        match &nt.kind {
+            TermKind::Claude { extra_args, .. } => assert!(extra_args.is_empty()),
+            _ => panic!("claude kind"),
+        }
+        assert_eq!(nt.name, "Claude · ChosenProj");
+        assert_eq!(sp.kind_tag, "claude");
+        assert_eq!(sp.cwd, PathBuf::from("C:\\ChosenProj"), "recents record the dir");
+
+        // Two activations mint two DIFFERENT session ids.
+        let (nt2, _) = claude_dir_spec(dir, None, &[]).unwrap();
+        let sid = |nt: &NewTerminal| match &nt.kind {
+            TermKind::Claude { session_id, .. } => *session_id,
+            _ => unreachable!(),
+        };
+        assert_ne!(sid(&nt), sid(&nt2));
+
+        // Folder target and name uniquification ride through.
+        let fid = Uuid::new_v4();
+        let (nt, _) = claude_dir_spec(dir, Some(fid), &["Claude · ChosenProj"]).unwrap();
+        assert_eq!(nt.folder, Some(fid));
+        assert_eq!(nt.name, "Claude · ChosenProj 2");
+    }
+
+    /// The typed SHELL row spawns what it names: a claude-kind sticky spawn
+    /// heals to the PowerShell default (the claude choice is its own row),
+    /// while every shell-kind sticky passes through untouched.
+    #[test]
+    fn typed_shell_row_never_spawns_claude() {
+        let last = spawn("claude", "C:\\Sticky");
+        let healed = shell_last(&last);
+        assert_eq!(healed.kind_tag, "powershell");
+        assert_eq!(healed.cwd, PathBuf::from("C:\\Sticky"), "dir survives the heal");
+        let (nt, sp) = dir_spec(Path::new("C:\\Typed"), &healed, None, &[]).unwrap();
+        assert_eq!(nt.kind, TermKind::Shell, "'Open shell in …' must open a SHELL");
+        assert_eq!(nt.cwd, PathBuf::from("C:\\Typed"));
+        assert_eq!(sp.kind_tag, "powershell");
+
+        // Non-claude stickies are untouched.
+        let last = spawn("wsl:Ubuntu-24.04", "C:\\proj");
+        assert_eq!(shell_last(&last), last);
+    }
+
+    /// Both typed rows enter the display plan when the §4.5 probe resolves:
+    /// shell first (muscle memory), claude second.
+    #[test]
+    fn typed_rows_in_plan() {
+        let mut st = LauncherState::new(None, false, Vec::new(), Vec::new());
+        st.query = "C:\\SomeDir".into();
+        st.typed = Some(TypedDir {
+            q: st.query.clone(),
+            at: Instant::now(),
+            checked: true,
+            dir: Some(PathBuf::from("C:\\SomeDir")),
+        });
+        let plan = build_plan(&st);
+        assert!(
+            matches!(plan[0], Item::Row(RowRef::Typed)),
+            "shell row leads"
+        );
+        assert!(
+            matches!(plan[1], Item::Row(RowRef::TypedClaude)),
+            "claude row rides the same typed path"
+        );
+
+        // No resolved dir ⇒ neither row.
+        st.typed = None;
+        let plan = build_plan(&st);
+        assert!(!plan
+            .iter()
+            .any(|i| matches!(i, Item::Row(RowRef::Typed | RowRef::TypedClaude))));
+    }
+
+    /// The New-Claude row displays the directory it would actually open in
+    /// (the same heal spec_for applies): an explicit sticky dir verbatim,
+    /// an empty one healed to home — never a blank secondary.
+    #[test]
+    fn new_claude_row_shows_target_dir() {
+        let state = SharedState::default();
+        let cands = build(&state, &[], &degraded_shells(), &[], &[], Path::new("C:\\Work"));
+        let row = cands
+            .iter()
+            .find(|c| matches!(c.kind, CandKind::ClaudeNew))
+            .unwrap();
+        assert_eq!(row.secondary, "C:\\Work");
+
+        let cands = build(&state, &[], &degraded_shells(), &[], &[], Path::new(""));
+        let row = cands
+            .iter()
+            .find(|c| matches!(c.kind, CandKind::ClaudeNew))
+            .unwrap();
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("C:\\"));
+        assert_eq!(row.secondary, home.to_string_lossy());
     }
 }

@@ -198,6 +198,14 @@
 //!                 whose frozen app stopped reading stdin wedges only ITS
 //!                 connection — a second connection's echo stays fast (no
 //!                 fleet-wide seizure); thaws the conhost before judging
+//!   launcher_claude_cwd  Shiro report #1: the launcher's claude-row
+//!                 composition (`gui::launcher::claude_dir_spec`) spawns a
+//!                 Claude-kind terminal IN the chosen directory — proven at
+//!                 the PTY level by a staged fake claude printing its
+//!                 process cwd + argv (needs TC_PROBE_FAKE_CLAUDE=1 on a rig
+//!                 with a fake claude.exe FIRST on the daemon's PATH; SKIPs
+//!                 without — a real claude would burn tokens and write into
+//!                 the live ~/.claude store)
 //!
 //! Convention: a new case gets a header line here IN THE SAME PATCH (the
 //! r2 header rewrite decayed within one round without it).
@@ -9774,6 +9782,114 @@ fn ssh_nested_claude_body(host: &str, sid: Uuid) -> anyhow::Result<()> {
 /// before the suite (sweeps leftovers from prior/failed runs) and after every
 /// case (so cleanup happens even when a case fails or times out) — probe
 /// terminals must never pollute the user's real sidebar.
+/// Screenshot rig for Shiro report #1 (see run()'s hidden-verb match): the
+/// same real composition as `case_launcher_claude_cwd`, but the terminal
+/// survives (demo name, not `__probe_`-prefixed) for a GUI capture.
+fn case_claude_cwd_demo_create() -> anyhow::Result<()> {
+    let dir = std::path::PathBuf::from(
+        std::env::var("TC_PROBE_CLAUDE_DIR")
+            .map_err(|_| anyhow::anyhow!("set TC_PROBE_CLAUDE_DIR to the chosen directory"))?,
+    );
+    std::fs::create_dir_all(&dir)?;
+    let mut c = Conn::open()?;
+    let _ = c.first_snapshot()?;
+    let (nt, _) = crate::gui::launcher::claude_dir_spec(&dir, None, &[])
+        .expect("'claude' is a known tag");
+    let name = nt.name.clone();
+    c.send(&C2D::CreateTerminal { spec: nt })?;
+    let state = c.snapshot_until(15, |s| {
+        s.terminals
+            .iter()
+            .any(|t| t.name == name && t.status == TermStatus::Running)
+    })?;
+    let meta = state.terminals.iter().find(|t| t.name == name).unwrap();
+    anyhow::ensure!(meta.cwd == dir, "state cwd mismatch");
+    println!("[claude_cwd_demo] created '{}' id={} cwd={}", name, meta.id, dir.display());
+    Ok(())
+}
+
+/// Shiro report #1 end-to-end: the launcher's typed-path claude row picks
+/// the session's working directory. The case drives the REAL composition fn
+/// (`claude_dir_spec` — exactly what the row's activation sends) into a real
+/// daemon spawn and proves the cwd at the PTY level. Contract with the
+/// staged fake claude.exe: it prints `FAKECLAUDE_CWD=<process cwd>` and one
+/// `FAKECLAUDE_ARG=<arg>` line per argv entry, then blocks on stdin (stays
+/// Running until deleted).
+fn case_launcher_claude_cwd() -> anyhow::Result<()> {
+    if std::env::var("TC_PROBE_FAKE_CLAUDE").ok().as_deref() != Some("1") {
+        return Err(skip(
+            "needs a fake claude.exe FIRST on the daemon's PATH (opt in with \
+             TC_PROBE_FAKE_CLAUDE=1 on such a rig)"
+            .into(),
+        ));
+    }
+    let dir =
+        std::env::temp_dir().join(format!("tcprobe-claude-cwd-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let mut c = Conn::open()?;
+    let _ = c.first_snapshot()?;
+
+    // The REAL launcher composition — the typed-path claude row's activation.
+    let (mut nt, sp) = crate::gui::launcher::claude_dir_spec(&dir, None, &[])
+        .expect("'claude' is a known tag");
+    anyhow::ensure!(
+        sp.kind_tag == "claude" && sp.cwd == dir,
+        "the recorded SpawnSpec must carry the chosen dir"
+    );
+    let sid = match &nt.kind {
+        TermKind::Claude { session_id, .. } => *session_id,
+        _ => anyhow::bail!("claude_dir_spec must compose a Claude-kind terminal"),
+    };
+    nt.name = "__probe_claude_cwd__".into(); // sweepable
+    c.send(&C2D::CreateTerminal { spec: nt })?;
+    let state = c.snapshot_until(15, |s| {
+        s.terminals
+            .iter()
+            .any(|t| t.name == "__probe_claude_cwd__" && t.status == TermStatus::Running)
+    })?;
+    let meta = state
+        .terminals
+        .iter()
+        .find(|t| t.name == "__probe_claude_cwd__")
+        .unwrap();
+    let id = meta.id;
+    anyhow::ensure!(
+        meta.cwd == dir,
+        "the state (every cwd display surface reads it) must record the chosen dir"
+    );
+
+    // PTY-level proof: the launched process's OWN idea of its cwd, plus the
+    // launch_command lane (a fresh `--session-id <sid>` composed per spawn).
+    c.send(&C2D::Attach { id, cols: 160, rows: 40 })?;
+    let want_cwd = format!("FAKECLAUDE_CWD={}", dir.display());
+    let want_sid = format!("FAKECLAUDE_ARG={sid}");
+    let mut collected = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "fake claude never printed `{want_cwd}` + `{want_sid}` \
+             (got {} bytes)",
+            collected.len()
+        );
+        match c.recv() {
+            Ok(D2C::Replay { id: rid, bytes }) | Ok(D2C::Output { id: rid, bytes })
+                if rid == id =>
+            {
+                collected.extend_from_slice(&bytes);
+                let text = String::from_utf8_lossy(&collected).replace("\r\n", "\n");
+                if text.contains(&want_cwd) && text.contains(&want_sid) {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    delete_terminal(&mut c, id);
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
 fn sweep_probes() {
     let Ok(mut c) = Conn::open() else { return };
     let Ok(state) = c.first_snapshot() else { return };
@@ -9818,6 +9934,11 @@ pub fn run(case: Option<&str>) -> anyhow::Result<()> {
     // must survive between invocations; `--probe sweep` cleans up).
     match case {
         Some("blocks_demo_create") => return case_blocks_demo_create(),
+        // Screenshot rig (Shiro report #1): a Claude-kind terminal composed
+        // through the REAL `claude_dir_spec` into $TC_PROBE_CLAUDE_DIR,
+        // left alive (non-__probe_ name) so a GUI capture can show the cwd
+        // chip + the fake claude's own FAKECLAUDE_CWD line.
+        Some("claude_cwd_demo_create") => return case_claude_cwd_demo_create(),
         Some("blocks_demo_run") => return case_blocks_demo_run(),
         Some("composer_demo_arm") => return case_composer_demo_arm(),
         // Hidden ops helper (perf-wave-3): gracefully stop the daemon this
@@ -9918,6 +10039,7 @@ pub fn run(case: Option<&str>) -> anyhow::Result<()> {
         ("sleep_waiters_folder", case_sleep_waiters_folder),
         ("sleep_freeze_frame", case_sleep_freeze_frame),
         ("frame_corrupt_degrade", case_frame_corrupt_degrade),
+        ("launcher_claude_cwd", case_launcher_claude_cwd),
     ];
 
     let selected: Vec<_> = match case {
