@@ -548,7 +548,7 @@ pub fn spawn(
         .name(format!("pty-read-{id}"))
         .spawn(move || {
             let result = catch_unwind(AssertUnwindSafe(|| {
-                let mut buf = vec![0u8; 256 * 1024];
+                let mut buf = vec![0u8; 16 * 1024]; // conhost never delivers >4.3KB/read; 16KiB keeps a wide margin
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
