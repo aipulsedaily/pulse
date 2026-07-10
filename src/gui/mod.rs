@@ -13,7 +13,9 @@ mod glyph_cache;
 /// Blocks lists through the same build_index/filter the popup uses.
 pub mod history;
 mod import;
-mod launcher;
+/// Public within the crate: the launcher_claude_cwd probe composes its
+/// Claude-kind create through the REAL `claude_dir_spec` path.
+pub mod launcher;
 pub mod shells;
 /// ssh-drop (#26): sftp transport, upload queue/workers, and the pure
 /// argv/parser/classifier half (golden-tested in-module).
@@ -1441,6 +1443,17 @@ pub struct App {
     /// exists so two windows can't fight over PTY grids). Never set in
     /// normal use.
     diag_assume_focus: bool,
+    /// DIAGNOSTIC (launcher staging): TC_DIAG_OPEN_LAUNCHER_MS=<ms> invokes
+    /// `open_launcher()` once, N ms after boot — the same method every real
+    /// entry point (titlebar chevron, sidebar +, folder "New terminal
+    /// here…") funnels into — and TC_DIAG_LAUNCHER_QUERY presets the query
+    /// at that invocation. TC_DIAG_START_VIEW=dashboard boots into the card
+    /// dashboard. Display-detached RDP rigs deliver no synthetic clicks or
+    /// keys (same family as TC_DIAG_ASSUME_FOCUS), so scripted staging needs
+    /// product-side hooks to exercise the launcher entry points. Never set
+    /// in normal use.
+    diag_open_launcher: Option<Instant>,
+    diag_launcher_query: Option<String>,
     /// Startup/attach lifecycle stage tracker (perf-wave-3), enabled with
     /// TC_PERF_STAGES=1 — the daemon's stage-timer knob. Log-only; None when
     /// off. gui.log gets `[perf] gui …` lines for cold start (window+wgpu →
@@ -1690,7 +1703,13 @@ impl App {
             any_working: false,
             waiting: Vec::new(),
             previews: HashMap::new(),
-            central_view: CentralView::Terminal,
+            central_view: if std::env::var("TC_DIAG_START_VIEW").ok().as_deref()
+                == Some("dashboard")
+            {
+                CentralView::Dashboard(None)
+            } else {
+                CentralView::Terminal
+            },
             search: None,
             modal: None,
             launcher: None,
@@ -1714,6 +1733,11 @@ impl App {
             diag_empty_ui: std::env::var("TC_DIAG_EMPTY_UI").ok().as_deref() == Some("1"),
             diag_assume_focus: std::env::var("TC_DIAG_ASSUME_FOCUS").ok().as_deref()
                 == Some("1"),
+            diag_open_launcher: std::env::var("TC_DIAG_OPEN_LAUNCHER_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|ms| Instant::now() + Duration::from_millis(ms)),
+            diag_launcher_query: std::env::var("TC_DIAG_LAUNCHER_QUERY").ok(),
             perf3,
             font_perf: None,
             font_step_t0: None,
@@ -5435,18 +5459,33 @@ impl App {
     /// Open the launcher palette (§4.1): mutual exclusion with every other
     /// floating surface, candidates built now (click-time cost), open-frame
     /// focus grab so the first fast keystroke lands in the query (LOW-9).
-    /// While the §6.1 empty-state embed is showing, the embed IS the launcher
-    /// — just target its query (and preset its folder chip).
+    /// While the §6.1 empty-state embed is SHOWING, the embed IS the launcher
+    /// — just target its query (and preset its folder chip). The embed only
+    /// renders in the Terminal central view: on the DASHBOARD with zero
+    /// terminals every entry point (titlebar chevron, sidebar +, folder
+    /// "New terminal here…") used to mutate the invisible embed and read as
+    /// a dead control (field report #2) — those now open the overlay.
     fn open_launcher(&mut self, ctx: &egui::Context, folder: Option<Uuid>) {
         self.search = None;
         self.blocks_panel = None;
         self.history = None;
-        if self.state.terminals.is_empty() {
-            if let Some(l) = self.launcher.as_mut() {
-                l.folder = folder.or(l.folder);
+        match launcher::open_target(
+            self.state.terminals.is_empty(),
+            matches!(self.central_view, CentralView::Dashboard(_)),
+        ) {
+            launcher::OpenTarget::Embed => {
+                if let Some(l) = self.launcher.as_mut() {
+                    l.folder = folder.or(l.folder);
+                } else {
+                    // First frame after a snapshot emptied the list: the
+                    // embed renders next frame either way — creating it now
+                    // just makes the focus grab land.
+                    self.launcher = Some(self.fresh_launcher(folder, true));
+                }
             }
-        } else {
-            self.launcher = Some(self.fresh_launcher(folder, false));
+            launcher::OpenTarget::Overlay => {
+                self.launcher = Some(self.fresh_launcher(folder, false));
+            }
         }
         ctx.memory_mut(|m| m.request_focus(Id::new("launcher_q")));
     }
@@ -5475,6 +5514,7 @@ impl App {
             &st.shells,
             &st.sessions,
             &self.prefs.recent_spawns,
+            &self.effective_last_spawn().cwd,
         );
         st.hits = launcher::filter(&st.cands, &st.query);
         st.sel = st.sel.min(st.hits.len().saturating_sub(1));
@@ -5515,8 +5555,14 @@ impl App {
                     .cands
                     .get(i as usize)
                     .and_then(|c| launcher::spec_for(c, &last, folder, &taken)),
+                // The typed SHELL row spawns what it names — a claude-kind
+                // sticky spawn heals to the PowerShell default (the claude
+                // choice is its own explicit row below).
                 launcher::Activation::Typed(p) => {
-                    launcher::dir_spec(&p, &last, folder, &taken)
+                    launcher::dir_spec(&p, &launcher::shell_last(&last), folder, &taken)
+                }
+                launcher::Activation::TypedClaude(p) => {
+                    launcher::claude_dir_spec(&p, folder, &taken)
                 }
                 launcher::Activation::Custom { prog, args } => {
                     launcher::custom_spec(&prog, &args, &last.cwd, folder, &taken)
@@ -5763,6 +5809,23 @@ impl eframe::App for App {
                     .push(t0.elapsed().as_micros().min(u64::MAX as u128) as u64);
             }
             return;
+        }
+
+        // DIAGNOSTIC one-shot (see the field docs): scripted launcher open
+        // for display-detached staging rigs — no clicks or keys arrive there.
+        if self.diag_open_launcher.is_some_and(|t| Instant::now() >= t) {
+            self.diag_open_launcher = None;
+            self.open_launcher(&ctx, None);
+            if let Some(q) = self.diag_launcher_query.take() {
+                if let Some(l) = self.launcher.as_mut() {
+                    l.query = q;
+                    l.hits = launcher::filter(&l.cands, &l.query);
+                    l.sel = 0;
+                }
+            }
+        }
+        if self.diag_open_launcher.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
 
         // Keep pulsing dots animating without input while anything is Working
