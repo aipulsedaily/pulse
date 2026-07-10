@@ -1042,7 +1042,9 @@ impl App {
 
         let meta = self.state.terminal(id);
         let name = meta.map(|m| m.name.as_str()).unwrap_or("(gone)");
-        let act = self.activity_of(id);
+        let act = meta
+            .map(|m| self.activity_from_meta(m))
+            .unwrap_or_else(|| self.activity_of(id));
         let dead = meta.map(|m| m.status) == Some(TermStatus::Dead);
         let asleep = meta.is_some_and(|m| m.asleep);
 

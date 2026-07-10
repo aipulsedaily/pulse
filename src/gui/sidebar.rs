@@ -180,7 +180,7 @@ impl App {
                 painter.rect_filled(bar, CornerRadius::same(1), ACCENT);
             }
             let dot_c = rect.center();
-            match self.activity_of(id) {
+            match self.activity_from_meta(t) {
                 Activity::Working => {
                     let pulse = 0.75 + 0.25 * (time as f32 * std::f32::consts::TAU).sin();
                     painter.circle_filled(dot_c, 7.0, ACCENT.gamma_multiply(0.20 * pulse));
@@ -640,7 +640,7 @@ impl App {
         let selected = self.selected == Some(t.id);
         let unread = self.unread.contains(&t.id);
 
-        let act = self.activity_of(t.id);
+        let act = self.activity_from_meta(t);
         let bursts = self.activity.get(&t.id).map(|s| s.bursts).unwrap_or(0);
         // LOW-7: one clone of the OSC title (it was cloned here and cloned
         // AGAIN at the sub-line below). An empty title is normalized to None
