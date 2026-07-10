@@ -883,6 +883,13 @@ pub(super) fn upgrade_before_launch(
         return None; // D13: remote_hooks is the consent bit — no hooks, no probes
     }
     let cli = meta.inner_cli.clone()?;
+    // F1 spec §3.5 (I3): a nested identity's store lives under the NESTED
+    // account's home; the sftp legs list the LOGIN user's — any
+    // "correlation" would be a wrong-user hijack laundered to Explicit.
+    // Never probe, never mutate, never clear.
+    if cli.nested {
+        return None;
+    }
     let store = store_for(&cli.adapter)?;
     if !store.remote {
         return None;
@@ -1445,6 +1452,7 @@ mod tests {
             resume_token: None,
             confidence: CliConfidence::Ambiguous,
             cwd: PathBuf::from("/home/alice/proj"),
+            nested: false,
         };
         assert!(sidecar_matches(&s, &cli));
         let mut wrong = cli.clone();

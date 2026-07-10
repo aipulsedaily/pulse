@@ -52,8 +52,10 @@ src=$(printf '%s' "$in" | sed -n 's/.*"source"[^"]*"\([^"]*\)".*/\1/p' | head -n
 if [ -z "$src" ]; then
   src=$(printf '%s' "$in" | sed -n 's/.*"reason"[^"]*"\([^"]*\)".*/\1/p' | head -n 1)
 fi
+cwd=$(printf '%s' "$in" | sed -n 's/.*"cwd"[^"]*"\([^"]*\)".*/\1/p' | head -n 1)
+cwdhex=$(printf '%s' "$cwd" | od -An -v -tx1 2>/dev/null | tr -d ' \n')
 [ -n "$sid" ] || exit 0
-{ printf '\033]7717;tcbeacon;%s;%s;%s\007' "$ev" "${src:-unknown}" "$sid" > /dev/tty; } 2>/dev/null || true
+{ printf '\033]7717;tcbeacon;%s;%s;%s;%s\007' "$ev" "${src:-unknown}" "$sid" "$cwdhex" > /dev/tty; } 2>/dev/null || true
 exit 0
 "#;
 
@@ -359,16 +361,24 @@ mod tests {
     }
 
     /// The beacon script's load-bearing properties: POSIX sh (no bashisms
-    /// in the shebang), the exact OSC shape the BlockScanner parses, LF
-    /// endings, fail-silent exit 0 everywhere.
+    /// in the shebang), the exact OSC shape the BlockScanner parses (F1
+    /// beacon v2: 4th payload field = hex(cwd), hex via `od` so `;`/BEL/ESC
+    /// in a path can never split or terminate the OSC), LF endings,
+    /// fail-silent exit 0 everywhere.
     #[test]
     fn beacon_script_shape() {
         assert!(BEACON_SCRIPT.starts_with("#!/bin/sh\n"));
         assert!(!BEACON_SCRIPT.contains('\r'), "LF only — sh rejects CRLF");
         assert!(BEACON_SCRIPT
-            .contains(r"printf '\033]7717;tcbeacon;%s;%s;%s\007'"));
+            .contains(r"printf '\033]7717;tcbeacon;%s;%s;%s;%s\007'"));
         assert!(BEACON_SCRIPT.contains("> /dev/tty"));
         assert!(BEACON_SCRIPT.trim_end().ends_with("exit 0"));
         assert!(BEACON_SCRIPT.contains(r#"[ -n "$sid" ] || exit 0"#));
+        // v2 cwd leg: extracted from the hook stdin JSON, hex-encoded with
+        // POSIX od (busybox-safe flags), errors swallowed (a cwd-less or
+        // od-less host degrades to an empty field = legacy 3-field behavior
+        // at the parser).
+        assert!(BEACON_SCRIPT.contains(r#"sed -n 's/.*"cwd"[^"]*"\([^"]*\)".*/\1/p'"#));
+        assert!(BEACON_SCRIPT.contains(r"od -An -v -tx1 2>/dev/null | tr -d ' \n'"));
     }
 }

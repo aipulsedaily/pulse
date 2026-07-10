@@ -1682,6 +1682,7 @@ mod tests {
             color_tag: None,
             asleep: false,
             reconnecting: false,
+            nested_chain: None,
         }
     }
 

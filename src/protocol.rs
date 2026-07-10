@@ -656,6 +656,12 @@ pub struct CtlTerm {
     pub hooked: bool, // block store epoch > 0
     pub open_block: Option<CtlOpenBlock>,
     pub last_block: Option<CtlLastBlock>,
+    /// F1 nested-shell breadcrumb (attribution surface for automation; the
+    /// GUI reads the Snapshot instead). APPENDED last — bincode field order
+    /// is wire order; pulse.exe/pulse-ctl.exe ship together (the skew
+    /// window is the install copy-race that already exists).
+    #[serde(default)]
+    pub nested_chain: Option<crate::state::NestedChain>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

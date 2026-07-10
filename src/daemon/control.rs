@@ -626,6 +626,7 @@ impl Core {
                     hooked: bv.is_some_and(|b| b.hooked),
                     open_block: bv.and_then(|b| b.open.clone()),
                     last_block: bv.and_then(|b| b.last.clone()),
+                    nested_chain: t.nested_chain,
                 }
             })
             .collect();

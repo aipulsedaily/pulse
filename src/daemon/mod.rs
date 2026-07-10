@@ -22,7 +22,7 @@ use reconnect::Reconnect;
 mod remote_probe;
 pub mod serialize;
 mod session;
-mod tracker;
+pub(crate) mod tracker;
 mod waiters;
 
 use std::collections::{HashMap, HashSet};
@@ -439,6 +439,18 @@ pub struct Core {
     /// running, so the resume wrapper fires and re-announces itself through
     /// a fresh exec hook.
     cli_blocks: Mutex<HashMap<Uuid, (u32, u64)>>,
+    /// F1 nested-shell episodes LIVE in the current spawn (LEAF lock):
+    /// terminals whose last hook-fed exec classified as a nested shell
+    /// (`sudo su`…) and whose outer shell has not spoken since. While set,
+    /// D2 synthetic submissions append to `meta.nested_chain` and a tcbeacon
+    /// may mint a nested-tagged inner_cli; the outer shell's next
+    /// token-checked hook ends the episode (hooks are process-local to the
+    /// outer shell — its voice returning means the nested world is gone).
+    /// Runtime-only ON PURPOSE: a restore never re-marks it, so a restored
+    /// terminal's fresh hooks can NOT retire the persisted breadcrumb — it
+    /// survives until the user re-enters a nested shell (fresh chain) or a
+    /// new outer-shell CLI launch supersedes it.
+    nested_open: Mutex<HashSet<Uuid>>,
     /// Per-terminal spawn/exit wall-clock window of the CURRENT/most-recent
     /// process (LEAF lock; runtime-only). Powers the claude session-id
     /// re-pin at wake: a transcript jsonl BORN inside this window belongs to
@@ -759,8 +771,8 @@ impl Core {
         // hook tokens rotate per spawn) — handled BEFORE the token check
         // behind its own advisory-trust gates. It mutates only inner_cli /
         // the claude pin, never the block store.
-        if let blocks::HookVerb::Beacon { adapter, event, source, sid } = &ev.verb {
-            self.on_beacon(id, adapter, event, source, sid);
+        if let blocks::HookVerb::Beacon { adapter, event, source, sid, cwd } = &ev.verb {
+            self.on_beacon(id, adapter, event, source, sid, cwd.as_deref());
             return;
         }
         let now = now_ms();
@@ -895,6 +907,21 @@ impl Core {
                     self.broadcast_snapshot();
                 }
             }
+        }
+        // F1 nested-shell episode END — the SINGLE clear mechanism (spec
+        // §2.5): a token-checked pre can only come from the OUTER shell
+        // (hooks are process-local to it), so its prompt returning means the
+        // nested world is gone — runtime marker, breadcrumb, and any
+        // nested-tagged inner_cli all retire. Deliberately NOT keyed to the
+        // opener rec's close (a D2 synthetic submission dangling-closes it
+        // mid-chain) and deliberately unconditional-change-gated: a restored
+        // terminal's FIRST pre retires the persisted breadcrumb too — after
+        // launch() already fed it to the re-establish preface (one-shot
+        // honesty, then a clean slate). Runs BEFORE the outcome early-return
+        // (the common return-to-prompt can be a cwd-refresh pre with no open
+        // block).
+        if is_pre {
+            self.clear_nested_chain(id, "hooked prompt returned");
         }
         let Some((epoch, recs, snap)) = outcome else { return };
         // P6a §7.2 inner-CLI lifecycle, hook-fed (WslShell family only inside
@@ -1283,14 +1310,14 @@ impl Core {
             // Adapter-generic: any confidently-tracked CLI whose registry entry
             // can produce a resume command gets relaunched in place (claude,
             // codex, copilot, qwen, goose, …). Ambiguity is surfaced, never
-            // guessed.
+            // guessed. F1 (I1): `cli_wants_resume` additionally excludes a
+            // nested-tagged identity from BOTH arms — it falls through to
+            // the plain-shell arm (cd-only trailing) and the honest
+            // re-establish preface below; auto-resuming it would run as the
+            // ssh login user against the nested account's session store
+            // (wrong-user hazard, investigation §2c).
             match &meta.inner_cli {
-                Some(cli)
-                    if matches!(
-                        cli.confidence,
-                        CliConfidence::Explicit | CliConfidence::Correlated
-                    ) =>
-                {
+                Some(cli) if tracker::cli_wants_resume(cli) => {
                     match tracker::restore_trailing(&cli.adapter, cli.resume_token.as_deref()) {
                         Some(resume_cmd) if is_wsl => {
                             // §7.4 WslShell row: same wsl argv with the
@@ -1367,7 +1394,7 @@ impl Core {
                         None => spawn_meta.cwd = base_cwd,
                     }
                 }
-                Some(cli) if matches!(cli.confidence, CliConfidence::Ambiguous) => {
+                Some(cli) if matches!(cli.confidence, CliConfidence::Ambiguous) && !cli.nested => {
                     spawn_meta.cwd = base_cwd;
                     ambiguous_adapter = Some(cli.adapter.clone());
                 }
@@ -1386,6 +1413,21 @@ impl Core {
                 }
             }
         }
+        // F1 (I2/I4): a terminal that had a nested-shell chain restores
+        // SHELL-ONLY (the arms above never composed a resume for it) but
+        // never silently — the honest re-establish preface is printed after
+        // spawn. Keyed on the persisted breadcrumb: a bare chain without an
+        // attributed identity still notices (variant C); a nested identity
+        // without its chain (not producible) would stay quiet.
+        let nested_notice: Option<String> = meta.nested_chain.as_ref().map(|chain| {
+            log::info!(
+                "terminal {id}: nested-shell breadcrumb present — shell-only restore (no auto-resume across a privilege boundary)"
+            );
+            tracker::nested_restore_notice(
+                chain,
+                meta.inner_cli.as_ref().filter(|c| c.nested),
+            )
+        });
 
         // Journal Blocks spawn rotation: mint a fresh hook token, regenerate
         // the bootstrap file, bump the store's epoch, and close any block the
@@ -1593,6 +1635,12 @@ impl Core {
                         }
                         // Fresh spawn window (claude re-pin evidence base).
                         self.spawn_times.lock().insert(id, (now_ms(), None));
+                        // F1: the runtime nested-episode marker belongs to
+                        // the DEAD spawn — the fresh session must not accept
+                        // beacons (or D2 appends) against it. The persisted
+                        // breadcrumb stays until the first token-checked pre
+                        // (it already fed the preface above).
+                        self.nested_open.lock().remove(&id);
                         self.sessions.lock().insert(id, s);
                         // SLEEP freeze-frame: waking IS launching — the frame
                         // sidecar dies in the SAME success path that clears
@@ -1606,6 +1654,16 @@ impl Core {
                         let mut s = s;
                         let _ = s.killer.kill();
                         return;
+                    }
+                }
+                if let Some(text) = &nested_notice {
+                    // F1 (I4): the honest re-establish line — preface-space
+                    // like the ambiguous line below (mutually exclusive with
+                    // it by composition: a nested identity never reaches the
+                    // ambiguous arm), never the mirror/PTY stream, never
+                    // keystrokes.
+                    if let Some(s) = self.sessions.lock().get(&id) {
+                        s.preface.lock().push_info_line(text);
                     }
                 }
                 if let Some(adapter) = &ambiguous_adapter {
@@ -1944,6 +2002,103 @@ impl Core {
         }
     }
 
+    /// F1 spec §2.3: a hook-fed exec classified as a nested shell — open a
+    /// fresh breadcrumb, REPLACING any prior chain (the newest witnessed
+    /// opener is the current truth; a user re-entering `sudo su` after a
+    /// restore IS the re-establish). Inserts the runtime episode marker that
+    /// gates beacon acceptance and D2 appends. Claude-kind terminals are
+    /// skipped (their pin lifecycle owns them). `entered_cwd` is the outer
+    /// shell's hook-tracked cwd at entry.
+    fn open_nested_chain(&self, id: Uuid, cmd: &str, entered_cwd: &std::path::Path) {
+        {
+            let state = self.state.lock();
+            let Some(t) = state.terminal(id) else { return };
+            if matches!(t.kind, TermKind::Claude { .. }) {
+                return;
+            }
+        }
+        self.nested_open.lock().insert(id);
+        let changed = {
+            let mut state = self.state.lock();
+            let Some(t) = state.terminal_mut(id) else { return };
+            let chain = crate::state::NestedChain {
+                cmds: vec![cmd.trim().to_string()],
+                entered_cwd: entered_cwd.to_path_buf(),
+                cli_cwd: None,
+                opened_ms: now_ms(),
+            };
+            if t.nested_chain.as_ref() != Some(&chain) {
+                t.nested_chain = Some(chain);
+                state.save_logged("nested chain open");
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            self.broadcast_snapshot();
+        }
+        log::info!("terminal {id}: nested-shell episode opened ({})", cmd.trim());
+    }
+
+    /// F1 spec §2.4: a D2 synthetic submission landed while a nested episode
+    /// is live — append it to the breadcrumb ONLY when it is itself a
+    /// nested-shell spawn (`su - deploy`…): deeper hops extend the
+    /// re-establish chain; cd's and plain inner commands are episode noise
+    /// and are deliberately not recorded. Cap + consecutive-dedupe live in
+    /// `tracker::append_nested_cmd`. Persisted per append (capture-on-change
+    /// is the power-loss guarantee restore metadata lives by); a chain
+    /// mutates a handful of times per episode, never storms.
+    fn append_nested_chain(&self, id: Uuid, cmd: &str) {
+        if !self.nested_open.lock().contains(&id) {
+            return;
+        }
+        if !tracker::nested_shell_cmd(cmd) {
+            return;
+        }
+        let changed = {
+            let mut state = self.state.lock();
+            let Some(t) = state.terminal_mut(id) else { return };
+            let Some(chain) = t.nested_chain.as_mut() else { return };
+            if tracker::append_nested_cmd(&mut chain.cmds, cmd) {
+                state.save_logged("nested chain append");
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            self.broadcast_snapshot();
+        }
+    }
+
+    /// F1 spec §2.5 — the single retirement point: runtime marker, the
+    /// breadcrumb chain, and a nested-tagged inner_cli (NEVER a non-nested
+    /// one) all clear together. Change-gated: one state lock, one save, one
+    /// Snapshot; a terminal with nothing nested pays a marker probe only.
+    fn clear_nested_chain(&self, id: Uuid, why: &str) {
+        let had_marker = self.nested_open.lock().remove(&id);
+        let changed = {
+            let mut state = self.state.lock();
+            let Some(t) = state.terminal_mut(id) else { return };
+            let mut changed = t.nested_chain.take().is_some();
+            if t.inner_cli.as_ref().is_some_and(|c| c.nested) {
+                t.inner_cli = None;
+                changed = true;
+            }
+            if changed {
+                state.save_logged("nested chain clear");
+            }
+            changed
+        };
+        if changed {
+            log::info!("terminal {id}: nested-shell breadcrumb retired ({why})");
+            self.broadcast_snapshot();
+        } else if had_marker {
+            log::debug!("terminal {id}: nested episode marker cleared ({why})");
+        }
+    }
+
     /// Backwards-compatible claude entry point (Layer 1 WSL registry, the
     /// Claude-KIND registry re-pin). Thin wrapper over `apply_cli_session`.
     fn apply_claude_session(&self, id: Uuid, sid: Uuid, why: &str) -> bool {
@@ -1989,6 +2144,13 @@ impl Core {
                 if cli.adapter != adapter {
                     return false;
                 }
+                // F1 spec §3.5 (I3): a nested identity is owned by the
+                // nested beacon lane — the ordinary refine path must never
+                // touch it (an open CLI block + a nested identity cannot
+                // even coexist honestly; refuse rather than launder).
+                if cli.nested {
+                    return false;
+                }
                 let sid_s = sid.to_string();
                 if cli.resume_token.as_deref() == Some(sid_s.as_str())
                     && cli.confidence == CliConfidence::Explicit
@@ -2010,14 +2172,31 @@ impl Core {
     /// own output stream (the consent-installed remote hook script printing
     /// to /dev/tty). Advisory-trust — the beacon carries no rotating token,
     /// so it is believed only when (a) THIS spawn's bootstrap proved itself
-    /// (hooks_live), (b) a same-adapter exec block was observed and is still
-    /// open (cli_blocks + the adapter gate inside apply_cli_session), and (c)
-    /// the payload is uuid-shaped. Spoofing past those gates requires
-    /// same-user code already running inside the session — the Warp-hooks
-    /// trust stance, same as the block hooks. `adapter` selects the target
-    /// (claude vs codex); a beacon whose adapter doesn't match the open CLI
-    /// block's inner_cli is a no-op.
-    fn on_beacon(&self, id: Uuid, adapter: &str, event: &str, source: &str, sid: &str) {
+    /// (hooks_live), (b) a daemon-witnessed block gate holds — an open
+    /// same-adapter CLI block (cli_blocks + the adapter gate inside
+    /// apply_cli_session), OR (F1) a nested-shell episode THIS daemon
+    /// instance observed open (the runtime `nested_open` set, never the
+    /// persisted breadcrumb: a beacon must not attach identity across a
+    /// restart the episode did not survive) — and (c) the payload is
+    /// uuid-shaped. Spoofing past those gates requires same-user code
+    /// already running inside the session — the Warp-hooks trust stance,
+    /// same as the block hooks. The nested lane is additionally quarantined:
+    /// it never re-pins a Claude-kind terminal, never overwrites a
+    /// non-nested inner_cli, is skipped by every auto-consuming leg
+    /// (restore/probe/registry — spec I1/I3), and its only output surface is
+    /// display text behind the `safe_resume_token` + single-quote choke
+    /// points. Worst-case spoof = a decorated preface line — strictly less
+    /// power than the exec-hook surface same-user code already has. `cwd` is
+    /// the v2 beacon's hex-decoded claude cwd (None from legacy scripts).
+    fn on_beacon(
+        &self,
+        id: Uuid,
+        adapter: &str,
+        event: &str,
+        source: &str,
+        sid: &str,
+        cwd: Option<&str>,
+    ) {
         let Ok(sid) = Uuid::parse_str(sid) else {
             log::debug!("terminal {id}: tcbeacon with a non-uuid session dropped");
             return;
@@ -2026,21 +2205,151 @@ impl Core {
             log::debug!("terminal {id}: tcbeacon before hooks_live dropped");
             return;
         }
-        if !self.cli_blocks.lock().contains_key(&id) {
+        if self.cli_blocks.lock().contains_key(&id) {
+            // Ordinary lane, byte-identical to pre-F1 (anti-hijack priority:
+            // an open CLI block always outranks the nested lane). The
+            // deliberate exclusion stands: this lane does NOT consume the v2
+            // cwd field — the exec hook already witnessed the real cwd.
+            if event != "SessionStart" {
+                // claude's SessionEnd(clear|resume) is the transient half of
+                // a switch — the paired SessionStart lands ~200ms later;
+                // other ends mean the CLI is exiting and the block-close
+                // lifecycle owns clearing inner_cli. codex has no
+                // SessionEnd. Either way: observe, never mutate.
+                log::debug!(
+                    "terminal {id}: tcbeacon {adapter} {event} (source={source}) ignored"
+                );
+                return;
+            }
+            if self.apply_cli_session(id, adapter, sid, "tcbeacon") {
+                log::info!("terminal {id}: tcbeacon {adapter} session {sid} (source={source})");
+                self.broadcast_snapshot();
+            }
+            return;
+        }
+        if !self.nested_open.lock().contains(&id) {
             log::debug!("terminal {id}: tcbeacon without an open CLI block dropped");
             return;
         }
-        if event != "SessionStart" {
-            // claude's SessionEnd(clear|resume) is the transient half of a
-            // switch — the paired SessionStart lands ~200ms later; other
-            // ends mean the CLI is exiting and the block-close lifecycle owns
-            // clearing inner_cli. codex has no SessionEnd. Either way:
-            // observe, never mutate.
-            log::debug!("terminal {id}: tcbeacon {adapter} {event} (source={source}) ignored");
+        // F1 nested lane.
+        match event {
+            "SessionStart" => self.apply_nested_cli_session(id, adapter, sid, source, cwd),
+            // A non-transient SessionEnd means the nested CLI exited: the
+            // identity retires, the breadcrumb chain stays (the shell hops
+            // are still what a re-establish needs). clear|resume are the
+            // transient half of an in-TUI switch — the paired SessionStart
+            // lands ~200ms later.
+            "SessionEnd" if source != "clear" && source != "resume" => {
+                self.end_nested_cli_session(id, adapter)
+            }
+            _ => {
+                log::debug!(
+                    "terminal {id}: nested tcbeacon {adapter} {event} (source={source}) ignored"
+                );
+            }
+        }
+    }
+
+    /// F1 spec §3.4: mint a NESTED-tagged inner_cli from a SessionStart
+    /// beacon accepted during a live nested-shell episode. This is the one
+    /// sanctioned exception to "a report can never CREATE cli state"
+    /// (`apply_cli_session`): inside a nested shell no exec hook can ever
+    /// establish the state first, and the beacon IS the CLI's self-report.
+    /// Refusals (I3): Claude-kind terminals, an existing NON-nested
+    /// inner_cli, an existing nested identity for a DIFFERENT adapter, and
+    /// unknown adapters. cwd priority: beacon-witnessed → chain entered_cwd
+    /// (`sudo su` preserves $PWD) → tracked outer cwd; a witnessed cwd also
+    /// lands in `chain.cli_cwd` (the ONLY writer — never inferred).
+    fn apply_nested_cli_session(
+        &self,
+        id: Uuid,
+        adapter: &str,
+        sid: Uuid,
+        source: &str,
+        beacon_cwd: Option<&str>,
+    ) {
+        if !tracker::known_adapter(adapter) {
+            log::debug!("terminal {id}: nested tcbeacon for unknown adapter {adapter} dropped");
             return;
         }
-        if self.apply_cli_session(id, adapter, sid, "tcbeacon") {
-            log::info!("terminal {id}: tcbeacon {adapter} session {sid} (source={source})");
+        // Freshness stamp — same registry-flap suppression contract as
+        // apply_cli_session (harmless for ssh; load-bearing for a WSL
+        // terminal's \\wsl$ scan throttle).
+        self.claude_reports.lock().insert(id, (sid, now_ms()));
+        let changed = {
+            let mut state = self.state.lock();
+            let Some(t) = state.terminal_mut(id) else { return };
+            if matches!(t.kind, TermKind::Claude { .. }) {
+                return; // never re-pin a Claude-kind terminal from here
+            }
+            match &t.inner_cli {
+                Some(c) if !c.nested => {
+                    log::debug!(
+                        "terminal {id}: nested tcbeacon refused — a non-nested {} identity exists",
+                        c.adapter
+                    );
+                    return;
+                }
+                Some(c) if c.adapter != adapter => {
+                    log::debug!(
+                        "terminal {id}: nested tcbeacon adapter {adapter} != tracked {}; dropped",
+                        c.adapter
+                    );
+                    return;
+                }
+                _ => {}
+            }
+            let witnessed = beacon_cwd.map(std::path::PathBuf::from);
+            if let (Some(chain), Some(w)) = (t.nested_chain.as_mut(), witnessed.as_ref()) {
+                chain.cli_cwd = Some(w.clone());
+            }
+            let cwd = witnessed
+                .or_else(|| t.nested_chain.as_ref().map(|c| c.entered_cwd.clone()))
+                .or_else(|| t.live_cwd.clone())
+                .unwrap_or_else(|| t.cwd.clone());
+            let cli = crate::state::InnerCli {
+                adapter: adapter.to_string(),
+                resume_token: Some(sid.to_string()),
+                confidence: CliConfidence::Explicit,
+                cwd,
+                nested: true,
+            };
+            if t.inner_cli.as_ref() != Some(&cli) {
+                t.inner_cli = Some(cli);
+                state.save_logged("nested inner_cli (tcbeacon)");
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            log::info!(
+                "terminal {id}: tcbeacon {adapter} session {sid} tagged nested (source={source}) — attribution only, never auto-resumed"
+            );
+            self.broadcast_snapshot();
+        }
+    }
+
+    /// F1 spec §3.4: a non-transient SessionEnd inside the nested episode —
+    /// retire ONLY a nested same-adapter identity; the breadcrumb chain
+    /// stays (re-establishing the shell hops is still worth a preface).
+    fn end_nested_cli_session(&self, id: Uuid, adapter: &str) {
+        let changed = {
+            let mut state = self.state.lock();
+            let Some(t) = state.terminal_mut(id) else { return };
+            if t.inner_cli
+                .as_ref()
+                .is_some_and(|c| c.nested && c.adapter == adapter)
+            {
+                t.inner_cli = None;
+                state.save_logged("nested inner_cli end (tcbeacon)");
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            log::info!("terminal {id}: nested {adapter} session ended (beacon)");
             self.broadcast_snapshot();
         }
     }
@@ -2092,6 +2401,13 @@ impl Core {
             };
             let Some(cli) = &t.inner_cli else { return false };
             if cli.adapter != "claude" {
+                return false;
+            }
+            // F1 spec §3.5 (I3): a nested claude's registry lives under the
+            // NESTED account's home — scanning the login home would at best
+            // find nothing and at worst hijack a same-cwd login-user session
+            // onto the nested identity. Skip entirely.
+            if cli.nested {
                 return false;
             }
             (distro, cli.cwd.to_string_lossy().into_owned())
@@ -2162,6 +2478,17 @@ impl Core {
             )
         };
         let Some(inner) = tracker::analyze_cmdline(cmd, &cwd) else {
+            // F1 spec §2.3: a nested-shell entry (`sudo su`, `su - x`, plain
+            // `bash`…) is the one hook-fed exec whose EPISODE the hooks
+            // cannot witness — open the breadcrumb instead of a CLI track
+            // (the classifiers are disjoint: an adapter launch never
+            // classifies nested). Inherits this fn's family gate, the
+            // hook_cwd→live_cwd→meta.cwd resolution, and accept_token's
+            // trust class. Any stale pre-restore chain was already retired
+            // by the pre that rendered the prompt this was typed at.
+            if tracker::nested_shell_cmd(cmd) {
+                self.open_nested_chain(id, cmd, &cwd);
+            }
             return;
         };
         self.cli_blocks.lock().insert(id, (epoch, start_off));
@@ -2220,6 +2547,7 @@ impl Core {
                 color_tag: None,
                 asleep: false,
                 reconnecting: false,
+                nested_chain: None,
             });
             if let Err(e) = state.save() {
                 drop(state);
@@ -2262,6 +2590,7 @@ impl Core {
         // r2-M4: these two were missed — tiny entries, but forever.
         self.cli_blocks.lock().remove(&id);
         self.spawn_times.lock().remove(&id);
+        self.nested_open.lock().remove(&id);
         blocks::BlockStore::delete_sidecar(id);
         remote_probe::delete_sidecar(id);
         bootstrap::delete_script(id);
@@ -2987,6 +3316,9 @@ impl Core {
     /// terminal has no prompt hooks to ever CLOSE the record, so opening one
     /// would lie forever.
     pub(crate) fn open_synthetic(&self, id: Uuid, cmd: String, at_off: u64) {
+        // F1 §2.4: keep a copy for the breadcrumb append below — the store
+        // takes ownership of the record's cmd.
+        let chain_cmd = cmd.clone();
         let outcome = {
             let mut map = self.blocks.lock();
             let Some(store) = map.get_mut(&id) else {
@@ -3020,6 +3352,10 @@ impl Core {
             self.notify_blocks(id, epoch, false, recs);
             self.resolve_block_close(id, &closed);
         }
+        // F1 spec §2.4: a submission inside a LIVE nested episode extends
+        // the breadcrumb when it is itself a nested-shell spawn (deeper
+        // hop). Both-gated inside: runtime marker + classifier.
+        self.append_nested_chain(id, &chain_cmd);
     }
 
     /// D14 (P6b §5.3) — the exec-less at-prompt evidence for Cmd-family
@@ -3897,6 +4233,7 @@ pub fn run() -> anyhow::Result<()> {
         fast_exits: Mutex::new(HashMap::new()),
         launching: Mutex::new(HashSet::new()),
         cli_blocks: Mutex::new(HashMap::new()),
+        nested_open: Mutex::new(HashSet::new()),
         last_error_ms: AtomicU64::new(0),
         waiters: Mutex::new(Vec::new()),
         waiter_count: AtomicUsize::new(0),
@@ -4258,6 +4595,7 @@ mod sync_tests {
             color_tag: None,
             asleep: false,
             reconnecting: false,
+            nested_chain: None,
         };
         assert!(should_boot_restore(&t), "awake auto_restore terminal restores");
         t.asleep = true;

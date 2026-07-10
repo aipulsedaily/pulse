@@ -536,6 +536,29 @@ In `on_block_event` (post-token-check, blocks lock released — same slot where
 shell-agnostic text; only the wrapper differs. Ambiguous ⇒ shell restored + preface
 info line (existing `push_info_line`), all families.
 
+### 7.5 F1 — Nested-shell breadcrumb lifecycle (nested-resume spec)
+A hook-fed exec that classifies `nested_shell_cmd` (`sudo su`/`su`/plain `bash`…)
+opens `TerminalMeta.nested_chain` (persisted) + the runtime `nested_open` marker.
+While the episode is live: D2 synthetic submissions that are THEMSELVES nested-shell
+spawns append to the chain (cap 8, consecutive-dedupe); a tcbeacon SessionStart mints
+`InnerCli{nested: true}` (attribution/preface ONLY — `cli_wants_resume` excludes it
+from every auto-resume lane; the probe/registry/refine legs all skip it, spec I3).
+Restore of a terminal holding a chain is SHELL-ONLY (cd-only trailing) plus the
+honest re-establish preface (`tracker::nested_restore_notice`, variants A/B/C) —
+never a resume across a privilege boundary (I1), never keystrokes (I2), never
+silent loss (I4).
+
+| Event | runtime marker | nested_chain | nested inner_cli |
+|---|---|---|---|
+| nested exec hook (`sudo su`) | SET | REPLACED (fresh opener) | kept |
+| D2 synthetic nested spawn | — | append (cap/dedupe) | — |
+| beacon SessionStart (marker set) | — | `cli_cwd` witnessed | minted/refined (nested:true) |
+| beacon SessionEnd (source ∉ {clear,resume}) | — | kept | cleared |
+| token-checked `pre` | CLEARED | CLEARED | CLEARED |
+| sleep / death / power loss | dropped (runtime) | persists | persists |
+| spawn success (restore) | CLEARED | kept until first pre (feeds preface first) | kept until first pre |
+| delete | removed | dies with meta | dies with meta |
+
 ---
 
 ## 8. Restore synthesis (no inner CLI — the common case)
