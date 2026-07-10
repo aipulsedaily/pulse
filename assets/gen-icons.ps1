@@ -1,13 +1,16 @@
 # Pulse - icon asset generator.
 #
 # Renders the app mark to a multi-resolution icon.ico, plus a raw RGBA blob
-# for the eframe window icon. Repeatable: re-run after editing icon.svg /
-# icon-16.svg; commit the generated icon.ico + window-icon-48.rgba so
-# `cargo build` never needs this toolchain.
+# for the eframe window icon. Repeatable: re-run after editing icon.svg;
+# commit the generated icon.ico + window-icon-48.rgba so `cargo build`
+# never needs this toolchain.
 #
-# Small frames (16/24) come from the SIMPLIFIED mark (icon-16.svg: bold
-# chevron + cursor block, no frame/spark) so they survive taskbar-size
-# rasterization; larger frames (32..256) come from the FULL mark (icon.svg).
+# EVERY frame (16..256) comes from the FULL mark (icon.svg). A simplified
+# small-size variant (icon-16.svg) used to feed the 16/24 frames, but that
+# made the taskbar icon visibly different between a 4K monitor (picks 32px+)
+# and a 1080p/100%-scaling monitor (picks 16/24px). Verdict 2026-07-10: the
+# full mark is legible at 16px and consistency across DPI wins — do NOT
+# reintroduce a divergent small mark.
 #
 # Toolchain (verified on this machine): resvg (SVG->PNG, cargo-installed) +
 # Python Pillow (PNG->ICO packing, raw RGBA). No ImageMagick dependency -
@@ -24,24 +27,14 @@ $py = (Get-Command python -ErrorAction SilentlyContinue)
 if (-not $py) { throw "python (with Pillow) not found" }
 
 $full = Join-Path $here 'icon.svg'
-$small = Join-Path $here 'icon-16.svg'
 $tmp = Join-Path $here '_iconbuild'
 New-Item -ItemType Directory -Force $tmp | Out-Null
 
-# size -> which source svg (small mark for <=24px)
-$frames = @(
-    @{ size = 16;  src = $small },
-    @{ size = 24;  src = $small },
-    @{ size = 32;  src = $full  },
-    @{ size = 48;  src = $full  },
-    @{ size = 64;  src = $full  },
-    @{ size = 128; src = $full  },
-    @{ size = 256; src = $full  }
-)
-foreach ($f in $frames) {
-    $out = Join-Path $tmp "icon-$($f.size).png"
-    & resvg -w $f.size -h $f.size $f.src $out | Out-Null
-    if (-not (Test-Path $out)) { throw "resvg failed for size $($f.size)" }
+$sizes = @(16, 24, 32, 48, 64, 128, 256)
+foreach ($s in $sizes) {
+    $out = Join-Path $tmp "icon-$s.png"
+    & resvg -w $s -h $s $full $out | Out-Null
+    if (-not (Test-Path $out)) { throw "resvg failed for size $s" }
 }
 # 48px window icon (eframe IconData needs raw RGBA of a single size).
 & resvg -w 48 -h 48 $full (Join-Path $tmp 'window-48.png') | Out-Null
