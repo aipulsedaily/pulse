@@ -305,6 +305,44 @@ impl Journal {
         (buf, clipped)
     }
 
+    /// pw1 attach lock-split: the raw byte delta `[from, absolute_len())`,
+    /// or `None` when it is not FULLY reconstructible — the head compacted
+    /// past `from` between the caller's two lock holds, or a persistent
+    /// read error — in which case the caller must fall back to
+    /// re-serializing under the lock (a partial delta with a StreamPos at
+    /// absolute_len would be a silent stream gap: worse than the ~20ms the
+    /// split saves). Loop-drains `read_range`'s `max` clip so a flood-sized
+    /// delta can never be silently truncated; callers hold the journal
+    /// lock, so `base`/`len` are frozen and the loop terminates.
+    pub fn delta_from(&self, from: u64) -> Option<Vec<u8>> {
+        // Head-cut check FIRST: read_range clamps a pre-base start onto the
+        // file head and returns bytes that do NOT begin at `from` — those
+        // must never be appended after a serialization taken at `from`.
+        if from < self.base {
+            return None;
+        }
+        let end = self.absolute_len();
+        // Per-read cap only (the loop re-reads until `end`): bounds each
+        // transient buffer, not the delta.
+        const CHUNK: usize = 1024 * 1024;
+        let mut out = Vec::new();
+        let mut at = from;
+        while at < end {
+            let (bytes, _clipped) = self.read_range(at, end, CHUNK);
+            if bytes.is_empty() {
+                // Open/seek/read failure: the remainder is unreadable and a
+                // gapped delta must never be emitted.
+                return None;
+            }
+            // A short (mid-loop-error) read is safe to keep: the next
+            // iteration re-reads from the exact continuation offset, so the
+            // output is contiguous or the loop bails above.
+            at += bytes.len() as u64;
+            out.extend_from_slice(&bytes);
+        }
+        Some(out)
+    }
+
     /// The replay tail for a newly attached client.
     pub fn tail(&self) -> Vec<u8> {
         let mut f = match File::open(&self.path) {
@@ -396,6 +434,79 @@ mod tests {
         assert!(j.dirty);
         j.sync();
         assert!(!j.dirty, "successful sync() clears dirty");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// pw1 attach lock-split: `delta_from` must loop-drain `read_range`'s
+    /// per-read `max` clip — a delta larger than one read's cap must come
+    /// back COMPLETE (a truncated delta with a StreamPos at absolute_len
+    /// would be a silent stream gap). Also pins the exact-bytes and
+    /// empty-delta contracts.
+    #[test]
+    fn delta_from_loop_drains_past_the_read_cap() {
+        let dir = std::env::temp_dir().join(format!("tc-journal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut j = Journal::open_path(dir.join("t.log"), 0).unwrap();
+
+        j.append(b"prefix before the attach snapshot\r\n");
+        let off0 = j.absolute_len();
+
+        // Empty delta (no bytes between the holds): Some(empty), never None.
+        assert_eq!(j.delta_from(off0).as_deref(), Some(&[][..]));
+
+        // A 2.5MiB flood lands between hold 1 and hold 2 — larger than the
+        // 1MiB per-read cap, so a non-looping read would truncate it.
+        let mut flood = Vec::with_capacity(2_621_440);
+        let mut i = 0u64;
+        while flood.len() < 2_621_440 {
+            flood.extend_from_slice(format!("\x1b[31mrow {i:08}\x1b[0m data\r\n").as_bytes());
+            i += 1;
+        }
+        j.append(&flood);
+        let delta = j.delta_from(off0).expect("in-file range must reconstruct");
+        assert_eq!(delta.len(), flood.len(), "delta must not clip at the read cap");
+        assert_eq!(delta, flood, "delta must be the exact appended bytes");
+
+        // Mid-range start reconstructs exactly too.
+        let mid = off0 + 1_500_000;
+        let d2 = j.delta_from(mid).expect("mid-range delta");
+        assert_eq!(d2, flood[1_500_000..], "delta from a mid offset is exact");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// pw1 attach lock-split: a compaction between the two lock holds can
+    /// cut the head past the hold-1 offset — `delta_from` must then refuse
+    /// (None ⇒ the caller re-serializes under the lock) rather than return
+    /// bytes that begin at the post-cut head (read_range's clamp) and gap
+    /// the stream.
+    #[test]
+    fn delta_from_refuses_a_compacted_head() {
+        let dir = std::env::temp_dir().join(format!("tc-journal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut j = Journal::open_path(dir.join("t.log"), 0).unwrap();
+
+        j.append(b"the hold-1 snapshot point is in this early region\r\n");
+        let off0 = j.absolute_len();
+        // Blow past MAX_LEN so append() compacts and the head moves.
+        let row = vec![b'x'; 64 * 1024];
+        let mut compacted = false;
+        for _ in 0..((MAX_LEN / (64 * 1024)) + 4) {
+            if j.append(&row).is_some() {
+                compacted = true;
+                break;
+            }
+        }
+        assert!(compacted, "test setup: compaction must have run");
+        assert!(off0 < j.base, "test setup: the head must have moved past off0");
+        assert_eq!(
+            j.delta_from(off0),
+            None,
+            "a pre-base start must refuse — clamped bytes would gap the stream"
+        );
+        // A post-compaction offset still works.
+        let off1 = j.absolute_len();
+        j.append(b"fresh bytes");
+        assert_eq!(j.delta_from(off1).as_deref(), Some(&b"fresh bytes"[..]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

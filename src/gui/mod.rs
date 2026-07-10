@@ -661,15 +661,16 @@ struct ActivityState {
     /// replay-seeded baseline and the FIRST real episode after boot would
     /// inherit that diff and false-mark.
     unread_adopt: bool,
-    /// The acked visible-content baseline: what the user last saw (refreshed
-    /// while the terminal is selected) or the last settled state already
+    /// The acked visible-content baseline: what the user last saw (captured
+    /// at the deselection edge, pw2-L1) or the last settled state already
     /// judged (refreshed after every settle verdict, marking or not — chrome
     /// drift like a ticking status timer never accumulates into a mark).
     /// None until the attach Replay seeds it; a None baseline ADOPTS the
     /// current grid without marking, so restore/Reset replay comes up quiet.
     unread_base: Option<term_backend::GridDigest>,
-    /// `TermBackend::feed_gen` at the last baseline refresh — skips the
-    /// O(rows×cols) digest while the selected terminal is quiet.
+    /// `TermBackend::feed_gen` at the last baseline refresh — lets the
+    /// deselection-edge capture skip the O(rows×cols) digest when nothing
+    /// was consumed since the baseline was taken.
     unread_base_gen: u64,
 }
 
@@ -702,6 +703,22 @@ impl ActivityState {
 /// rows of changed text. Never marks with no baseline (post-attach/Reset
 /// adoption — boot comes up quiet) or across a resize (row-count mismatch:
 /// reflow moves every hash without any new output; the caller adopts).
+/// pw2-L1: re-base a terminal's unread baseline to its CURRENT grid — "the
+/// user saw exactly this". Called synchronously at the deselection edge
+/// (`select_terminal`), BEFORE `selected` is overwritten; see that call site
+/// for why the capture must be same-frame (a next-frame edge capture bakes
+/// one drain of never-painted bytes into the baseline and can permanently
+/// miss an unread mark).
+fn unread_rebase_on_deselect(st: &mut ActivityState, backend: &TermBackend) {
+    // Gen match ⇒ nothing was consumed since the last capture — the
+    // baseline already reflects this exact grid content, skip the digest.
+    if st.unread_base.is_some() && st.unread_base_gen == backend.feed_gen {
+        return;
+    }
+    st.unread_base = Some(backend.grid_digest());
+    st.unread_base_gen = backend.feed_gen;
+}
+
 fn unread_should_mark(
     base: Option<&term_backend::GridDigest>,
     cur: &term_backend::GridDigest,
@@ -2455,6 +2472,28 @@ impl App {
         // exhaustion path below already defers losslessly (request_repaint +
         // FIFO carry-over), so slicing at ~6ms turns one heavy frame into a
         // few smooth ones — same bytes, same order.
+        //
+        // BOOT-CYCLE PACING (perf-wave-4, diagnosed but deliberately NOT
+        // "fixed" here): during a GUI cold start the attach replays sit
+        // parsed-ready in this channel while drain frames land ~55-88ms
+        // apart — the daemon delivers all N replays in 12ms (N=10) / 36ms
+        // (N=30) and total parse CPU is 27/85ms, yet the cycle takes
+        // 0.2-0.9s. That stall is NOT this slice policy and NOT
+        // repaint-request starvation (TC_DIAG_SPIN=1 requests a repaint
+        // every frame and changes nothing): a minimal eframe 0.35/DX12/
+        // LOW_LATENCY app with ZERO app logic shows the same ~88ms
+        // inter-frame present cadence when visible-but-unfocused vs ~31ms
+        // when activated — eframe/winit/DWM present pacing of
+        // non-foreground windows (AutoVsync + max_frame_latency=1) is the
+        // suspect. Agent rigs cannot hold real user foreground focus, so
+        // whether a genuinely-clicked-open window collapses to vsync pacing
+        // is the open question: diagnose on a real focused cold start (the
+        // [perf] replay lines ship in the binary) BEFORE touching anything.
+        // If gaps survive real focus, the sanctioned fallback is a larger
+        // slice (≤12ms) gated STRICTLY on the boot/reconnect pending set —
+        // steady-state must keep 6ms (r3-2), and present-mode experiments
+        // stay behind an env knob, never default. The selected terminal is
+        // unaffected either way (painted at snapshot+38ms, N-invariant).
         const PARSE_SLICE: Duration = Duration::from_millis(6);
         let t0 = Instant::now();
         let mut parsed = 0usize;
@@ -3247,7 +3286,8 @@ impl App {
                 self.attention_flashed.remove(&id);
             }
             // Unread ack machine (accent dot, Bug A's step_attention pattern):
-            // selection continuously re-bases the digest — "I saw this" — so
+            // the deselection edge re-bases the digest (select_terminal,
+            // pw2-L1) — "I saw this" — so
             // the ack survives any later chrome cycle; an unselected terminal
             // with a queued episode gets ONE verdict once the stream settles.
             // The baseline refreshes after every verdict, marking or not:
@@ -3261,7 +3301,12 @@ impl App {
                 // this also covers the apply_snapshot auto-select path that
                 // bypasses select_terminal (B1).
                 self.unread.remove(&id);
-                if st.unread_base.is_none() || st.unread_base_gen != backend.feed_gen {
+                // Baseline maintenance lives at the DESELECTION edge now
+                // (select_terminal, pw2-L1); only a missing baseline seeds
+                // here (fresh terminal selected before its Replay, post-
+                // Reset gap) so a never-deselected terminal still has one
+                // the moment it needs one.
+                if st.unread_base.is_none() {
                     st.unread_base = Some(backend.grid_digest());
                     st.unread_base_gen = backend.feed_gen;
                 }
@@ -3339,6 +3384,32 @@ impl App {
     /// Select a terminal: clear its unread/burst signals, leave any dashboard,
     /// and drop the scrollback search (matches don't carry across terminals).
     fn select_terminal(&mut self, id: Uuid) {
+        // Unread ack machine (pw2-L1): capture the OUTGOING terminal's
+        // "what the user last saw" baseline here, synchronously at the
+        // deselection edge. The only consumer of a selected terminal's
+        // baseline is the verdict taken after it becomes unselected, so the
+        // per-frame re-digest this replaced (grid_digest on every consumed
+        // frame of a streaming selected terminal, 3-22µs each) was pure
+        // waste. Synchronous capture is load-bearing: the click lands in
+        // ui(), AFTER this frame's drain_ipc and update_activity, so zero
+        // bytes have drained since the last selected-arm pass and the
+        // captured baseline is byte-identical to the continuously
+        // maintained one. A next-frame edge capture would run after the
+        // NEXT frame's drain advanced this grid — one batch of
+        // never-painted bytes baked into the baseline; a stream settling
+        // inside that batch (claude's final chunk landing as the user
+        // clicks away) would then never light the unread dot. Census of
+        // `self.selected` writers: this is the only prev-alive deselection
+        // edge — the delete paths (apply_snapshot prune, delete-modal
+        // neighbor hop) lose the backend anyway, and the auto-select
+        // fallback has no previous terminal.
+        if let Some(prev) = self.selected.filter(|&p| p != id) {
+            if let (Some(backend), Some(st)) =
+                (self.terms.get(&prev), self.activity.get_mut(&prev))
+            {
+                unread_rebase_on_deselect(st, backend);
+            }
+        }
         self.selected = Some(id);
         self.unread.remove(&id);
         if let Some(st) = self.activity.get_mut(&id) {
@@ -6363,6 +6434,44 @@ pub fn run() -> anyhow::Result<()> {
                 let mut setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
                 setup.instance_descriptor.backends =
                     wgpu::Backends::from_env().unwrap_or(wgpu::Backends::DX12);
+                // Memory hints (perf-wave MEM-1): wgpu's default
+                // MemoryHints::Performance maps (DX12/gpu-allocator) to
+                // 128-256MB device + 64-128MB host minimum blocks, committed
+                // up-front per heap type — ~120MB dedicated VRAM + ~60MB
+                // shared + ~180MB private RAM the GUI never touches (the
+                // zero-terminal floor was dominated by it). MemoryUsage
+                // grows in 8MB blocks instead; growth is event-driven
+                // (glyph-atlas upload, vertex-buffer growth, window enlarge —
+                // all already reconfigure-class events), never per-frame:
+                // A/B-measured under simultaneous flood + atlas churn +
+                // resize churn with NO P99.9 frame-time change, steady or
+                // resize-adjacent, while the savings held (−120MB ded /
+                // −60MB shared / −179MB priv). Everything else in this
+                // closure replicates egui-wgpu 0.35's default
+                // device_descriptor (setup.rs, without_display_handle)
+                // verbatim: the GL branch matters because WGPU_BACKEND=gl is
+                // the documented diagnosis path above — full default limits
+                // can exceed a GL adapter's and request_device would fail
+                // (GUI won't boot exactly when the fallback is needed).
+                setup.device_descriptor = std::sync::Arc::new(|adapter| {
+                    let base_limits = if adapter.get_info().backend == wgpu::Backend::Gl {
+                        wgpu::Limits::downlevel_webgl2_defaults()
+                    } else {
+                        wgpu::Limits::default()
+                    };
+                    wgpu::DeviceDescriptor {
+                        label: Some("egui wgpu device"),
+                        required_limits: wgpu::Limits {
+                            // Depth texture must cover the whole surface on
+                            // 4k+ displays (egui's 8192 overlay, kept).
+                            max_texture_dimension_2d: 8192,
+                            ..base_limits
+                        },
+                        // The ONE deliberate change vs egui's default.
+                        memory_hints: wgpu::MemoryHints::MemoryUsage,
+                        ..Default::default()
+                    }
+                });
                 setup.into()
             },
             ..Default::default()
@@ -7244,6 +7353,71 @@ mod tests {
         fresh.advance(b"PS C:\\Users\\zany> claude\r\n\r\nWelcome back.\r\n");
         let seeded = fresh.grid_digest();
         assert!(!unread_should_mark(Some(&seeded), &fresh.grid_digest()));
+    }
+
+    /// pw2-L1: capture-at-deselect ≡ the continuous re-base it replaced —
+    /// and explicitly NOT next-frame-edge semantics. Walks select → stream
+    /// (viewed) → deselect (capture via the exact helper select_terminal
+    /// calls) → stream more → settle. Bytes the user saw before clicking
+    /// away must NOT mark; bytes drained AFTER the deselection MUST mark —
+    /// including when the stream settles inside the very first
+    /// post-deselect drain batch (the regression a next-frame edge capture
+    /// would introduce: one drain of never-painted bytes baked into the
+    /// baseline, dot permanently missed).
+    #[test]
+    fn unread_capture_at_deselect_equivalence() {
+        let size = GridSize {
+            cols: 80,
+            rows: 24,
+            ..GridSize::default()
+        };
+        let mut b = TermBackend::new(size);
+        let mut st = ActivityState::new();
+
+        // Selected: the user watches this stream in. The continuous
+        // re-base kept the baseline at "what is on glass"; the edge capture
+        // below must land on the identical digest.
+        b.advance_live(b"PS C:\\> build\r\nstep 1 ok\r\nstep 2 ok\r\n");
+        let continuous = b.grid_digest(); // what per-frame re-base held
+
+        // Deselection edge: select_terminal's capture, same frame as the
+        // click (no bytes drain between update_activity and the click).
+        unread_rebase_on_deselect(&mut st, &b);
+        let base_at_click = st.unread_base.clone().expect("captured");
+        assert_eq!(
+            base_at_click, continuous,
+            "capture-at-deselect must equal the continuously-maintained baseline"
+        );
+        // Bytes seen BEFORE the click never mark.
+        assert!(!unread_should_mark(Some(&base_at_click), &b.grid_digest()));
+
+        // Settle-in-drained-batch regression case: the stream settles
+        // inside the FIRST post-deselect batch (claude prints its final
+        // answer chunk just as the user clicks away). Those bytes were
+        // never painted for the user — the settle verdict MUST mark.
+        b.advance_live(b"error: build failed\r\nnote: 2 errors emitted\r\n");
+        let settled = b.grid_digest();
+        assert!(
+            unread_should_mark(Some(&base_at_click), &settled),
+            "bytes drained after the deselection edge must mark unread"
+        );
+        // And explicitly NOT next-frame-edge semantics: a baseline captured
+        // after that drain compares equal to the settled grid — that
+        // variant would never light the dot.
+        let next_frame_edge = b.grid_digest();
+        assert!(
+            !unread_should_mark(Some(&next_frame_edge), &settled),
+            "sanity: a next-frame-edge baseline is blind to the settling batch"
+        );
+
+        // Gen-skip guard: nothing consumed since the capture ⇒ a second
+        // deselection edge (reselect + immediate click-away) skips the
+        // digest but keeps the same verdict surface.
+        let mut st2 = ActivityState::new();
+        unread_rebase_on_deselect(&mut st2, &b);
+        let first = st2.unread_base.clone();
+        unread_rebase_on_deselect(&mut st2, &b);
+        assert_eq!(st2.unread_base, first, "no-consumption re-capture is a no-op");
     }
 
     /// SLEEP §7.1: the presented-status → lifecycle-menu table. Running gets
