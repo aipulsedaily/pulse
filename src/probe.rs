@@ -2006,6 +2006,33 @@ fn case_blocks_roundtrip() -> anyhow::Result<()> {
         .find(|r| r.cmd.contains("cmd /c exit 3"))
         .unwrap();
     anyhow::ensure!(r.exit == Some(3), "expected exit 3, got {:?}", r.exit);
+
+    // Fix B (cmdlet exit-code inheritance): a PURE CMDLET run after the
+    // failing native command above must NOT inherit its $LASTEXITCODE — pwsh
+    // only sets $LASTEXITCODE for native commands, so `ls` leaves it at the
+    // stale 3. Before the fix the bootstrap trusted that stale code and `ls`
+    // was mis-flagged failed, drawing its own red gutter that abutted the
+    // native command's into one "bleeding" stripe. It must fold $? to 0/1.
+    c.send(&C2D::Input {
+        id,
+        bytes: b"ls\r".to_vec(),
+    })?;
+    let recs = c.await_blocks(id, 20, |recs| {
+        recs.iter()
+            .any(|r| r.cmd.trim() == "ls" && r.end_off.is_some())
+    })?;
+    let r = recs.iter().find(|r| r.cmd.trim() == "ls").unwrap();
+    anyhow::ensure!(
+        r.exit != Some(3),
+        "cmdlet inherited the prior native exit code: {:?}",
+        r.exit
+    );
+    anyhow::ensure!(
+        matches!(r.exit, Some(0) | Some(1)),
+        "cmdlet-only exit must fold $? to 0/1, got {:?}",
+        r.exit
+    );
+
     ensure_no_new_panics(log0)?;
     delete_terminal(&mut c, id);
     Ok(())
