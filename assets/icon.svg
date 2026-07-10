@@ -2,9 +2,9 @@
   <!-- Pulse app mark (Logo A, chosen 2026-07-06): terminal window
        frame + prompt chevron + cursor underscore, with a four-point spark
        breaking the frame's top-right corner ("terminal with magic"). This is
-       the canonical FULL mark — used for the large icon frames (32px and up),
-       the splash, and the lifecycle windows. The simplified small-size mark
-       is icon-16.svg. Palette: plate #0B0D12 family, ACCENT #7C83FF, TEXT
+       the canonical mark — used for EVERY icon.ico frame (16px..256px, so the
+       taskbar icon is identical on every monitor DPI), the splash, and the
+       lifecycle windows. Palette: plate #0B0D12 family, ACCENT #7C83FF, TEXT
        #E7E9EF (src/gui/theme.rs). -->
   <defs>
     <linearGradient id="plate" x1="0" y1="0" x2="0" y2="1">
