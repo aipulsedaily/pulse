@@ -201,9 +201,10 @@ pub struct BlockFeed {
     /// Ctrl+C at prompt, …). The paint-time self-heal decides whether it is
     /// actually blank.
     saw_exec_since_pre: bool,
-    /// The grid row a fresh prompt is ABOUT to render on: captured at the
-    /// `pre` scan (the bootstrap's flush-sleep means the cursor sits at the
-    /// incoming prompt row's start when the OSC lands), cleared by the
+    /// The grid row a fresh prompt is ABOUT to render on: captured
+    /// provisionally at the `pre` scan and upgraded at the following 133;A
+    /// (D* — the sleepless pre can land before the output tail; the 133;A
+    /// lands after it, at the true prompt row's start), cleared by the
     /// 133;B that ends the render window (prompt_end takes over) and by any
     /// exec. This is the certainty source for the submit-flash blank: the
     /// structural ConPTY window where the fresh raw `PS …>` text renders
@@ -212,6 +213,21 @@ pub struct BlockFeed {
     /// never remapped — on reflow/alt/shrink-below-screen (drop-don't-drift:
     /// a wrong blank is worse than the flash).
     incoming_prompt: Option<i32>,
+    /// D* (perf-wave-3, the pre-sleep removal): the last `pre` scan's row
+    /// reads are PROVISIONAL — with no bootstrap flush-sleep the pre OSC can
+    /// arrive AHEAD of the command's still-unrendered output tail, so the
+    /// cursor at pre-scan may sit mid-output. The 133;A that follows rides
+    /// the text frame AFTER that tail, so `capture_prompt_start` re-reads
+    /// the settled cursor there and upgrades `incoming_prompt` (the col-0
+    /// gate re-applied). Idempotent when nothing reordered (same cursor);
+    /// cleared wherever incoming_prompt drops (exec/alt/reflow) —
+    /// drop-don't-drift.
+    pending_prompt_start: bool,
+    /// Companion to the above: the same pre stamped the last anchor's
+    /// end_line (it was None), so the 133;A upgrade may re-stamp it to the
+    /// settled row. NEVER set when an older end_line already existed — an
+    /// upgrade would clobber correct history.
+    pending_end_line_upgrade: bool,
     /// Cursor grid line at the end of the previous feed — the UP-MOVE
     /// detector for the stale-cover prune (F2). None while alt-screen is
     /// active (the visible cursor belongs to the alt grid) so alt exit never
@@ -276,6 +292,8 @@ impl BlockFeed {
             covers: Vec::new(),
             saw_exec_since_pre: false,
             incoming_prompt: None,
+            pending_prompt_start: false,
+            pending_end_line_upgrade: false,
             last_cursor_line: None,
             replay_base_history: history,
             replay_size: (0, 0),
@@ -653,6 +671,7 @@ impl TermBackend {
                     }
                 }
                 HookVerb::Pre { .. } => self.capture_pre(),
+                HookVerb::PromptStart => self.capture_prompt_start(),
                 HookVerb::PromptEnd => self.capture_prompt_end(),
                 HookVerb::Init { .. } | HookVerb::Beacon { .. } => {}
             }
@@ -714,6 +733,8 @@ impl TermBackend {
             // prompt-render window is definitionally over (a full-screen app
             // owns the screen now) — drop, never blank an alt row.
             bf.incoming_prompt = None;
+            bf.pending_prompt_start = false;
+            bf.pending_end_line_upgrade = false;
             bf.was_alt = true;
             return;
         }
@@ -732,6 +753,8 @@ impl TermBackend {
             bf.anchors.clear();
             bf.prompt_end = None;
             bf.incoming_prompt = None;
+            bf.pending_prompt_start = false;
+            bf.pending_end_line_upgrade = false;
             bf.covers.clear();
             return;
         }
@@ -818,6 +841,10 @@ impl TermBackend {
         bf.prompt_end = None;
         bf.pending_prompt_end = false;
         bf.incoming_prompt = None;
+        // D*: a command is running — any outstanding 133;A upgrade for the
+        // superseded prompt must never re-arm against this exec's rows.
+        bf.pending_prompt_start = false;
+        bf.pending_end_line_upgrade = false;
         // Defensive ordering: the daemon dedupes and offsets are monotonic —
         // a duplicate/late offset can only come from a replayed spoof.
         bf.anchors.retain(|a| a.start_off < start_off);
@@ -908,21 +935,57 @@ impl TermBackend {
             // v0.1.1: a pending upgrade for the SUPERSEDED prompt must never
             // resolve against the fresh prompt's cursor.
             bf.pending_prompt_end = false;
-            // …and the row the fresh prompt will render on IS the cursor row
-            // at this scan (the bootstrap's pre-hook flush-sleep drained the
-            // previous command's text frames first). The composer blanks it
-            // through the render window so the raw prompt never flashes; the
-            // paint gate re-checks the cursor is still ON this row every
-            // frame (a late output tail — the reorder residual — moves it
-            // off and the blank drops, honest raw). COLUMN 0 is required at
+            // …and the row the fresh prompt will render on is the cursor row
+            // at this scan — PROVISIONALLY (D*: with the bootstrap's
+            // pre-hook flush-sleep gone, this pre may precede the command's
+            // last output rows; the following 133;A re-captures settled).
+            // The composer blanks it through the render window so the raw
+            // prompt never flashes; the paint gate re-checks the cursor is
+            // still ON this row every frame (a late output tail — the
+            // reorder residual — moves it off and the blank drops, honest
+            // raw). COLUMN 0 is required at
             // capture: a fresh prompt renders from the row start — a pre
             // scanned with the cursor parked mid-row (the echo/newline of
             // the previous command hasn't rendered yet, the ConPTY reorder)
             // is NOT sitting on the incoming prompt row, and blanking there
             // would blank the OLD prompt/echo row. Drop-don't-drift.
             bf.incoming_prompt = (cur_col == 0).then_some(prompt_line);
+            // D*: both reads above are provisional — without the bootstrap
+            // flush-sleep this pre may have beaten the output tail into the
+            // stream, leaving the cursor mid-output. The 133;A that follows
+            // (after the tail, before the prompt text) re-reads them settled.
+            bf.pending_prompt_start = true;
+            bf.pending_end_line_upgrade = false;
             if let Some(a) = bf.anchors.last_mut() {
                 if a.end_line.is_none() {
+                    a.end_line = Some(prompt_line);
+                    bf.pending_end_line_upgrade = true;
+                }
+            }
+        }
+    }
+
+    /// A PromptStart (OSC 133;A) landed: the prompt render is beginning, so
+    /// the command's output tail — which the sleepless pre OSC may have
+    /// jumped ahead of (D*, the ConPTY OSC-vs-text reorder) — is fully in
+    /// the grid. Upgrade the pre's provisional row reads to the settled
+    /// cursor: the incoming-prompt blank re-arms on the true prompt row
+    /// (col-0 gate re-applied) and the closing anchor's end_line moves to
+    /// the real block end. Idempotent when nothing reordered (the cursor
+    /// hasn't moved since the pre scan); a 133;A with no pre pending (a
+    /// program echoing one mid-output) changes nothing.
+    fn capture_prompt_start(&mut self) {
+        let prompt_line = self.term.grid().cursor.point.line.0;
+        let cur_col = self.term.grid().cursor.point.column.0;
+        let Some(bf) = self.block_feed.as_mut() else { return };
+        if bf.stale || !bf.pending_prompt_start {
+            return;
+        }
+        bf.pending_prompt_start = false;
+        bf.incoming_prompt = (cur_col == 0).then_some(prompt_line);
+        if std::mem::take(&mut bf.pending_end_line_upgrade) {
+            if let Some(a) = bf.anchors.last_mut() {
+                if a.end_line.is_some() {
                     a.end_line = Some(prompt_line);
                 }
             }
@@ -1864,6 +1927,8 @@ impl TermBackend {
                 bf.prompt_end = None;
                 bf.pending_prompt_end = false;
                 bf.incoming_prompt = None;
+                bf.pending_prompt_start = false;
+                bf.pending_end_line_upgrade = false;
                 bf.covers.clear();
             }
             return None;
