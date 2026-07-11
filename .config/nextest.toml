@@ -1,0 +1,33 @@
+# cargo-nextest configuration (Warp-tier1 CI adopt).
+#
+# Why nextest: Pulse's tokio / ConPTY / daemon-socket tests can wedge (a stuck
+# child process, an un-signalled socket) and a plain `cargo test` would then
+# ride the CI job's 60-minute ceiling before the run failed. nextest runs each
+# test in its own process and enforces a per-test wall-clock timeout, so a hang
+# is force-killed in seconds and the run fails fast with the offending test
+# named — exactly the "process sticks around and hangs the runner" class this
+# app is exposed to on Windows runners.
+#
+# LOCAL `cargo test` is UNAFFECTED: this file only governs `cargo nextest`.
+# Doc tests are not run by nextest, but the crate has none, so no separate
+# `cargo test --doc` step is needed.
+
+[profile.default]
+# A test still running after `period` is reported as slow; after
+# `period * terminate-after` it is force-killed and the run fails. Pulse's
+# unit / integration tests run in-process and finish in well under a second
+# each — the heavy real-shell end-to-end suite runs separately via
+# `pulse.exe --probe`, NOT under cargo test — so this 120s ceiling sits far
+# above any legitimate test. It exists solely to guillotine a genuine hang,
+# never to bound a legitimately slow test.
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+[profile.ci]
+# Inherits `slow-timeout` from the default profile. Adds one retry so a
+# timing-sensitive ConPTY/daemon test that flakes on a shared, loaded runner
+# (PTY handshake races) gets a second attempt before failing the gate; a
+# deterministic failure still fails both attempts and blocks the PR.
+retries = 1
+# Fail the whole run only after every test has been attempted, so one failure
+# doesn't mask others in the same CI run.
+fail-fast = false
