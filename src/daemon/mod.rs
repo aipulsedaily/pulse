@@ -826,6 +826,16 @@ impl Core {
         if matches!(ev.verb, blocks::HookVerb::PromptEnd) {
             return;
         }
+        // D* (perf-wave-3): 133;A — the deferred block-close anchor. It is
+        // tokenless by construction (it rides the rendered prompt string),
+        // so it is handled BEFORE the token comparison too; it can only
+        // ever LAND a close that a token-checked pre armed (the
+        // spurious-marker guard lives in BlockStore::on_prompt_start) —
+        // never open, forge, or mark hooks live.
+        if matches!(ev.verb, blocks::HookVerb::PromptStart) {
+            self.resolve_pre_close(id, Some(abs_off));
+            return;
+        }
         // Attribution Layer 3: the remote claude-session beacon is tokenless
         // by construction (the consent-installed remote script is persistent;
         // hook tokens rotate per spawn) — handled BEFORE the token check
@@ -922,15 +932,21 @@ impl Core {
                     if let Some(fill) = pre_cwd_fill {
                         store.last_cwd = Some(fill);
                     }
+                    // D*: this ARMS the close — end_off waits for the 133;A
+                    // anchor (resolve_pre_close lands it, or the ingest
+                    // loop's quiescence fallback flushes it at abs_off). A
+                    // record comes back only when a PREVIOUS armed close had
+                    // to flush first (lost marker).
                     match store.on_pre(exit, n, cwd, abs_off, now) {
                         Some(i) => {
                             let rec = store.recs.get(i).cloned();
                             Some((store.epoch, rec.into_iter().collect(), Some(store.clone())))
                         }
-                        None => None, // cwd refresh only
+                        None => None, // cwd refresh, or close armed
                     }
                 }
                 blocks::HookVerb::PromptEnd => None, // early-returned above
+                blocks::HookVerb::PromptStart => None, // early-returned above
                 blocks::HookVerb::Beacon { .. } => None, // early-returned above
             }
         };
@@ -984,11 +1000,33 @@ impl Core {
             self.clear_nested_chain(id, "hooked prompt returned");
         }
         let Some((epoch, recs, snap)) = outcome else { return };
-        // P6a §7.2 inner-CLI lifecycle, hook-fed (WslShell family only inside
-        // the helpers; all leaf/state locks taken sequentially, never nested):
-        // a closing record that matches the remembered CLI block clears
-        // inner_cli (the CLI exited back to a prompt); an exec that parses as
-        // an adapter launch sets it (and remembers this block's key).
+        self.clear_cli_block_on_close(id, &recs);
+        if let Some(cmd) = &exec_cmd {
+            self.track_hook_exec(id, epoch, abs_off, cmd, hook_cwd);
+        }
+        if let Some(s) = snap {
+            s.save(id);
+        }
+        if !recs.is_empty() {
+            // P5 BlockClose/Run waiters: any record that just CLOSED (a
+            // flushed armed close, or exec closing a dangling predecessor)
+            // can resolve them.
+            let closed: Vec<crate::state::BlockRec> = recs
+                .iter()
+                .filter(|r| r.end_off.is_some())
+                .cloned()
+                .collect();
+            self.notify_blocks(id, epoch, false, recs);
+            self.resolve_block_close(id, &closed);
+        }
+    }
+
+    /// P6a §7.2 inner-CLI lifecycle, hook-fed (WslShell family only inside
+    /// the helpers; all leaf/state locks taken sequentially, never nested):
+    /// a closing record that matches the remembered CLI block clears
+    /// inner_cli (the CLI exited back to a prompt). Shared by the exec
+    /// dangling-close path and the D* deferred close resolution.
+    fn clear_cli_block_on_close(&self, id: Uuid, recs: &[crate::state::BlockRec]) {
         if let Some(key) = recs
             .iter()
             .find(|r| r.end_off.is_some())
@@ -1004,23 +1042,48 @@ impl Core {
                 remote_probe::delete_sidecar(id);
             }
         }
-        if let Some(cmd) = &exec_cmd {
-            self.track_hook_exec(id, epoch, abs_off, cmd, hook_cwd);
-        }
-        if let Some(s) = snap {
-            s.save(id);
-        }
-        if !recs.is_empty() {
-            // P5 BlockClose/Run waiters: any record that just CLOSED (a pre,
-            // or exec closing a dangling predecessor) can resolve them.
-            let closed: Vec<crate::state::BlockRec> = recs
-                .iter()
-                .filter(|r| r.end_off.is_some())
-                .cloned()
-                .collect();
-            self.notify_blocks(id, epoch, false, recs);
-            self.resolve_block_close(id, &closed);
-        }
+    }
+
+    /// D* (perf-wave-3): land a deferred block close — at the 133;A anchor
+    /// offset (`anchor = Some`, just past the marker: after the full output
+    /// tail, before the prompt text), or at the armed pre position
+    /// (`anchor = None`, the ingest loop's quiescence fallback — today's
+    /// sleep-era end_off, byte-identical). Runs the same close side effects
+    /// the pre used to run inline: inner-CLI retirement, sidecar persist,
+    /// Blocks notify, and the P5 BlockClose/Run waiters.
+    fn resolve_pre_close(&self, id: Uuid, anchor: Option<u64>) {
+        let outcome = {
+            let mut map = self.blocks.lock();
+            let Some(store) = map.get_mut(&id) else { return };
+            let idx = match anchor {
+                Some(off) => store.on_prompt_start(off, now_ms()),
+                None => store.flush_pending_close(),
+            };
+            idx.and_then(|i| store.recs.get(i).cloned())
+                .map(|rec| (store.epoch, vec![rec], store.clone()))
+        };
+        let Some((epoch, recs, snap)) = outcome else { return };
+        self.clear_cli_block_on_close(id, &recs);
+        snap.save(id);
+        let closed = recs.clone();
+        self.notify_blocks(id, epoch, false, recs);
+        self.resolve_block_close(id, &closed);
+    }
+
+    /// Leaf-lock peek for the ingest loop (D*): is a pre-armed close still
+    /// awaiting its 133;A on this terminal?
+    pub fn block_pre_close_armed(&self, id: Uuid) -> bool {
+        self.blocks
+            .lock()
+            .get(&id)
+            .is_some_and(|s| s.pre_close_armed())
+    }
+
+    /// The ingest loop's quiescence fallback (D*; see session.rs
+    /// PRE_CLOSE_QUIESCE): the armed close's 133;A never came — close at the
+    /// pre position, byte-identical to the pre-sleep era.
+    pub fn flush_block_pre_close(&self, id: Uuid) {
+        self.resolve_pre_close(id, None);
     }
 
     /// Enqueue a Blocks frame to every client attached to `id` (same
@@ -4838,10 +4901,10 @@ mod sync_tests {
     }
 
     /// U7 companion: a synthetic block (opened by SubmitCommand — no exec
-    /// hook involved) closes on the next pre EXACTLY like a hook-opened one,
-    /// carrying the pre's honest exit — which for cmd's static PROMPT pre is
-    /// None, with the cwd substituted from the adjacent 9;9 (the empty-cwd
-    /// fill path stamps last_cwd BEFORE on_pre runs).
+    /// hook involved) closes on the next pre + 133;A anchor EXACTLY like a
+    /// hook-opened one, carrying the pre's honest exit — which for cmd's
+    /// static PROMPT pre is None, with the cwd substituted from the adjacent
+    /// 9;9 (the empty-cwd fill path stamps last_cwd BEFORE on_pre runs).
     #[test]
     fn synthetic_block_closes_on_pre_with_exit_none() {
         let mut st = blocks::BlockStore::load(Uuid::new_v4()); // no sidecar
@@ -4852,12 +4915,15 @@ mod sync_tests {
         assert_eq!(changed, vec![0]);
         assert_eq!(st.recs[0].cwd.as_deref(), Some(std::path::Path::new("C:\\Users")));
         assert!(st.recs[0].end_off.is_none());
-        // cmd's static pre: e=null, n=0, empty cwd payload.
-        let closed = st.on_pre(None, 0, String::new(), 250, 1_400);
+        // cmd's static pre: e=null, n=0, empty cwd payload. D*: the pre ARMS
+        // the close; cmd's PROMPT renders 133;A right behind it in the same
+        // burst, and the anchor lands the close there.
+        assert_eq!(st.on_pre(None, 0, String::new(), 250, 1_400), None);
+        let closed = st.on_prompt_start(260, 1_400);
         assert_eq!(closed, Some(0));
         let r = &st.recs[0];
         assert_eq!(r.exit, None, "cmd never reports exit codes (D7)");
-        assert_eq!(r.end_off, Some(250));
+        assert_eq!(r.end_off, Some(260));
         assert_eq!(r.ended_ms, Some(1_400));
         assert_eq!(
             st.last_cwd.as_deref(),
