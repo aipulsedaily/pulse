@@ -3270,6 +3270,23 @@ pub fn show(
                 .filter(|_| state.draft.is_empty())
                 .map(|h| h.ghost.lines().next().unwrap_or("").to_string());
             let n_lines = editor_rows(&state.draft);
+            // Prompt syntax highlighting (Tier-2a #1): both TextEdits render
+            // through this layouter — a token-level colorizer over the SAME
+            // lexer Tab completion uses (highlight.rs). Presentation only:
+            // the job matches egui's default layouter in every geometry knob
+            // (font, wrap width, halign, keep_trailing_whitespace), so rows/
+            // wraps/caret rects are identical to an uncolored draft. The
+            // closure tokenizes the text it is HANDED (never a cached draft:
+            // mid-frame edits re-layout before `state.draft` settles); one
+            // O(len) pass per call, galley cache absorbs repeat jobs.
+            let hl_fam = state.fam.clone();
+            let hl_font = font.clone();
+            let mut hl_layouter =
+                move |lui: &Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
+                    let job =
+                        super::highlight::layout_job(&hl_fam, buf.as_str(), &hl_font, wrap_width);
+                    lui.fonts_mut(|f| f.layout_job(job))
+                };
             let resp = if n_lines > 1 {
                 let h = (n_lines.min(EDITOR_MAX_ROWS) as f32) * row_h + 12.0;
                 let h = h.min(grid_rect.height().max(row_h + 12.0));
@@ -3301,6 +3318,7 @@ pub fn show(
                                             egui::TextEdit::multiline(&mut state.draft)
                                                 .id(ed_id)
                                                 .font(font.clone())
+                                                .layouter(&mut hl_layouter)
                                                 .desired_rows(2)
                                                 .desired_width(f32::INFINITY)
                                                 .lock_focus(true)
@@ -3326,6 +3344,7 @@ pub fn show(
                     egui::TextEdit::multiline(&mut state.draft)
                         .id(ed_id)
                         .font(font.clone())
+                        .layouter(&mut hl_layouter)
                         .hint_text(if lane_ghost.is_some() {
                             ""
                         } else {

@@ -107,13 +107,12 @@ fn bs_escapes(fam: &Family) -> bool {
     matches!(fam, Family::Wsl { .. } | Family::Ssh)
 }
 
-/// Split the draft on unquoted whitespace (family quote/escape rules; an
-/// unterminated quote runs to the end — the common mid-edit state) and
-/// return the token CONTAINING the caret (start < caret ≤ end), else an
-/// empty token AT the caret (readline semantics: `cd |` completes the cwd
-/// with an empty stem). Everything outside the returned range is preserved
-/// byte-exact by the caller.
-pub(crate) fn token_at(fam: &Family, s: &str, caret: usize) -> Tok {
+/// Split the WHOLE draft on unquoted whitespace (family quote/escape rules;
+/// an unterminated quote runs to the end — the common mid-edit state).
+/// Byte ranges include any quotes; `value` is the unquoted text. Shared by
+/// the caret lookup below and the prompt highlighter (highlight.rs) — one
+/// lexer, one set of quote rules.
+pub(crate) fn tokens(fam: &Family, s: &str) -> Vec<Tok> {
     let mut toks: Vec<Tok> = Vec::new();
     let mut it = s.char_indices().peekable();
     let mut cur: Option<(usize, String)> = None;
@@ -178,7 +177,16 @@ pub(crate) fn token_at(fam: &Family, s: &str, caret: usize) -> Tok {
             value: v,
         });
     }
-    toks.into_iter()
+    toks
+}
+
+/// The token CONTAINING the caret (start < caret ≤ end), else an empty
+/// token AT the caret (readline semantics: `cd |` completes the cwd with an
+/// empty stem). Everything outside the returned range is preserved
+/// byte-exact by the caller.
+pub(crate) fn token_at(fam: &Family, s: &str, caret: usize) -> Tok {
+    tokens(fam, s)
+        .into_iter()
         .find(|t| t.start < caret && caret <= t.end)
         .unwrap_or(Tok {
             start: caret,
