@@ -8,6 +8,8 @@ pub mod composer;
 /// QOL §4: pure drop translation/quoting/routing. ssh-drop (#26) shares its
 /// `bash_single_quote` and replaces the one Ssh arm in `route_file_drop`.
 pub mod drop;
+/// Ctrl-R history-search matcher (Tier-2b #1): pure scoring, UI-free.
+mod fuzzy;
 mod glyph_cache;
 mod highlight;
 /// Public within the crate: the history_cross_session probe feeds captured
