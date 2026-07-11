@@ -101,13 +101,15 @@ function global:prompt {
   # ConPTY frame-flush race: conhost renders TEXT on an async frame but
   # passes OSC/CSI writes through the pipe immediately, so the pre hook
   # emitted right after a command's output can arrive BEFORE that output in
-  # the stream — the recorded end_off would then exclude the very bytes it
-  # must bracket (probe blocks_text caught real output loss). A buffer-info
-  # query does NOT flush the frame on this conhost (tested); a short sleep
-  # lets the pending frame drain first. Prompt-render latency only — the
-  # exec hook stays sleep-free (it would delay every command's start, and
-  # the GUI's anchor capture tolerates accept-echo skew by design).
-  Start-Sleep -Milliseconds 15
+  # the stream (probe blocks_text caught real output loss). This hook used
+  # to absorb that with `Start-Sleep -Milliseconds 15` — ~16ms of VISIBLE
+  # prompt-return latency on every command (perf-wave-3 D*). The daemon now
+  # closes the block at the NEXT 133;A instead of at this pre's byte
+  # position: 133;A rides prompt()'s RETURN string, i.e. the async text
+  # frame AFTER the command output, so it is a deterministic output/prompt
+  # boundary with no sleep (blocks.rs PendingClose; the ingest quiescence
+  # fallback restores the old pre-position close if 133;A is ever lost).
+  # The exec hook stays sleep-free as ever.
   TCEmit 'pre' @{ e = $e; n = $script:TCN; d = $p }
   [Console]::Write([char]27 + ']9;9;' + $p + [char]7)
   $base = if ($script:TCPrevPrompt) { & $script:TCPrevPrompt } else { 'PS ' + $p + '> ' }
@@ -163,10 +165,17 @@ TCEmit 'init' @{ v = 1; pid = $PID }
 ///   - `e=$?` is captured before anything else in the pre hook — any command
 ///     in the hook would clobber it — and `__tc_pre` goes FIRST in
 ///     PROMPT_COMMAND for the same reason;
-///   - the 15ms pre-hook sleep is the SAME ConPTY frame-drain as the ps1's:
-///     conhost passes OSCs through the pipe immediately but renders text
-///     async, so a sleep-free pre can beat the command's last output rows
-///     into the stream and clip end_off; the exec hook stays sleep-free;
+///   - the 15ms pre-hook sleep is the ConPTY frame-drain the ps1 used to
+///     carry: conhost passes OSCs through the pipe immediately but renders
+///     text async, so a sleep-free pre can beat the command's last output
+///     rows into the stream and clip end_off. The ps1 dropped its sleep for
+///     the daemon-side 133;A close anchor (perf-wave-3 D*) — bash KEEPS the
+///     sleep because here 133;A rides PS1, which a foreign PROMPT_COMMAND
+///     element (git-prompt themes rebuilding PS1 AFTER `__tc_wrap_ps1`) can
+///     strip per-render: pre and 133;A are separable in bash, so the anchor
+///     is not guaranteed to arrive and the quiescence fallback would close
+///     at a sleep-free pre position — the exact clip the drain prevents.
+///     The exec hook stays sleep-free;
 ///   - 133;A/B are wrapped into PS1 IDEMPOTENTLY EVERY PROMPT (`__tc_wrap_ps1`)
 ///     because git-prompt themes rebuild PS1 inside their own PROMPT_COMMAND
 ///     each render; 133;B rides the end of PS1 (bash has no
@@ -875,15 +884,19 @@ mod tests {
         let mut sc = BlockScanner::new();
         let evs = sc.feed(rendered.as_bytes());
         let verbs: Vec<&HookVerb> = evs.iter().map(|e| &e.verb).collect();
-        assert_eq!(verbs.len(), 2, "pre + PromptEnd only: {verbs:?}");
+        assert_eq!(verbs.len(), 3, "pre + PromptStart + PromptEnd only: {verbs:?}");
         assert_eq!(
             *verbs[0],
             HookVerb::Pre { exit: None, n: 0, cwd: String::new() }
         );
         assert_eq!(evs[0].token, "0123456789abcdef");
-        assert_eq!(*verbs[1], HookVerb::PromptEnd);
+        // D*: 133;A parses (the deferred-close anchor) and, in cmd's PROMPT
+        // grammar, immediately follows the pre — so cmd's end_off moves by
+        // exactly the 133;A OSC's own bytes, nothing visible.
+        assert_eq!(*verbs[1], HookVerb::PromptStart);
+        assert_eq!(*verbs[2], HookVerb::PromptEnd);
         // The 9;9 stays a foreign OSC to the block scanner (the session's
-        // OscScanner owns it) and 133;A stays ignored.
+        // OscScanner owns it).
     }
 
     /// U4 (ssh half): base64 vectors (RFC 4648 — the remote coreutils
