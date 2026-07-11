@@ -20,8 +20,12 @@
 //!     (shell-side truncation to 2000 chars);
 //!   - emits `init` once at dot-source time;
 //!   - reproduces the version-faithful startup banner (PS_BANNER, #31) FIRST,
-//!     once per real spawn, suppressed by `-NoLogo`-style args, so a restored
-//!     terminal shows one banner instead of one per restore.
+//!     on the terminal's FIRST-EVER spawn only, suppressed by `-NoLogo`-style
+//!     args. Respawns/restores replay the journaled scrollback — which already
+//!     contains the first launch's banner — so printing it again under the
+//!     seam would break the "continuous terminal" illusion (field bug: every
+//!     daemon restart stamped a fresh banner at the bottom of every restored
+//!     pwsh tab).
 //!
 //! The exit code is best-effort for cmdlet-only pipelines: PowerShell only
 //! sets $LASTEXITCODE for native commands, so pure-cmdlet lines fold $? into
@@ -39,9 +43,15 @@ use crate::state::data_dir;
 /// with `-Command . '<bootstrap>'` makes PowerShell suppress its logo (any
 /// `-Command`/`-File` implies `-NoLogo`), so hooked pwsh tabs opened to a
 /// blank screen while a real terminal shows the banner. The bootstrap prints
-/// it back — FIRST, before anything else, exactly once per real spawn, same
-/// as cmd's honest per-spawn banner (the seam-adjacent banner dedupe in
-/// serialize.rs collapses prior lifetimes' copies at restore seams).
+/// it back — FIRST, before anything else, on the FIRST-EVER spawn only
+/// (`pwsh_banner_for_spawn`): a respawn/restore replays the journal, whose
+/// scrollback already carries the first launch's banner, so reproducing it
+/// again would stamp a duplicate under the restore seam (the respawn-banner
+/// field bug — same product rule as `WslMotd::Restore`). cmd differs: its
+/// banner is printed natively by cmd.exe on every spawn (we can't suppress
+/// it without filtering real PTY bytes — mirror purity forbids that), so the
+/// seam-adjacent banner dedupe in serialize.rs collapses cmd's prior copies
+/// at restore seams instead.
 /// Version-faithful: Windows PowerShell 5.1 prints the 2-line logo + the
 /// "Install the latest PowerShell" hint (byte-verified against a real
 /// interactive powershell.exe on this machine); PowerShell 7+ prints its
@@ -68,6 +78,20 @@ pub fn pwsh_wants_banner(args: &[String]) -> bool {
         };
         t.len() >= 4 && "-nologo".starts_with(t.as_str())
     })
+}
+
+/// THE banner rule for a pwsh spawn (respawn-banner fix): the bootstrap
+/// reproduces the startup logo iff this is the terminal's FIRST-EVER spawn
+/// (the screen would otherwise be blank) AND the user's own args don't ask
+/// for `-NoLogo`. Every other spawn — daemon-restart auto-restore, manual
+/// relaunch of a dead terminal, wake — replays the journaled scrollback,
+/// which already contains the first launch's banner, so printing another
+/// under the seam would break continuity. Callers pass
+/// `first_spawn = !meta.launched_once` (the same flag that gates the seam +
+/// journal replay in launch(), so "replay happens" and "banner suppressed"
+/// can never disagree).
+pub fn pwsh_banner_for_spawn(first_spawn: bool, args: &[String]) -> bool {
+    first_spawn && pwsh_wants_banner(args)
 }
 
 /// `{TOKEN}` and `{BANNER}` are substituted at generation time.
@@ -631,16 +655,21 @@ pub fn mint_token() -> String {
     format!("{v:016x}")
 }
 
+/// The generated ps1 body for a spawn (testable core of `write_script`).
+fn render_script(token: &str, banner: bool) -> String {
+    TEMPLATE
+        .replace("{BANNER}", if banner { PS_BANNER } else { "" })
+        .replace("{TOKEN}", token)
+}
+
 /// (Re)write the bootstrap script for a spawn, embedding `token`. `banner`
 /// reproduces the suppressed startup logo at the top of the dot-source (see
-/// `PS_BANNER`); callers pass `pwsh_wants_banner(&meta.args)`.
+/// `PS_BANNER`); callers pass `pwsh_banner_for_spawn(!meta.launched_once,
+/// &meta.args)` — first-ever spawns only, restores replay the journaled copy.
 pub fn write_script(id: Uuid, token: &str, banner: bool) -> anyhow::Result<PathBuf> {
     std::fs::create_dir_all(bootstrap_dir())?;
     let path = script_path(id);
-    let body = TEMPLATE
-        .replace("{BANNER}", if banner { PS_BANNER } else { "" })
-        .replace("{TOKEN}", token);
-    std::fs::write(&path, body)?;
+    std::fs::write(&path, render_script(token, banner))?;
     Ok(path)
 }
 
@@ -1103,6 +1132,32 @@ mod tests {
         assert!(!f(&["-nol"]));
         assert!(!f(&["/nologo"]));
         assert!(f(&["-NoExit", "-Command", ". 'x.ps1'"]));
+    }
+
+    /// Respawn-banner fix: the banner rides the generated bootstrap iff the
+    /// spawn is the terminal's FIRST-EVER launch AND the args don't opt out.
+    /// A respawn/restore (first_spawn=false) replays the journal — its
+    /// scrollback already holds the first launch's banner — so the generated
+    /// script must carry NO banner text; `-NoLogo` suppresses regardless.
+    #[test]
+    fn banner_first_spawn_only() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // The rule itself.
+        assert!(pwsh_banner_for_spawn(true, &args(&[])));
+        assert!(!pwsh_banner_for_spawn(false, &args(&[])));
+        assert!(!pwsh_banner_for_spawn(true, &args(&["-NoLogo"])));
+        assert!(!pwsh_banner_for_spawn(false, &args(&["-NoLogo"])));
+        // And the generation it drives: first spawn ⇒ banner text at the top
+        // of the script; respawn ⇒ none, byte-identical to the -NoLogo form.
+        let first = render_script("t", pwsh_banner_for_spawn(true, &args(&[])));
+        assert!(first.contains("Windows PowerShell"));
+        assert!(first.contains("Install the latest PowerShell"));
+        let respawn = render_script("t", pwsh_banner_for_spawn(false, &args(&[])));
+        assert!(!respawn.contains("Windows PowerShell"));
+        assert!(!respawn.contains("Install the latest PowerShell"));
+        assert!(respawn.starts_with("# generated by Pulse"));
+        let nologo = render_script("t", pwsh_banner_for_spawn(true, &args(&["-nol"])));
+        assert_eq!(respawn, nologo, "respawn and -NoLogo yield the same script");
     }
 
     #[test]

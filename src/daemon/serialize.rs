@@ -681,10 +681,14 @@ fn dangling_prompt_match(prev: &str, next: &str) -> bool {
 
 /// Seam-adjacent banner dedupe (the "15 stacked `Microsoft Windows
 /// [Version …]` banners after restarts" fix). cmd prints its banner on every
-/// REAL spawn (no off switch exists), the pwsh bootstrap now reproduces the
-/// `-Command`-suppressed logo per spawn, and WSL/ssh sessions re-print their
-/// MOTD per login — so every restore appends one more identical copy to the
-/// journal, and reconstructions showed them all stacked at the seams.
+/// REAL spawn (no off switch exists) and ssh sessions re-print their MOTD
+/// per login — so every restore appends one more identical copy to the
+/// journal, and reconstructions showed them all stacked at the seams. The
+/// pwsh bootstrap used to reproduce the `-Command`-suppressed logo per spawn
+/// too; since the respawn-banner fix it only does so on the FIRST-EVER spawn
+/// (`pwsh_banner_for_spawn`), but this pass stays load-bearing for pwsh as
+/// well: journals written before that fix carry one banner copy per
+/// lifetime, and they must keep collapsing to one on every future restore.
 ///
 /// Rule: a session's OPENING BLOCK — the lines it printed after its boundary
 /// (a restore seam, or the tail start) BEFORE its first prompt-sigil line —

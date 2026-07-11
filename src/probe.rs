@@ -169,9 +169,10 @@
 //!                 frame; a planted corrupt/truncated sidecar degrades an
 //!                 attach to the plain reconstruction (no ?1049h), is
 //!                 removed on first read, and never blocks the wake
-//!   banner        (#31) the version-faithful PS/cmd startup banner reproduces
-//!                 once per real spawn and dedupes on restore — the user's
-//!                 journal collapses from many banners to one
+//!   banner        (#31 + respawn-banner fix) the version-faithful PS startup
+//!                 banner reproduces on the FIRST-EVER spawn only; respawns
+//!                 replay the journaled copy bannerless, so a restored
+//!                 terminal shows exactly one banner, at the top
 //!   cold_attach   the daemon-certified at-prompt PromptState seed lands so
 //!                 the composer arms with the cover on at app open
 //!   ssh_reconnect (proto 10) an unexpected hooked-ssh death schedules the
@@ -714,13 +715,17 @@ fn case_remnant() -> anyhow::Result<()> {
 }
 
 /// Banner-visibility fix, both halves (task: "pwsh tabs missing the startup
-/// banner; cmd stacks ~15 banners across restarts"):
+/// banner; cmd stacks ~15 banners across restarts") + the respawn-banner fix
+/// (field bug: every daemon restart stamped a fresh banner at the BOTTOM of
+/// every restored pwsh tab, under the replayed scrollback):
 ///   - a hooked pwsh spawned WITHOUT -NoLogo shows the real Windows
-///     PowerShell banner (the `-Command . '<bootstrap>'` launch suppresses
-///     the native logo; the bootstrap reproduces it);
+///     PowerShell banner on its FIRST-EVER launch (the `-Command
+///     . '<bootstrap>'` launch suppresses the native logo; the bootstrap
+///     reproduces it);
 ///   - across TWO kill/restart cycles the replay shows the banner EXACTLY
-///     once (seam-adjacent banner dedupe + the preface opening splice) while
-///     old output survives;
+///     once, and it is the FIRST launch's copy at the TOP of the history
+///     (respawns generate a bannerless bootstrap — the replayed scrollback
+///     already carries the banner) while old output survives below it;
 ///   - probe terminals elsewhere pass -NoLogo and stay bannerless (honored).
 fn case_banner() -> anyhow::Result<()> {
     let mut c = Conn::open()?;
@@ -783,8 +788,9 @@ fn case_banner() -> anyhow::Result<()> {
         c.snapshot_until(15, |s| {
             s.terminal(id).is_some_and(|t| t.status == TermStatus::Running)
         })?;
-        // Let the restored shell print its banner + first prompt (the next
-        // cycle's journal must contain a full lifetime).
+        // Let the restored shell print its first prompt — NO banner: the
+        // respawn bootstrap is generated bannerless (the next cycle's
+        // journal must contain a full lifetime).
         std::thread::sleep(Duration::from_millis(2000));
     }
 
@@ -812,9 +818,15 @@ fn case_banner() -> anyhow::Result<()> {
         .iter()
         .position(|l| l.trim() == "Windows PowerShell")
         .unwrap();
+    // Respawn-banner fix: the one surviving banner is the FIRST launch's,
+    // ABOVE the old output — a restored terminal looks continuous, never a
+    // fresh logo stamped under the seam. (Pre-fix this asserted the
+    // opposite: the newest spawn reprinted the banner below old content and
+    // the seam dedupe collapsed the older copies — the exact duplicate the
+    // field bug reported.)
     anyhow::ensure!(
-        banner_at > old,
-        "the surviving banner must be the newest spawn's (below old content)"
+        banner_at < old,
+        "the surviving banner must be the FIRST launch's (above old content): banner at line {banner_at}, old output at {old}"
     );
     delete_terminal(&mut c2, id);
     Ok(())

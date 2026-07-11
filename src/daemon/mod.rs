@@ -1581,11 +1581,21 @@ impl Core {
                 bootstrap::write_cmd_prompt(id, &token)
             } else {
                 // Banner-visibility fix: `-Command` suppresses PowerShell's
-                // logo, so the bootstrap reproduces it (top of the script,
-                // once per real spawn) unless the terminal's own args say
-                // -NoLogo. Checked on the PERSISTED meta args (the user's),
-                // not spawn_meta's synthesized tail.
-                bootstrap::write_script(id, &token, bootstrap::pwsh_wants_banner(&meta.args))
+                // logo, so the bootstrap reproduces it (top of the script)
+                // on the FIRST-EVER spawn only, unless the terminal's own
+                // args say -NoLogo. Respawns/restores (launched_once — the
+                // same flag that gates the seam + journal replay below)
+                // NEVER reprint it: the replayed scrollback already carries
+                // the first launch's banner, and a fresh copy under the seam
+                // broke the continuous-terminal illusion on every daemon
+                // restart (respawn-banner field bug; pwsh mirror of the
+                // WslMotd::Restore rule above). Checked on the PERSISTED
+                // meta args (the user's), not spawn_meta's synthesized tail.
+                bootstrap::write_script(
+                    id,
+                    &token,
+                    bootstrap::pwsh_banner_for_spawn(!meta.launched_once, &meta.args),
+                )
             };
             let path = match write_result {
                 Ok(p) => Some(p),
