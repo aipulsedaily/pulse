@@ -726,6 +726,12 @@ fn case_remnant() -> anyhow::Result<()> {
 ///     once, and it is the FIRST launch's copy at the TOP of the history
 ///     (respawns generate a bannerless bootstrap — the replayed scrollback
 ///     already carries the banner) while old output survives below it;
+///   - the SEAM is prompt-clean (respawn-seam fix, the "bare PS C:\> under
+///     the scrollback" second half): an attach landing BEFORE the respawned
+///     shell's first prompt — the GUI's boot timing — already carries no
+///     dead dangling prompt (build-time preface truncation on 133;B byte
+///     proof), and the settled replay holds exactly ONE bare prompt (live);
+///   - first spawn is honest: banner bytes precede the first prompt;
 ///   - probe terminals elsewhere pass -NoLogo and stay bannerless (honored).
 fn case_banner() -> anyhow::Result<()> {
     let mut c = Conn::open()?;
@@ -769,6 +775,21 @@ fn case_banner() -> anyhow::Result<()> {
             && seen.contains("Copyright (C) Microsoft Corporation. All rights reserved."),
         "banner incomplete on fresh spawn: {seen:?}"
     );
+    // First-spawn honesty (respawn-seam fix): the banner precedes the first
+    // prompt in the byte stream — no real console renders a prompt above its
+    // own startup logo. (The field "PS C:\Users> above the banner" was the
+    // DEAD lifetime's dangling prompt above the restore seam, pinned by the
+    // early-attach assertion below — but the first-spawn order is asserted
+    // here so a bootstrap reordering can never reintroduce the shape.)
+    if let Some(prompt_at) = seen.find("PS C:\\") {
+        let banner_at = seen
+            .find("Windows PowerShell")
+            .expect("banner presence asserted above");
+        anyhow::ensure!(
+            banner_at < prompt_at,
+            "first spawn must print banner BEFORE the first prompt: {seen:?}"
+        );
+    }
 
     // Recognizable old content, then two kill/restart cycles (the user
     // acceptance: "restart the app twice → exactly one banner").
@@ -779,7 +800,7 @@ fn case_banner() -> anyhow::Result<()> {
     c.await_output(id, 20, |l| {
         l.trim_start().starts_with("BANNER_OLD_1") && !l.contains("echo")
     })?;
-    for _ in 0..2 {
+    for cycle in 0..2 {
         c.send(&C2D::KillTerminal { id })?;
         c.snapshot_until(10, |s| {
             s.terminal(id).is_some_and(|t| t.status == TermStatus::Dead)
@@ -788,6 +809,41 @@ fn case_banner() -> anyhow::Result<()> {
         c.snapshot_until(15, |s| {
             s.terminal(id).is_some_and(|t| t.status == TermStatus::Running)
         })?;
+        // EARLY-ATTACH pin (respawn-seam fix — the GUI boot shape): attach
+        // BEFORE the respawned shell prints its first prompt. The replay
+        // must ALREADY be free of the dead lifetime's bare dangling prompt:
+        // the preface-build truncation (`tail_ends_at_bare_prompt`) needs no
+        // future prompt to compare against, unlike the attach-time matcher —
+        // which is exactly why the field GUI (attaching within ms of boot
+        // restore, seconds before a cold pwsh prompts) kept showing the dead
+        // `PS C:\>` under the scrollback. Timing-tolerant: if the live
+        // prompt DID sneak in first, it must be the only bare prompt and sit
+        // on the final content line.
+        if cycle == 1 {
+            let mut ce = Conn::open()?;
+            let _ = ce.first_snapshot()?;
+            let early = strip_ansi(&String::from_utf8_lossy(&ce.replay(id)?));
+            let elines: Vec<&str> = early.lines().collect();
+            let bare: Vec<usize> = elines
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| {
+                    let t = l.trim();
+                    t.starts_with("PS ") && t.ends_with('>')
+                })
+                .map(|(i, _)| i)
+                .collect();
+            let last_content = elines.iter().rposition(|l| !l.trim().is_empty());
+            anyhow::ensure!(
+                bare.is_empty() || (bare.len() == 1 && Some(bare[0]) == last_content),
+                "early attach: dead lifetime's dangling prompt survived at the seam \
+                 (bare prompt rows {bare:?}, last content {last_content:?}): {:?}",
+                elines
+                    .iter()
+                    .filter(|l| !l.trim().is_empty())
+                    .collect::<Vec<_>>()
+            );
+        }
         // Let the restored shell print its first prompt — NO banner: the
         // respawn bootstrap is generated bannerless (the next cycle's
         // journal must contain a full lifetime).
@@ -828,7 +884,130 @@ fn case_banner() -> anyhow::Result<()> {
         banner_at < old,
         "the surviving banner must be the FIRST launch's (above old content): banner at line {banner_at}, old output at {old}"
     );
+    // Respawn-seam fix: after everything settles, exactly ONE bare prompt
+    // line remains — the live one. Every dead lifetime's dangling prompt was
+    // dropped (build-time truncation for the final one, the render-time seam
+    // pass for older copies already flanked in the journal). This is the
+    // "restored terminal = scrollback + Pulse's prompt row, nothing else"
+    // acceptance in text form.
+    let bare = lines
+        .iter()
+        .filter(|l| {
+            let t = l.trim();
+            t.starts_with("PS ") && t.ends_with('>')
+        })
+        .count();
+    anyhow::ensure!(
+        bare == 1,
+        "expected exactly one bare prompt (the live one) after two restarts, found {bare}: {:?}",
+        lines
+            .iter()
+            .filter(|l| !l.trim().is_empty())
+            .collect::<Vec<_>>()
+    );
     delete_terminal(&mut c2, id);
+    Ok(())
+}
+
+/// Hidden diagnosis rig (respawn-banner fix, seam-pollution half): dump the
+/// EXACT replay bytes a GUI-shaped sized attach receives after a respawn, so
+/// the "bare PS C:\> at the restore seam" artifact can be located in the
+/// stream (dead lifetime's dangling prompt vs live re-render vs preface bug).
+/// Never in the sweep — run with `--probe banner_diag` against a staging
+/// daemon.
+fn case_banner_diag() -> anyhow::Result<()> {
+    let esc = |b: &[u8]| -> String {
+        String::from_utf8_lossy(b)
+            .replace('\x1b', "<ESC>")
+            .replace('\x07', "<BEL>")
+            .replace('\r', "<CR>")
+            .replace('\n', "<LF>\n")
+    };
+    let mut c = Conn::open()?;
+    let _ = c.first_snapshot()?;
+    c.send(&C2D::CreateTerminal {
+        spec: NewTerminal {
+            name: "__probe_bannerdiag__".into(),
+            folder: None,
+            kind: TermKind::Shell,
+            program: "powershell.exe".into(),
+            args: vec![], // banner wanted
+            cwd: "C:\\".into(),
+            already_launched: false,
+            shell_cfg: None,
+        },
+    })?;
+    let state = c.snapshot_until(10, |s| {
+        s.terminals
+            .iter()
+            .any(|t| t.name == "__probe_bannerdiag__" && t.status == TermStatus::Running)
+    })?;
+    let id = state
+        .terminals
+        .iter()
+        .find(|t| t.name == "__probe_bannerdiag__")
+        .unwrap()
+        .id;
+    // GUI-shaped: sized attach.
+    c.send(&C2D::Attach { id, cols: 120, rows: 30 })?;
+    let _ = c.await_output(id, 20, |l| l.contains("Install the latest PowerShell"))?;
+    c.send(&C2D::Input {
+        id,
+        bytes: b"echo DIAG_OLD\r".to_vec(),
+    })?;
+    c.await_output(id, 20, |l| {
+        l.trim_start().starts_with("DIAG_OLD") && !l.contains("echo")
+    })?;
+    c.send(&C2D::KillTerminal { id })?;
+    c.snapshot_until(10, |s| {
+        s.terminal(id).is_some_and(|t| t.status == TermStatus::Dead)
+    })?;
+    c.send(&C2D::RestartTerminal { id })?;
+    c.snapshot_until(15, |s| {
+        s.terminal(id).is_some_and(|t| t.status == TermStatus::Running)
+    })?;
+    std::thread::sleep(Duration::from_millis(2500));
+
+    // Fresh conn, attach at the SAME size the terminal is running at.
+    let mut c2 = Conn::open()?;
+    let _ = c2.first_snapshot()?;
+    c2.send(&C2D::Attach { id, cols: 120, rows: 30 })?;
+    let same = loop {
+        match c2.recv() {
+            Ok(D2C::Replay { id: rid, bytes }) if rid == id => break bytes,
+            Ok(_) => {}
+            Err(e) => anyhow::bail!("no same-size replay: {e}"),
+        }
+    };
+    println!("\n===== REPLAY same-size (120x30) =====\n{}", esc(&same));
+
+    // Fresh conn, attach at a DIFFERENT size (the boot-attach shape: the GUI
+    // window rarely matches the daemon-restore grid).
+    let mut c3 = Conn::open()?;
+    let _ = c3.first_snapshot()?;
+    c3.send(&C2D::Attach { id, cols: 100, rows: 26 })?;
+    let diff = loop {
+        match c3.recv() {
+            Ok(D2C::Replay { id: rid, bytes }) if rid == id => break bytes,
+            Ok(_) => {}
+            Err(e) => anyhow::bail!("no diff-size replay: {e}"),
+        }
+    };
+    println!("\n===== REPLAY resized (100x26) =====\n{}", esc(&diff));
+    // Give the shell a moment to repaint at the new size, then dump the
+    // follow-up Output frames (the resize re-render the mirror sees).
+    std::thread::sleep(Duration::from_millis(1500));
+    let mut post: Vec<u8> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        match c3.recv() {
+            Ok(D2C::Output { id: rid, bytes }) if rid == id => post.extend_from_slice(&bytes),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    println!("\n===== post-resize Output frames =====\n{}", esc(&post));
+    delete_terminal(&mut c3, id);
     Ok(())
 }
 
@@ -10005,6 +10184,13 @@ pub fn run(case: Option<&str>) -> anyhow::Result<()> {
         // chip + the fake claude's own FAKECLAUDE_CWD line.
         Some("claude_cwd_demo_create") => return case_claude_cwd_demo_create(),
         Some("blocks_demo_run") => return case_blocks_demo_run(),
+        // Hidden byte-level diagnosis for the respawn seam (never swept in).
+        Some("banner_diag") => {
+            sweep_probes();
+            let r = case_banner_diag();
+            sweep_probes();
+            return r;
+        }
         Some("composer_demo_arm") => return case_composer_demo_arm(),
         // Hidden ops helper (perf-wave-3): gracefully stop the daemon this
         // data dir's daemon.json points at — Shutdown frame with the
