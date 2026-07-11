@@ -610,7 +610,37 @@ pub fn spawn(
                 // Boot-timeline marker (perf-wave-3): the first hooked prompt
                 // is "this session is interactive again" — the restore metric.
                 let mut first_prompt_pending = super::perf::on();
-                while let Ok(first) = chunk_rx.recv() {
+                // D* (perf-wave-3): the pwsh bootstrap dropped its 15ms
+                // pre-hook drain sleep — a pre now ARMS the block close and
+                // end_off waits for the 133;A anchor that rides the text
+                // frame behind it. CONTRACT: while a close is armed, park
+                // with this timeout instead of indefinitely; if the stream
+                // stays quiet this long with no 133;A, the marker is lost
+                // (prompt clobbered, hooks stripped) and the close flushes
+                // at the pre position — byte-identical to the sleep-era
+                // end_off. Quiescence-based (every arriving chunk restarts
+                // the window), so a flood between pre and 133;A can never
+                // misfire it. 40ms mirrors the GUI's PROMPT_END_QUIESCE for
+                // the same ConPTY OSC-vs-text reorder (term_backend.rs): the
+                // reordered text frame lands well inside it on slow rigs.
+                const PRE_CLOSE_QUIESCE: std::time::Duration =
+                    std::time::Duration::from_millis(40);
+                loop {
+                    let first = if ingest_core.block_pre_close_armed(id) {
+                        match chunk_rx.recv_timeout(PRE_CLOSE_QUIESCE) {
+                            Ok(c) => c,
+                            Err(mpsc::RecvTimeoutError::Timeout) => {
+                                ingest_core.flush_block_pre_close(id);
+                                continue;
+                            }
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                    } else {
+                        match chunk_rx.recv() {
+                            Ok(c) => c,
+                            Err(_) => break,
+                        }
+                    };
                     batch.clear();
                     batch.extend_from_slice(&first);
                     drain(&mut batch, &chunk_rx);
@@ -703,9 +733,13 @@ pub fn spawn(
                                     *reader_prompt.lock() = None;
                                 }
                                 // A beacon fires mid-TUI, never at a prompt —
-                                // the latch is untouched (like Init).
+                                // the latch is untouched (like Init). D*
+                                // 133;A only anchors the deferred block
+                                // close (on_block_event below); the prompt
+                                // latch is 133;B's alone.
                                 super::blocks::HookVerb::Init { .. }
-                                | super::blocks::HookVerb::Beacon { .. } => {}
+                                | super::blocks::HookVerb::Beacon { .. }
+                                | super::blocks::HookVerb::PromptStart => {}
                             }
                             ingest_core.on_block_event(
                                 id,

@@ -75,6 +75,18 @@ pub enum HookVerb {
         /// junk hex) yield None (preface variant B). APPENDED last.
         cwd: Option<String>,
     },
+    /// OSC 133;A — start of the prompt render (perf-wave-3 D*). Unlike the
+    /// `pre`/9;9 OSCs — immediate ConPTY passthroughs that can beat the
+    /// command's last output rows through the pipe (conhost renders text on
+    /// an async frame) — 133;A is emitted inside the rendered prompt string
+    /// itself, so it rides the text frame AFTER the command output: a
+    /// deterministic boundary between output tail and prompt text. The
+    /// daemon anchors a pre-armed block close's `end_off` to it
+    /// (`BlockStore::on_prompt_start`), which is what let the bootstrap drop
+    /// its 15ms pre-hook drain sleep. Tokenless like PromptEnd — it can only
+    /// ever RESOLVE a close a token-checked pre armed, never open or forge
+    /// one. APPENDED last.
+    PromptStart,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -246,15 +258,25 @@ struct PrePayload {
 }
 
 /// Parse an OSC body (bytes between `ESC ]` and the terminator). Only bodies
-/// starting `7717;` are ours — plus the tokenless `133;B` prompt-end marker
-/// (P3); anything malformed is dropped with a debug log.
+/// starting `7717;` are ours — plus the tokenless `133;B` prompt-end and
+/// `133;A` prompt-start markers (P3 / D*); anything malformed is dropped
+/// with a debug log.
 fn parse_hook(body: &[u8], offset_after: usize) -> Option<BlockEvent> {
     // Prompt-end marker: reuse the already-running DFA rather than a second
-    // scanner (which would drift). `133;A` and every other OSC stay ignored.
+    // scanner (which would drift). Every other OSC stays ignored.
     if body == b"133;B" {
         return Some(BlockEvent {
             token: String::new(),
             verb: HookVerb::PromptEnd,
+            offset_in_chunk: offset_after,
+        });
+    }
+    // Prompt-start marker (D*): the deferred block close's end_off anchor —
+    // same tokenless treatment as 133;B.
+    if body == b"133;A" {
+        return Some(BlockEvent {
+            token: String::new(),
+            verb: HookVerb::PromptStart,
             offset_in_chunk: offset_after,
         });
     }
@@ -400,6 +422,36 @@ pub struct BlockStore {
     /// behavior change for cmd (its static pre is already `e:null`). Runtime
     /// truth only — never persisted; cleared by hook-opened blocks.
     pub synthetic_open: bool,
+    /// D* (perf-wave-3): a `pre` arrived for an open block — the close is
+    /// ARMED but end_off waits for the next 133;A (see `PendingClose`).
+    /// Runtime truth only — never persisted (the sidecar serializes
+    /// epoch/base/recs); a launch rotation's `close_dangling` flushes it.
+    pending_close: Option<PendingClose>,
+}
+
+/// D* (perf-wave-3): the armed-but-deferred block close. The pre/9;9 OSCs
+/// are immediate ConPTY passthroughs that can arrive BEFORE the command's
+/// last output rows (conhost renders text on an async frame), so closing at
+/// the pre's byte position could clip the block's tail — the race the
+/// bootstrap's 15ms prompt() sleep used to absorb shell-side, at ~16ms of
+/// visible prompt-return latency per command. The close now waits for the
+/// next 133;A (PromptStart), which rides the text frame AFTER the output;
+/// if the marker never comes (user clobbered `prompt`, hooks stripped), the
+/// ingest loop's quiescence timeout flushes the close at the pre position —
+/// byte-identical to the sleep-era end_off.
+#[derive(Clone)]
+struct PendingClose {
+    /// (epoch, start_off) of the armed record — index-free, so journal
+    /// compaction (`evict`, which drains recs) can never dangle it; an open
+    /// record (end_off None) is never evicted, only flagged truncated.
+    key: (u32, u64),
+    /// Exit already D2-resolved at arm time (synthetic open ⇒ None).
+    exit: Option<i64>,
+    n: u32,
+    /// Byte offset just past the pre OSC — the fallback end_off.
+    pre_off: u64,
+    /// When the pre armed this close; the fallback's honest ended_ms.
+    armed_ms: u64,
 }
 
 /// Sidecar file body: everything a restart needs to rehydrate.
@@ -447,6 +499,7 @@ impl BlockStore {
             last_cwd: None,
             hooks_live: false,
             synthetic_open: false,
+            pending_close: None,
         }
     }
 
@@ -483,7 +536,10 @@ impl BlockStore {
     }
 
     /// Spawn rotation (launch()): new epoch, fresh token, and the liveness
-    /// proof resets — the NEW shell hasn't run its bootstrap yet.
+    /// proof resets — the NEW shell hasn't run its bootstrap yet. A D*
+    /// pending close deliberately SURVIVES rotation: launch() calls
+    /// `close_dangling` right after, which flushes it with its real exit
+    /// (the key is (epoch, start_off), so it can never touch new-epoch recs).
     pub fn rotate(&mut self, token: String) {
         self.epoch += 1;
         self.token = token;
@@ -544,6 +600,12 @@ impl BlockStore {
     pub fn open_block(&mut self, cmd: String, start_off: u64, now_ms: u64) -> Vec<usize> {
         self.synthetic_open = false;
         let mut changed = Vec::new();
+        // D*: an exec landing while a close is still armed (lost 133;A and
+        // the stream never went quiet) flushes it at its pre position first —
+        // the pre DID arrive, so its exit/end are real; only the anchor is.
+        if let Some(i) = self.flush_pending_close() {
+            changed.push(i);
+        }
         if let Some(idx) = self.open.take() {
             if let Some(r) = self.recs.get_mut(idx) {
                 r.end_off = Some(start_off);
@@ -587,29 +649,81 @@ impl BlockStore {
         changed
     }
 
-    /// A prompt hook: refreshes cwd, and if a block is open, closes it.
-    /// Returns the changed index, if any. A synthetic-opened block closes
-    /// with `exit = None` regardless of payload (D2 misattribution guard —
-    /// the pre that closes the LAST inner command of a nested-shell episode
-    /// is the login shell's, carrying the OUTER command's exit).
+    /// A prompt hook: refreshes cwd, and if a block is open, ARMS its close —
+    /// end_off is deferred to the next 133;A (`on_prompt_start`), the marker
+    /// that rides the text frame after the command output (D*; see
+    /// `PendingClose`). A still-armed close from a lost 133;A flushes at its
+    /// own pre position first; the returned index is that flushed record, if
+    /// any. A synthetic-opened block arms with `exit = None` regardless of
+    /// payload (D2 misattribution guard — the pre that closes the LAST inner
+    /// command of a nested-shell episode is the login shell's, carrying the
+    /// OUTER command's exit).
     pub fn on_pre(
         &mut self,
         exit: Option<i64>,
         n: u32,
         cwd: String,
-        end_off: u64,
+        pre_off: u64,
         now_ms: u64,
     ) -> Option<usize> {
+        let flushed = self.flush_pending_close();
         if !cwd.is_empty() {
             self.last_cwd = Some(PathBuf::from(cwd));
         }
-        let idx = self.open.take()?;
-        let synth = std::mem::take(&mut self.synthetic_open);
-        let r = self.recs.get_mut(idx)?;
-        r.exit = if synth { None } else { exit };
-        r.n = n;
+        if let Some(idx) = self.open.take() {
+            let synth = std::mem::take(&mut self.synthetic_open);
+            if let Some(r) = self.recs.get(idx) {
+                self.pending_close = Some(PendingClose {
+                    key: (r.epoch, r.start_off),
+                    exit: if synth { None } else { exit },
+                    n,
+                    pre_off,
+                    armed_ms: now_ms,
+                });
+            }
+        }
+        flushed
+    }
+
+    /// The 133;A anchor arrived: close the armed record THERE — just past
+    /// the marker, after the full output tail, before the prompt text. Only
+    /// the FIRST 133;A while a close is armed is honored; with nothing armed
+    /// (a program echoing the sequence mid-output, a nested shell's own
+    /// shell-integration prompt) this is a no-op — the spurious-marker guard.
+    pub fn on_prompt_start(&mut self, end_off: u64, now_ms: u64) -> Option<usize> {
+        let p = self.pending_close.take()?;
+        self.close_pending(p, end_off, now_ms)
+    }
+
+    /// Flush an armed close at its pre position with its arm-time stamp —
+    /// byte- and time-identical to the sleep-era immediate close. Fired by
+    /// the ingest loop's quiescence fallback (marker lost), a following pre
+    /// or exec (marker lost, stream never quiet), and `close_dangling`.
+    pub fn flush_pending_close(&mut self) -> Option<usize> {
+        let p = self.pending_close.take()?;
+        let (off, at) = (p.pre_off, p.armed_ms);
+        self.close_pending(p, off, at)
+    }
+
+    /// True while a pre-armed close awaits its 133;A — the ingest loop's
+    /// signal to park with a timeout instead of indefinitely.
+    pub fn pre_close_armed(&self) -> bool {
+        self.pending_close.is_some()
+    }
+
+    fn close_pending(&mut self, p: PendingClose, end_off: u64, ended_ms: u64) -> Option<usize> {
+        let idx = self
+            .recs
+            .iter()
+            .rposition(|r| (r.epoch, r.start_off) == p.key)?;
+        let r = &mut self.recs[idx];
+        if r.end_off.is_some() {
+            return None; // already closed elsewhere (a dangling close raced)
+        }
+        r.exit = p.exit;
+        r.n = p.n;
         r.end_off = Some(end_off);
-        r.ended_ms = Some(now_ms);
+        r.ended_ms = Some(ended_ms);
         Some(idx)
     }
 
@@ -620,6 +734,12 @@ impl BlockStore {
         self.open = None;
         self.synthetic_open = false;
         let mut changed = Vec::new();
+        // D*: an armed close knows its real exit and pre position — flush it
+        // honestly before the blanket exit=None sweep (its record then reads
+        // end_off=Some and the loop below skips it).
+        if let Some(i) = self.flush_pending_close() {
+            changed.push(i);
+        }
         for (i, r) in self.recs.iter_mut().enumerate() {
             if r.end_off.is_none() {
                 r.end_off = Some(end_off);
@@ -699,7 +819,11 @@ mod tests {
             out
         };
         let whole = collect(data.len());
-        assert_eq!(whole.len(), 5, "init, prompt-end, exec, pre, exec");
+        assert_eq!(
+            whole.len(),
+            6,
+            "init, prompt-start, prompt-end, exec, pre, exec"
+        );
         assert_eq!(collect(1), whole);
         assert_eq!(collect(7), whole);
         assert_eq!(collect(64), whole);
@@ -719,28 +843,30 @@ mod tests {
                 user: String::new()
             }
         );
-        assert_eq!(evs[1].verb, HookVerb::PromptEnd);
-        assert_eq!(evs[2].verb, HookVerb::Exec { cmd: "echo hi".into() });
+        assert_eq!(evs[1].verb, HookVerb::PromptStart);
+        assert_eq!(evs[2].verb, HookVerb::PromptEnd);
+        assert_eq!(evs[3].verb, HookVerb::Exec { cmd: "echo hi".into() });
         assert_eq!(
-            evs[3].verb,
+            evs[4].verb,
             HookVerb::Pre { exit: Some(0), n: 2, cwd: "C:\\".into() }
         );
-        assert_eq!(evs[4].verb, HookVerb::Exec { cmd: "dir".into() });
+        assert_eq!(evs[5].verb, HookVerb::Exec { cmd: "dir".into() });
         // exec #1's offset points at the 'h' of "hi\r\n".
-        let off = evs[2].offset_in_chunk;
+        let off = evs[3].offset_in_chunk;
         assert_eq!(&data[off..off + 2], b"hi");
-        assert!(evs
-            .iter()
-            .all(|e| e.token == TOK || e.verb == HookVerb::PromptEnd));
+        assert!(evs.iter().all(|e| e.token == TOK
+            || matches!(e.verb, HookVerb::PromptEnd | HookVerb::PromptStart)));
     }
 
-    /// P3 §11 — the tokenless `133;B` prompt-end marker parses to
-    /// `HookVerb::PromptEnd` identically at every chunk size, `133;A` and
-    /// foreign OSCs still yield nothing, and its offset points just past the
+    /// P3 §11 + D* — the tokenless `133;A`/`133;B` prompt markers parse to
+    /// `PromptStart`/`PromptEnd` identically at every chunk size, foreign
+    /// OSCs still yield nothing, and each offset points just past its
     /// terminator.
     #[test]
     fn prompt_end_verb_parses_and_is_chunk_safe() {
-        let mut data = b"\x1b]133;A\x07PS C:\\>".to_vec();
+        let mut data = b"\x1b]133;A\x07".to_vec();
+        let after_a = data.len();
+        data.extend_from_slice(b"PS C:\\>");
         data.extend_from_slice(b"\x1b]133;B\x07");
         let after = data.len();
         data.extend_from_slice(b"tail");
@@ -750,7 +876,7 @@ mod tests {
             let mut base = 0usize;
             for c in data.chunks(chunk) {
                 for ev in sc.feed(c) {
-                    assert!(ev.token.is_empty(), "PromptEnd must carry no token");
+                    assert!(ev.token.is_empty(), "prompt markers carry no token");
                     out.push((ev.verb, base + ev.offset_in_chunk));
                 }
                 base += c.len();
@@ -758,17 +884,25 @@ mod tests {
             out
         };
         let whole = collect(data.len());
-        assert_eq!(whole, vec![(HookVerb::PromptEnd, after)]);
+        assert_eq!(
+            whole,
+            vec![(HookVerb::PromptStart, after_a), (HookVerb::PromptEnd, after)]
+        );
         assert_eq!(collect(1), whole);
         assert_eq!(collect(7), whole);
         assert_eq!(collect(64), whole);
-        // ST-terminated variant parses too.
+        // ST-terminated variants parse too.
         let mut sc = BlockScanner::new();
         let evs = sc.feed(b"\x1b]133;B\x1b\\");
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].verb, HookVerb::PromptEnd);
+        let evs = sc.feed(b"\x1b]133;A\x1b\\");
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].verb, HookVerb::PromptStart);
         // Near-misses stay silent.
-        assert!(sc.feed(b"\x1b]133;A\x07\x1b]133;\x07\x1b]133;Bx\x07").is_empty());
+        assert!(sc
+            .feed(b"\x1b]133;\x07\x1b]133;Bx\x07\x1b]133;Ax\x07")
+            .is_empty());
     }
 
     /// L-8: a stray ESC inside an OSC body must behave identically at every
@@ -915,8 +1049,8 @@ mod tests {
     #[test]
     fn malformed_and_foreign_bodies_are_dropped_or_lenient() {
         let mut sc = BlockScanner::new();
-        // Foreign OSC codes produce nothing.
-        assert!(sc.feed(b"\x1b]133;A\x07\x1b]9;9;C:\\\x07").is_empty());
+        // Foreign OSC codes produce nothing (133;A/B are ours since D*/P3).
+        assert!(sc.feed(b"\x1b]9;9;C:\\\x07\x1b]0;title\x07").is_empty());
         // Odd-length / non-hex payloads drop.
         assert!(sc.feed(b"\x1b]7717;t;exec;abc\x07").is_empty());
         assert!(sc.feed(b"\x1b]7717;t;exec;zz\x07").is_empty());
@@ -964,6 +1098,7 @@ mod tests {
             last_cwd: None,
             hooks_live: false,
             synthetic_open: false,
+            pending_close: None,
         };
         st.evict(100);
         assert_eq!(st.base, 100);
@@ -991,19 +1126,24 @@ mod tests {
             last_cwd: None,
             hooks_live: false,
             synthetic_open: false,
+            pending_close: None,
         };
         st.open_block("first".into(), 10, 1);
         let changed = st.open_block("second".into(), 90, 2);
         assert_eq!(st.recs[0].end_off, Some(90), "first closed at second's offset");
         assert_eq!(st.recs[0].exit, None);
         assert_eq!(changed, vec![0, 1]);
-        let closed = st.on_pre(Some(3), 7, "C:\\w".into(), 200, 3);
-        assert_eq!(closed, Some(1));
+        // D*: the pre ARMS the close (end deferred); the 133;A anchor lands it.
+        assert_eq!(st.on_pre(Some(3), 7, "C:\\w".into(), 200, 3), None);
+        assert_eq!(st.recs[1].end_off, None, "close deferred to the anchor");
+        assert!(st.pre_close_armed());
+        assert_eq!(st.on_prompt_start(230, 3), Some(1));
         assert_eq!(st.recs[1].exit, Some(3));
         assert_eq!(st.recs[1].n, 7);
-        assert_eq!(st.recs[1].end_off, Some(200));
-        // A pre with no open block just refreshes cwd.
+        assert_eq!(st.recs[1].end_off, Some(230));
+        // A pre with no open block just refreshes cwd (and arms nothing).
         assert_eq!(st.on_pre(Some(0), 8, "C:\\x".into(), 300, 4), None);
+        assert!(!st.pre_close_armed());
         assert_eq!(st.last_cwd.as_deref(), Some(std::path::Path::new("C:\\x")));
     }
 
@@ -1020,13 +1160,16 @@ mod tests {
         st.rotate(TOK.into());
         // Inner command via the synthetic lane; the returning login-shell
         // pre carries exit 0 (sudo su's) — the rec must close exit None.
+        // (D*: arm at the pre, land at the 133;A anchor.)
         st.open_block_synthetic("whoami".into(), 100, 1);
-        assert_eq!(st.on_pre(Some(0), 7, "/root".into(), 200, 2), Some(0));
+        assert_eq!(st.on_pre(Some(0), 7, "/root".into(), 200, 2), None);
+        assert_eq!(st.on_prompt_start(210, 2), Some(0));
         assert_eq!(st.recs[0].exit, None, "outer exit must not misattribute");
-        assert_eq!(st.recs[0].end_off, Some(200));
+        assert_eq!(st.recs[0].end_off, Some(210));
         // Integration is back: a hook-opened block takes its real exit.
         st.open_block("false".into(), 300, 3);
-        assert_eq!(st.on_pre(Some(1), 8, "/root".into(), 400, 4), Some(1));
+        assert_eq!(st.on_pre(Some(1), 8, "/root".into(), 400, 4), None);
+        assert_eq!(st.on_prompt_start(410, 4), Some(1));
         assert_eq!(st.recs[1].exit, Some(1), "hook-opened keeps the real exit");
         // A hook exec dangling-closing a synthetic predecessor CLEARS the
         // flag: the successor's pre stamps its real exit again.
@@ -1034,7 +1177,8 @@ mod tests {
         st.open_block("outer".into(), 600, 6);
         assert_eq!(st.recs[2].end_off, Some(600), "dangling close at successor");
         assert_eq!(st.recs[2].exit, None);
-        assert_eq!(st.on_pre(Some(9), 9, String::new(), 700, 7), Some(3));
+        assert_eq!(st.on_pre(Some(9), 9, String::new(), 700, 7), None);
+        assert_eq!(st.on_prompt_start(710, 7), Some(3));
         assert_eq!(st.recs[3].exit, Some(9), "hook open cleared the flag");
         // close_dangling resets the flag too (launch rotation / exit).
         st.open_block_synthetic("dangler".into(), 800, 8);
@@ -1075,6 +1219,7 @@ mod tests {
             last_cwd: None,
             hooks_live: false,
             synthetic_open: false,
+            pending_close: None,
         };
         st.open_block("ok".into(), 100, 1);
         st.on_pre(Some(0), 1, String::new(), 900, 2);
@@ -1089,5 +1234,162 @@ mod tests {
         assert_eq!(st.open, None);
         // Idempotent on the now-empty store.
         assert!(!st.reconcile_with_journal_head(0));
+    }
+
+    /// D* (a) — the ConPTY reorder the pre-sleep used to absorb: the pre OSC
+    /// arrives BEFORE the command's last output rows; with the sleep gone,
+    /// end_off must land at the 133;A that rides the text frame AFTER the
+    /// full tail — the tail stays inside the block, the prompt text outside.
+    /// Walked scanner→store exactly like the ingest loop, at several chunk
+    /// sizes (the reorder can split anywhere).
+    #[test]
+    fn deferred_close_brackets_reordered_output_tail() {
+        // Stream: [exec][early output][pre][9;9][REORDERED TAIL][133;A][prompt]
+        let mut data = Vec::new();
+        data.extend(hook("exec", r#"{"c":"ls"}"#, TOK));
+        let exec_off = data.len() as u64;
+        data.extend_from_slice(b"alpha\r\n");
+        data.extend(hook("pre", r#"{"e":0,"n":2,"d":"C:\\"}"#, TOK));
+        data.extend_from_slice(b"\x1b]9;9;C:\\\x07");
+        data.extend_from_slice(b"TAIL_beta\r\n"); // the late text frame
+        data.extend_from_slice(b"\x1b]133;A\x07");
+        let anchor_off = data.len() as u64;
+        data.extend_from_slice(b"PS C:\\> ");
+        for chunk in [data.len(), 1, 7, 64] {
+            let mut sc = BlockScanner::new();
+            let mut st = BlockStore::load(Uuid::new_v4());
+            st.rotate(TOK.into());
+            let mut abs = 0u64;
+            for c in data.chunks(chunk) {
+                for ev in sc.feed(c) {
+                    let off = abs + ev.offset_in_chunk as u64;
+                    match ev.verb {
+                        // Tokenless anchor — mirrors on_block_event's
+                        // pre-token-check handling.
+                        HookVerb::PromptStart => {
+                            st.on_prompt_start(off, 3);
+                        }
+                        _ if !st.accept_token(&ev.token) => {}
+                        HookVerb::Exec { cmd } => {
+                            st.open_block(cmd, off, 1);
+                        }
+                        HookVerb::Pre { exit, n, cwd } => {
+                            assert_eq!(st.on_pre(exit, n, cwd, off, 2), None);
+                        }
+                        _ => {}
+                    }
+                }
+                abs += c.len() as u64;
+            }
+            let r = &st.recs[0];
+            assert_eq!(r.start_off, exec_off, "chunk {chunk}");
+            assert_eq!(
+                r.end_off,
+                Some(anchor_off),
+                "end_off must be the 133;A anchor (chunk {chunk})"
+            );
+            assert_eq!(r.exit, Some(0));
+            assert_eq!(r.n, 2);
+            // The money property: the block's byte span contains the
+            // reordered tail and none of the prompt text.
+            let body = &data[r.start_off as usize..r.end_off.unwrap() as usize];
+            assert!(
+                body.windows(9).any(|w| w == b"TAIL_beta"),
+                "reordered tail clipped from the block (chunk {chunk})"
+            );
+            assert!(
+                !body.windows(3).any(|w| w == b"PS "),
+                "prompt text folded into the block (chunk {chunk})"
+            );
+        }
+    }
+
+    /// D* (b) — MANDATORY fallback: the 133;A never arrives (user clobbered
+    /// `prompt`, hooks stripped) — the flush closes at the pre position with
+    /// the armed exit/n and the ARM-time stamp: byte- and time-identical to
+    /// the sleep-era immediate close.
+    #[test]
+    fn fallback_closes_at_pre_position() {
+        let mut st = BlockStore::load(Uuid::new_v4());
+        st.rotate(TOK.into());
+        st.open_block("make".into(), 100, 1);
+        assert_eq!(st.on_pre(Some(2), 5, "C:\\w".into(), 400, 2), None);
+        assert!(st.pre_close_armed());
+        assert_eq!(st.recs[0].end_off, None, "close deferred while armed");
+        assert_eq!(st.flush_pending_close(), Some(0));
+        assert!(!st.pre_close_armed());
+        let r = &st.recs[0];
+        assert_eq!(r.end_off, Some(400), "fallback = the pre's own offset");
+        assert_eq!(r.exit, Some(2));
+        assert_eq!(r.n, 5);
+        assert_eq!(r.ended_ms, Some(2), "arm-time stamp, not flush time");
+        // A late 133;A after the flush is spurious — nothing re-closes.
+        assert_eq!(st.on_prompt_start(500, 9), None);
+        assert_eq!(st.recs[0].end_off, Some(400));
+    }
+
+    /// D* (c) — the spurious-marker guard: 133;A is honored ONLY while a
+    /// pre-armed close waits, and only the FIRST one. A program echoing the
+    /// sequence mid-output (no pre yet) and any second marker are no-ops.
+    #[test]
+    fn spurious_prompt_start_is_ignored() {
+        let mut st = BlockStore::load(Uuid::new_v4());
+        st.rotate(TOK.into());
+        st.open_block("cat file".into(), 10, 1);
+        // Mid-output 133;A: no close armed — nothing may change.
+        assert_eq!(st.on_prompt_start(50, 2), None);
+        assert_eq!(st.recs[0].end_off, None);
+        assert_eq!(st.open, Some(0), "block stays open through a fake marker");
+        // The real pre arms; the FIRST 133;A closes; the second is spurious.
+        assert_eq!(st.on_pre(Some(0), 3, String::new(), 90, 3), None);
+        assert_eq!(st.on_prompt_start(120, 4), Some(0));
+        assert_eq!(st.recs[0].end_off, Some(120));
+        assert_eq!(st.recs[0].ended_ms, Some(4), "anchor close stamps its own time");
+        assert_eq!(st.on_prompt_start(150, 5), None);
+        assert_eq!(st.recs[0].end_off, Some(120), "the first anchor wins");
+    }
+
+    /// D* — dangling closes flush an armed close with its REAL exit at the
+    /// pre position (the pre DID arrive; only its anchor didn't), while
+    /// genuinely unclosed records still sweep to exit=None at the head.
+    #[test]
+    fn close_dangling_flushes_armed_close_with_real_exit() {
+        let mut st = BlockStore::load(Uuid::new_v4());
+        st.rotate(TOK.into());
+        st.open_block("false".into(), 100, 1);
+        assert_eq!(st.on_pre(Some(7), 2, String::new(), 200, 2), None);
+        let changed = st.close_dangling(900, 9);
+        assert_eq!(changed, vec![0]);
+        assert_eq!(st.recs[0].end_off, Some(200), "armed close keeps its pre offset");
+        assert_eq!(st.recs[0].exit, Some(7), "armed close keeps its real exit");
+        assert!(!st.pre_close_armed());
+        // An un-armed dangler still closes honestly at the head, exit None.
+        st.open_block("hang".into(), 1000, 10);
+        let changed = st.close_dangling(1100, 11);
+        assert_eq!(changed, vec![1]);
+        assert_eq!(st.recs[1].end_off, Some(1100));
+        assert_eq!(st.recs[1].exit, None);
+    }
+
+    /// D* — a lost 133;A never wedges the ledger: a following exec flushes
+    /// the armed close at its pre position before opening, and a following
+    /// pre (bash themes can strip the PS1 wrap per-render while PROMPT_COMMAND
+    /// keeps firing) does the same.
+    #[test]
+    fn exec_or_pre_while_armed_flushes_previous() {
+        let mut st = BlockStore::load(Uuid::new_v4());
+        st.rotate(TOK.into());
+        st.open_block("a".into(), 10, 1);
+        assert_eq!(st.on_pre(Some(0), 1, String::new(), 80, 2), None);
+        let changed = st.open_block("b".into(), 100, 3);
+        assert_eq!(changed, vec![0, 1]);
+        assert_eq!(st.recs[0].end_off, Some(80), "flushed at ITS pre, not the exec");
+        assert_eq!(st.recs[0].exit, Some(0));
+        // Consecutive pres: the second flushes the first's armed close.
+        assert_eq!(st.on_pre(Some(4), 2, String::new(), 300, 4), None);
+        assert_eq!(st.on_pre(Some(9), 3, String::new(), 500, 5), Some(1));
+        assert_eq!(st.recs[1].end_off, Some(300));
+        assert_eq!(st.recs[1].exit, Some(4), "first pre's exit, not the second's");
+        assert!(!st.pre_close_armed(), "second pre had no open block to arm");
     }
 }

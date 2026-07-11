@@ -474,7 +474,11 @@ fn scan_events(region: &[u8], region_base: u64) -> Vec<(u64, EvKind)> {
                 HookVerb::PromptEnd => EvKind::Pe,
                 HookVerb::Exec { .. } => EvKind::Exec,
                 HookVerb::Pre { .. } => EvKind::Pre,
-                HookVerb::Init { .. } | HookVerb::Beacon { .. } => continue,
+                // D* 133;A is a live-close anchor only; restore slots stay
+                // keyed on the 133;B prompt-end rows.
+                HookVerb::Init { .. }
+                | HookVerb::Beacon { .. }
+                | HookVerb::PromptStart => continue,
             };
             events.push((abs + ev.offset_in_chunk as u64, kind));
         }

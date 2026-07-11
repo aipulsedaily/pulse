@@ -4861,6 +4861,12 @@ fn case_composer_gate_replay() -> anyhow::Result<()> {
         "verdict before any pre must be Blocked(NoPrompt)"
     );
     let mut ping_exec_boff: Option<usize> = None;
+    // D* (perf-wave-3): a pre that closes a block defers end_off to the
+    // following 133;A, so at the pre's own offset the record still reads
+    // open (Busy) — the AutoArm lands at the PromptStart that carries the
+    // close. A pre with no open block (bare Enter, ^C at a prompt) still
+    // AutoArms immediately.
+    let mut arm_due_at_prompt_start = false;
     for (verb, boff) in &events {
         match verb {
             HookVerb::Pre { .. } => pre_n += 1,
@@ -4875,17 +4881,35 @@ fn case_composer_gate_replay() -> anyhow::Result<()> {
         st.on_stream_events(pre_n, exec_n, now);
         let verdict = gate_at(&st, *boff);
         match verb {
-            HookVerb::Pre { .. } => anyhow::ensure!(
-                verdict == GateVerdict::AutoArm,
-                "after a pre the gate must AutoArm, got {verdict:?}"
-            ),
-            HookVerb::Exec { .. } => anyhow::ensure!(
-                verdict == GateVerdict::Blocked(RawReason::Busy),
-                "after an exec the gate must be Busy, got {verdict:?}"
-            ),
+            HookVerb::Pre { .. } => match verdict {
+                GateVerdict::AutoArm => {}
+                GateVerdict::Blocked(RawReason::Busy) => arm_due_at_prompt_start = true,
+                v => anyhow::bail!(
+                    "after a pre the gate must AutoArm (no open block) or stay \
+                     Busy until the 133;A close anchor, got {v:?}"
+                ),
+            },
+            HookVerb::PromptStart if arm_due_at_prompt_start => {
+                arm_due_at_prompt_start = false;
+                anyhow::ensure!(
+                    verdict == GateVerdict::AutoArm,
+                    "at the 133;A close anchor the gate must AutoArm, got {verdict:?}"
+                );
+            }
+            HookVerb::Exec { .. } => {
+                arm_due_at_prompt_start = false;
+                anyhow::ensure!(
+                    verdict == GateVerdict::Blocked(RawReason::Busy),
+                    "after an exec the gate must be Busy, got {verdict:?}"
+                );
+            }
             _ => {}
         }
     }
+    anyhow::ensure!(
+        !arm_due_at_prompt_start,
+        "a deferred pre close never met its 133;A anchor in the capture"
+    );
 
     // The claude-safety property, on real bytes: exec disarms BEFORE the
     // interactive app's first output byte reaches the stream.
@@ -4910,9 +4934,10 @@ fn case_composer_gate_replay() -> anyhow::Result<()> {
         ping_rec.start_off
     );
 
-    // PromptEnd leg: after every pre, the next hook event is a PromptEnd, and
-    // the rendered prompt TEXT sits between them in the stream — the ordering
-    // the composer's cursor capture is grounded on.
+    // PromptEnd leg: after every pre, the next hook event is a PromptEnd
+    // (skipping the D* 133;A close anchor, which sits between the pre and
+    // the prompt text), and the rendered prompt TEXT sits between them in
+    // the stream — the ordering the composer's cursor capture is grounded on.
     let mut prior_end = 0usize;
     for (i, (verb, boff)) in events.iter().enumerate() {
         if !matches!(verb, HookVerb::Pre { .. }) {
@@ -4920,7 +4945,7 @@ fn case_composer_gate_replay() -> anyhow::Result<()> {
         }
         let next = events[i + 1..]
             .iter()
-            .find(|(v, _)| !matches!(v, HookVerb::Init { .. }));
+            .find(|(v, _)| !matches!(v, HookVerb::Init { .. } | HookVerb::PromptStart));
         match next {
             Some((HookVerb::PromptEnd, pe_boff)) => {
                 let between = strip_ansi(&String::from_utf8_lossy(&buf[*boff..*pe_boff]));
@@ -8073,8 +8098,9 @@ fn case_cmd_hooks() -> anyhow::Result<()> {
     // 1. SubmitCommand{write:true}: daemon writes the bytes AND opens a
     //    synthetic block; the NEXT pre closes it. The `ping -n 1` tail keeps
     //    the echo's output frame ahead of the prompt's OSC passthrough (the
-    //    P2 ConPTY reorder — cmd's PROMPT cannot carry the 15ms drain sleep
-    //    the pwsh/bash hooks use, so a bare `echo`'s tail bytes can clip
+    //    P2 ConPTY reorder — cmd's PROMPT cannot carry a drain sleep like
+    //    the bash hook's, and its D* 133;A close anchor rides the same OSC
+    //    burst as the pre, so a bare `echo`'s tail bytes can still clip
     //    past end_off; records stay correct, Copy-output is best-effort).
     c.send(&C2D::SubmitCommand {
         id,
