@@ -698,6 +698,26 @@ pub enum RecallSrc {
     History,
 }
 
+/// Ctrl-R fuzzy history search (Warp-study Tier-2b #1): a pre-submit
+/// overlay over `state.draft` only — it reads `recs` and writes the draft;
+/// the dispatch path (submission_bytes / settled dispatch / covers /
+/// SubmitHold / gate) never sees it. While open, the composer's OWN editor
+/// is the query field (the draft is stashed and the lane shows the query —
+/// readline's reverse-i-search model, so focus never moves and the
+/// overlay-close focus contract is trivially the §12.11 one). Results are
+/// derived per frame from `recs` + the live query, never stored.
+pub struct HistSearch {
+    /// Selected row: an index into THIS frame's ranked results (0 = best,
+    /// painted at the bottom, adjacent to the query). Clamped by the
+    /// renderer when the list shrinks under it.
+    pub sel: usize,
+    /// The draft as it stood at Ctrl-R — the Esc-restore stash (the same
+    /// contract as the recall stash: close-without-accept restores it
+    /// EXACTLY; accept displaces it into the recall slot via
+    /// `insert_history` so ArrowDown still brings it back).
+    saved: String,
+}
+
 pub struct ComposerState {
     pub mode: ComposerMode,
     pub draft: String,
@@ -748,6 +768,8 @@ pub struct ComposerState {
     chord_pre: Option<u64>,
     /// History recall: (walk source, draft saved before recall began).
     recall: Option<(RecallSrc, String)>,
+    /// Ctrl-R history search overlay, when open (Tier-2b #1).
+    search: Option<HistSearch>,
     /// One-frame flag: place the editor caret at the draft's end before the
     /// TextEdit shows (set by reclaim/insert — the user continues typing at
     /// the end of what just landed).
@@ -858,6 +880,7 @@ impl Default for ComposerState {
             last_exec: 0,
             chord_pre: None,
             recall: None,
+            search: None,
             caret_to_end: false,
             want_focus: false,
             has_focus: false,
@@ -1502,6 +1525,10 @@ impl ComposerState {
     /// consuming the episode the gate would auto-re-arm on the very next
     /// frame and fight the user for focus (D7).
     pub fn blur_to_grid(&mut self) {
+        // A yield closes the search overlay first (quietly — the user is
+        // leaving the editor, so no focus pull): the stashed draft is what
+        // folds/persists, never the transient query string.
+        self.search_close_quiet();
         if self.mode == ComposerMode::Compose {
             // Deliberate yield mid-buffer: nothing fires — queued blind
             // submissions fold into the draft where the user can see them.
@@ -1622,6 +1649,10 @@ impl ComposerState {
     /// mechanism for both). Any edit drops the stash (P3 rule, enforced at
     /// the UI via `changed()`).
     pub fn insert_history(&mut self, cmd: &str) {
+        // An external insert (history popup) over an open Ctrl-R overlay
+        // closes it first: the STASH is the draft being displaced — the
+        // transient query string must never end up in the recall slot.
+        self.search_close_quiet();
         if !self.draft.is_empty() && self.draft != cmd {
             self.recall = Some((RecallSrc::History, self.draft.clone()));
         }
@@ -1860,6 +1891,13 @@ impl ComposerState {
         grid_focused: bool,
         now: Instant,
     ) -> Option<Instant> {
+        // Tier-2b: the Ctrl-R overlay lives strictly inside a focused
+        // Compose. Any demotion since last frame (alt flip, exit, reset,
+        // Esc-blur) closes it and restores the stashed draft — the sweep
+        // runs first so this frame's gate/lane logic sees the real draft.
+        if self.mode != ComposerMode::Compose {
+            self.search_close_quiet();
+        }
         // D2 heuristic latch maintenance — BEFORE the gate reads inputs so
         // this frame's verdict sees the fresh truth. Drop a dead latch
         // (output byte / cursor move / resize / alt — heur_live's rules),
@@ -2278,6 +2316,12 @@ impl ComposerState {
     /// (live_cwd else meta.cwd — posix verbatim for WSL); `caret_byte` =
     /// the editor caret as a byte offset into the draft.
     pub fn tab_press(&mut self, cwd: Option<&str>, caret_byte: usize, delta: i64) -> Option<usize> {
+        if self.search.is_some() {
+            // Ctrl-R overlay open: the Tab cycle is dead (Tier-2b
+            // suppression interplay — the draft is the QUERY right now;
+            // path-completing it would corrupt the stash contract).
+            return None;
+        }
         if delta == 0 || matches!(self.fam, complete::Family::Ssh) {
             // ssh: no local view of the remote fs — silent no-op (spec).
             return None;
@@ -2348,6 +2392,133 @@ impl ComposerState {
         self.draft.push_str(rest);
         self.draft.chars().count()
     }
+
+    // ── Ctrl-R history search (Tier-2b #1) ───────────────────────────────
+
+    pub fn search_active(&self) -> bool {
+        self.search.is_some()
+    }
+
+    /// Ctrl-R at a focused editor: open the overlay. The draft is stashed
+    /// and the lane becomes the (empty) query. Idempotent while open — the
+    /// cycling gesture is handled by `search_cycle` before this could fire.
+    pub fn search_begin(&mut self) {
+        if self.search.is_none() {
+            let saved = std::mem::take(&mut self.draft);
+            self.search = Some(HistSearch { sel: 0, saved });
+            self.caret_to_end = true;
+        }
+    }
+
+    /// Ctrl-R while open: advance to the next (older / lower-ranked) match,
+    /// wrapping — readline reverse-i-search muscle-memory parity.
+    pub fn search_cycle(&mut self, n: usize) {
+        if let Some(s) = &mut self.search {
+            if n > 0 {
+                s.sel = (s.sel + 1) % n;
+            }
+        }
+    }
+
+    /// Up/Down while open: move the selection (+1 = visually up = older).
+    /// Clamped, never wraps (the arrows stop at the ends; Ctrl-R wraps).
+    pub fn search_nav(&mut self, delta: i64, n: usize) {
+        if let Some(s) = &mut self.search {
+            if n > 0 {
+                s.sel = (s.sel as i64 + delta).clamp(0, n as i64 - 1) as usize;
+            }
+        }
+    }
+
+    /// The query changed this frame: selection returns to the best match.
+    pub fn search_edited(&mut self) {
+        if let Some(s) = &mut self.search {
+            s.sel = 0;
+        }
+    }
+
+    /// The result list shrank under the selection: clamp it.
+    pub fn search_clamp(&mut self, n: usize) {
+        if let Some(s) = &mut self.search {
+            s.sel = s.sel.min(n.saturating_sub(1));
+        }
+    }
+
+    /// Enter / row click: the selection becomes the draft — NEVER a
+    /// submission. Rides `insert_history` with the stash swapped back in
+    /// first, so the displaced pre-search draft lands in the recall slot
+    /// (ArrowDown restores it) — one stash contract for every insert path.
+    pub fn search_accept(&mut self, cmd: &str) {
+        if let Some(s) = self.search.take() {
+            self.draft = s.saved;
+            self.insert_history(cmd);
+        }
+    }
+
+    /// Esc / Run-slot click while open: restore the pre-search draft
+    /// EXACTLY and keep the editor focused (§12.11 — typing continues in
+    /// the composer the moment the overlay closes).
+    pub fn search_cancel(&mut self) {
+        if let Some(s) = self.search.take() {
+            self.draft = s.saved;
+            self.caret_to_end = true;
+            self.want_focus = true;
+        }
+    }
+
+    /// The editor left Compose (demote / blur / exit / reset): the overlay
+    /// dies with it, restoring the stash silently — search state can never
+    /// leak into the next arm, and no focus is stolen on the way out.
+    fn search_close_quiet(&mut self) {
+        if let Some(s) = self.search.take() {
+            self.draft = s.saved;
+        }
+    }
+}
+
+/// Overlay row cap (Tier-2b #1): enough to scan at a glance, small enough
+/// to stay a strip garnish rather than a modal (seamless doctrine).
+pub(crate) const SEARCH_MAX: usize = 8;
+
+/// One ranked history-search result.
+pub(crate) struct SearchHit {
+    /// Pristine command — what accept inserts (interior newlines intact).
+    pub cmd: String,
+    /// Single-line display form the match ran against (newlines → spaces),
+    /// so the highlight indices below always line up with what's painted.
+    pub disp: String,
+    /// Matched CHAR indices into `disp` (the overlay's highlight spans).
+    pub hl: Vec<usize>,
+}
+
+/// Rank the command history against the query: the same `recs` source the
+/// recall walk uses, deduped, blanks skipped, most-recent-first — then
+/// scored by the fuzzy matcher (exact > prefix > substring > subsequence;
+/// see fuzzy.rs). The sort is stable, so equal scores keep recency order,
+/// and an empty query is simply the most-recent-first list. Pure derivation
+/// — recomputed per frame while the overlay is open, never stored.
+pub(crate) fn search_results(recs: &[BlockRec], query: &str, cap: usize) -> Vec<SearchHit> {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut scored: Vec<(i32, SearchHit)> = Vec::new();
+    for r in recs.iter().rev() {
+        if r.cmd.trim().is_empty() || !seen.insert(r.cmd.as_str()) {
+            continue;
+        }
+        let disp = r.cmd.replace(['\r', '\n'], " ");
+        if let Some((score, hl)) = super::fuzzy::fuzzy_match(query, &disp) {
+            scored.push((
+                score,
+                SearchHit {
+                    cmd: r.cmd.clone(),
+                    disp,
+                    hl,
+                },
+            ));
+        }
+    }
+    scored.sort_by_key(|s| std::cmp::Reverse(s.0));
+    scored.truncate(cap);
+    scored.into_iter().map(|(_, h)| h).collect()
 }
 
 /// Predictive history ghost (Tier-2a #2, PSReadLine-prediction parity — the
@@ -2359,15 +2530,117 @@ impl ComposerState {
 /// a multiline suggestion could not (nor could a multiline draft anchor
 /// one). Blank commands are skipped (recall parity); an exact match yields
 /// no remainder and falls through to an older, longer command.
-fn history_ghost(recs: &[BlockRec], draft: &str) -> Option<String> {
+///
+/// CWD-AWARE (v0.1.10 sandbox fix): an entry whose recorded cwd
+/// (`BlockRec.cwd` — the directory the command STARTED in) differs from the
+/// terminal's current tracked cwd is skipped when its command is
+/// path-sensitive (`path_sensitive`). The field failure: in `C:\Users` the
+/// composer ghosted `cd Users\…` recorded from a session rooted at `C:\`;
+/// accepted + submitted, PowerShell errored on `C:\Users\Users`. Unknown
+/// cwd on EITHER side counts as different (conservative — never suggest a
+/// relative path we can't certify), and ineligible entries fall through to
+/// older eligible ones. Location-independent commands (`git status`,
+/// `cargo build`) stay eligible across cwds — the useful case. `cur_cwd`
+/// must be the SAME tracked-cwd string the Tab completer receives
+/// (`prompt_cwd` in show()), so the two features can never disagree about
+/// where we are.
+fn history_ghost(
+    recs: &[BlockRec],
+    draft: &str,
+    fam: &complete::Family,
+    cur_cwd: Option<&str>,
+) -> Option<String> {
     if draft.is_empty() || draft.contains('\n') {
         return None;
     }
     recs.iter().rev().find_map(|r| {
         let rest = r.cmd.strip_prefix(draft)?;
-        (!rest.is_empty() && !rest.contains('\n') && !r.cmd.trim().is_empty())
+        if rest.is_empty() || rest.contains('\n') || r.cmd.trim().is_empty() {
+            return None;
+        }
+        (!path_sensitive(fam, &r.cmd) || same_cwd(r.cwd.as_deref(), cur_cwd))
             .then(|| rest.to_string())
     })
+}
+
+/// The command's meaning depends on the directory it runs in: its head is a
+/// directory-changing verb WITH an argument (`cd x`, `pushd ..`,
+/// `Set-Location y` — pwsh verbs fold case), or any non-flag token names a
+/// RELATIVE filesystem location (`relative_path_token`). Rides the same
+/// classifier the prompt highlighting uses (`highlight::classify`, i.e. the
+/// Tab completer's tokenizer underneath), so quoting and command separators
+/// behave identically everywhere: `git log && cd sub` is caught, a bare
+/// `cd` (no argument) and flag tokens are not.
+fn path_sensitive(fam: &complete::Family, cmd: &str) -> bool {
+    use super::highlight::Class;
+    let mut cd_head = false;
+    for (r, class) in super::highlight::classify(fam, cmd) {
+        let raw = cmd[r].trim_matches(|c| c == '\'' || c == '"');
+        match class {
+            Class::Head => {
+                cd_head = ["cd", "chdir", "pushd", "set-location", "sl"]
+                    .iter()
+                    .any(|v| raw.eq_ignore_ascii_case(v));
+                // A relative-path head (`.\build.ps1`, `bin\tool`) is
+                // location-dependent all by itself.
+                if relative_path_token(fam, raw) {
+                    return true;
+                }
+            }
+            Class::Op | Class::Flag => {}
+            _ => {
+                if cd_head {
+                    return true; // cd-like verb with any argument
+                }
+                if relative_path_token(fam, raw) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The token names a filesystem location RELATIVE to the cwd: it contains a
+/// path separator but is not anchored — drive-rooted (`C:\…` / `C:/…`), UNC
+/// (`\\srv\…` / `//srv/…`), home (`~/…` / `~\…`), a URL (`scheme://…`), or
+/// posix-absolute (`/…`) on the posix-fs families (WSL/ssh). Drive-relative
+/// (`C:foo\bar`) and `.\x`, `..\x`, `a\b`, `sub/dir` all count as relative.
+fn relative_path_token(fam: &complete::Family, raw: &str) -> bool {
+    if !raw.contains('\\') && !raw.contains('/') {
+        return false;
+    }
+    let b = raw.as_bytes();
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+    {
+        return false; // drive-rooted
+    }
+    if raw.starts_with("\\\\") || raw.starts_with("//") {
+        return false; // UNC
+    }
+    if raw.starts_with("~/") || raw.starts_with("~\\") {
+        return false; // home-anchored: cwd-independent
+    }
+    if raw.contains("://") {
+        return false; // URL, not a path (git clone https://…)
+    }
+    if raw.starts_with('/')
+        && matches!(fam, complete::Family::Wsl { .. } | complete::Family::Ssh)
+    {
+        return false; // posix-absolute on a posix fs
+    }
+    true
+}
+
+/// Both sides known and naming the same directory (trailing separators
+/// trimmed, ASCII case folded — Windows paths dominate and hook feeds vary
+/// drive-letter case). Either side unknown ⇒ NOT the same (conservative).
+fn same_cwd(rec: Option<&std::path::Path>, cur: Option<&str>) -> bool {
+    let (Some(rec), Some(cur)) = (rec, cur) else {
+        return false;
+    };
+    let norm = |s: &str| s.trim_end_matches(['\\', '/']).to_ascii_lowercase();
+    norm(&rec.to_string_lossy()) == norm(cur)
 }
 
 /// The grid row the CURRENT-PROMPT cover should BLANK this frame, if any
@@ -2696,6 +2969,46 @@ fn set_caret_chars(ctx: &egui::Context, id: Id, chars: usize) {
 }
 
 /// Tiny painter keyboard glyph (mouse-first: labels get icons, not hotkeys).
+/// One Ctrl-R overlay row's layout job: base-colored text with the matched
+/// chars lifted to the accent (Tier-2b #1). `hl` = ascending CHAR indices
+/// into `disp` (straight from the matcher). No wrap — rows clip.
+fn search_row_job(
+    disp: &str,
+    hl: &[usize],
+    base: Color32,
+    font: &FontId,
+) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = f32::INFINITY;
+    let base_fmt = TextFormat::simple(font.clone(), base);
+    let hit_fmt = TextFormat::simple(font.clone(), super::ACCENT);
+    let mut k = 0usize; // pointer into hl
+    let mut seg = String::new();
+    let mut seg_hl = false;
+    for (ci, ch) in disp.chars().enumerate() {
+        let is_hl = k < hl.len() && hl[k] == ci;
+        if is_hl {
+            k += 1;
+        }
+        if ci == 0 {
+            seg_hl = is_hl;
+        }
+        if is_hl != seg_hl {
+            let fmt = if seg_hl { &hit_fmt } else { &base_fmt };
+            job.append(&seg, 0.0, fmt.clone());
+            seg.clear();
+            seg_hl = is_hl;
+        }
+        seg.push(ch);
+    }
+    if !seg.is_empty() {
+        let fmt = if seg_hl { &hit_fmt } else { &base_fmt };
+        job.append(&seg, 0.0, fmt.clone());
+    }
+    job
+}
+
 fn draw_keyboard(painter: &egui::Painter, c: Pos2, color: Color32) {
     let body = Rect::from_center_size(c, Vec2::new(16.0, 11.0));
     painter.rect_stroke(
@@ -3017,6 +3330,68 @@ pub fn show(
         ComposerMode::Compose => {
             let ed_id = Id::new(("composer", terminal_id));
 
+            // ── Ctrl-R history search (Tier-2b #1): keys FIRST, before the
+            // caret-placement block below (so accept/cancel land their
+            // caret_to_end this same frame) and before every other
+            // consume-before-show chain (Esc here must never reach the
+            // Tab-restore or blur paths). The overlay is pre-submit UI over
+            // `state.draft` only. While the composer is NOT armed (Raw
+            // mode / grid focus) this block does not exist, so Ctrl-R still
+            // reaches the grid and ships ^R to the shell exactly as before.
+            // Key handling acts on the results the user SAW (this frame's
+            // pre-edit query); the render block after the TextEdit
+            // recomputes so the painted rows are never stale.
+            if !overlay_open {
+                if state.search_active() {
+                    let hits = search_results(recs, &state.draft, SEARCH_MAX);
+                    // Ctrl-R again: cycle to the next match (readline
+                    // parity), wrapping. Key repeat delivers several.
+                    let cyc = ui
+                        .input_mut(|i| i.count_and_consume_key(Modifiers::COMMAND, Key::R));
+                    for _ in 0..cyc {
+                        state.search_cycle(hits.len());
+                    }
+                    // Up/Down: walk the list (up = older/worse, clamped).
+                    let up = ui
+                        .input_mut(|i| i.count_and_consume_key(Modifiers::NONE, Key::ArrowUp))
+                        as i64;
+                    let down = ui.input_mut(|i| {
+                        i.count_and_consume_key(Modifiers::NONE, Key::ArrowDown)
+                    }) as i64;
+                    if up != down {
+                        state.search_nav(up - down, hits.len());
+                    }
+                    // Enter: the selection becomes the draft — close, do
+                    // NOT submit (the whole point: edit before running).
+                    // Every repeat is consumed so none falls into the
+                    // TextEdit as a stray newline; with no matches Enter
+                    // closes like Esc (nothing to insert).
+                    let mut enters = 0u32;
+                    while ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
+                        enters += 1;
+                    }
+                    if enters > 0 {
+                        let sel = state.search.as_ref().map(|s| s.sel).unwrap_or(0);
+                        match hits.get(sel) {
+                            Some(h) => state.search_accept(&h.cmd),
+                            None => state.search_cancel(),
+                        }
+                    } else if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
+                    {
+                        // Esc: close and restore the pre-search draft
+                        // exactly (the stash contract). Consumed here, so
+                        // the ordinary Esc chain (blur to grid) needs a
+                        // second press — same one-Esc-per-layer rule as the
+                        // Tab cycle's restore.
+                        state.search_cancel();
+                    }
+                } else if state.has_focus
+                    && ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::R))
+                {
+                    state.search_begin();
+                }
+            }
+
             // One-frame caret placement (P4): a reclaim/insert just replaced
             // the draft — put the caret at its end BEFORE the TextEdit shows
             // (the standard egui TextEditState pattern) so typing continues
@@ -3057,10 +3432,15 @@ pub fn show(
                     // ^C at an uncertain prompt). With the latch down the
                     // inner command is genuinely running and the deliberate
                     // Ctrl+C interrupt stays the universal cancel.
+                    // Tier-2b: never while the search overlay is open —
+                    // Ctrl+C there is the query box's own copy, and an
+                    // accidental interrupt from inside a search would be
+                    // the worst possible surprise.
                     if !editor_sel
                         && state.at_prompt_since.is_none()
                         && !heur_armed
                         && inputs.running
+                        && !state.search_active()
                     {
                         ui.input_mut(|i| {
                             i.events.retain(|e| !matches!(e, egui::Event::Copy))
@@ -3124,8 +3504,11 @@ pub fn show(
             // While an overlay (history popup / search / panel) is open, the
             // popup owns Enter/arrows — consuming them here on the stale
             // has_focus of the open frame would race the popup's own
-            // consume-before-show (P4 §3.6 focus chain).
-            if state.has_focus && !overlay_open {
+            // consume-before-show (P4 §3.6 focus chain). The Ctrl-R overlay
+            // is the same rule in-module: its block above already consumed
+            // Enter/arrows, and the draft is the QUERY right now — recall
+            // walks and ghost-accept must not fire against it.
+            if state.has_focus && !overlay_open && !state.search_active() {
                 // Consume EVERY pending Enter press, not just one: a held
                 // key delivers several repeats per frame, and any press left
                 // unconsumed falls into the TextEdit as a stray newline
@@ -3214,7 +3597,9 @@ pub fn show(
                 // end-of-text is otherwise a TextEdit no-op. End is left
                 // alone (it has row-end semantics under soft wrap).
                 if !state.tab_active() && state.recall.is_none() {
-                    if let Some(rest) = history_ghost(recs, &state.draft) {
+                    if let Some(rest) =
+                        history_ghost(recs, &state.draft, &state.fam, prompt_cwd)
+                    {
                         if caret_byte_of(ui.ctx(), ed_id, &state.draft) == state.draft.len()
                             && ui.input_mut(|i| {
                                 i.consume_key(Modifiers::NONE, Key::ArrowRight)
@@ -3322,8 +3707,12 @@ pub fn show(
             let lane_ghost = state
                 .submit_hold
                 .as_ref()
-                .filter(|_| state.draft.is_empty())
+                .filter(|_| state.draft.is_empty() && !state.search_active())
                 .map(|h| h.ghost.lines().next().unwrap_or("").to_string());
+            // Tier-2b: the lane is the QUERY field while the Ctrl-R overlay
+            // is open — every prediction/hint surface over the draft stands
+            // down (ghost text, frozen submit ghost, busy chip, Tab cycle).
+            let searching = state.search_active();
             let n_lines = editor_rows(&state.draft);
             // Prompt syntax highlighting (Tier-2a #1): both TextEdits render
             // through this layouter — a token-level colorizer over the SAME
@@ -3336,10 +3725,24 @@ pub fn show(
             // O(len) pass per call, galley cache absorbs repeat jobs.
             let hl_fam = state.fam.clone();
             let hl_font = font.clone();
+            // Tier-2b: while the lane holds the search QUERY, colorizing it
+            // as a command would be a lie — plain TEXT, geometry-identical
+            // (same simple-job shape as highlight.rs's empty branch).
+            let hl_plain = searching;
             let mut hl_layouter =
                 move |lui: &Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
-                    let job =
-                        super::highlight::layout_job(&hl_fam, buf.as_str(), &hl_font, wrap_width);
+                    let job = if hl_plain {
+                        let mut j = egui::text::LayoutJob::simple(
+                            buf.as_str().to_owned(),
+                            hl_font.clone(),
+                            super::TEXT,
+                            wrap_width,
+                        );
+                        j.keep_trailing_whitespace = true;
+                        j
+                    } else {
+                        super::highlight::layout_job(&hl_fam, buf.as_str(), &hl_font, wrap_width)
+                    };
                     lui.fonts_mut(|f| f.layout_job(job))
                 };
             let resp = if n_lines > 1 {
@@ -3401,7 +3804,9 @@ pub fn show(
                     .id(ed_id)
                     .font(font.clone())
                     .layouter(&mut hl_layouter)
-                    .hint_text(if lane_ghost.is_some() {
+                    .hint_text(if searching {
+                        "search history\u{2026}"
+                    } else if lane_ghost.is_some() {
                         ""
                     } else {
                         "Type a command\u{2026}"
@@ -3429,8 +3834,17 @@ pub fn show(
                 // while a Tab cycle or recall stash owns the draft (no
                 // fighting existing UX) and clipped at the hint slot so it
                 // never runs under the right-side chrome.
-                if state.has_focus && !state.tab_active() && state.recall.is_none() {
-                    if let Some(rest) = history_ghost(recs, &state.draft) {
+                // Tier-2b: hidden while the Ctrl-R overlay is open (the
+                // draft is the query — predicting a command off it would
+                // paint noise under the results).
+                if state.has_focus
+                    && !state.tab_active()
+                    && state.recall.is_none()
+                    && !searching
+                {
+                    if let Some(rest) =
+                        history_ghost(recs, &state.draft, &state.fam, prompt_cwd)
+                    {
                         let end = te.galley.pos_from_cursor(te.galley.end());
                         let pos = Pos2::new(
                             te.galley_pos.x + end.max.x,
@@ -3448,9 +3862,16 @@ pub fn show(
                 te.response.response
             };
 
-            // A user edit forks off any active recall (§6.2).
+            // A user edit forks off any active recall (§6.2). While the
+            // Ctrl-R overlay is open the edit is a QUERY edit instead: the
+            // selection snaps back to the best match and the recall stash —
+            // which may be holding a pre-search ArrowDown restore — is kept.
             if resp.changed() {
-                state.recall = None;
+                if searching {
+                    state.search_edited();
+                } else {
+                    state.recall = None;
+                }
             }
 
             // Escape: the TextEdit surrenders focus natively; yield the
@@ -3513,7 +3934,11 @@ pub fn show(
             // the contract ("Enter queues"). Same slot the hints use (one
             // occupant, F3 stable chrome, zero geometry change); REVEAL
             // hysteresis keeps instant commands from flashing it.
-            let busy_chip = (busy_hold && !quiet && lane_ghost.is_none() && !cmd_multiline)
+            let busy_chip = (busy_hold
+                && !quiet
+                && lane_ghost.is_none()
+                && !cmd_multiline
+                && !searching)
                 .then(|| {
                     match recs.iter().rev().find(|r| r.end_off.is_none()) {
                         Some(r) => format!(
@@ -3528,7 +3953,11 @@ pub fn show(
                         None => "running \u{2014} Enter queues".to_string(),
                     }
                 });
-            let hint = if lane_ghost.is_some() || busy_chip.is_some() {
+            let hint = if searching {
+                // The overlay's one line of guidance rides the EXISTING
+                // hint slot — zero new chrome (F3 stable geometry).
+                Some("Enter inserts \u{b7} Esc restores \u{b7} Ctrl+R next")
+            } else if lane_ghost.is_some() || busy_chip.is_some() {
                 None
             } else if cmd_multiline {
                 // P6b §6 / D2: the refusal is announced, never silent.
@@ -3593,9 +4022,19 @@ pub fn show(
                         state.blur_to_grid();
                         resp.surrender_focus();
                     } else if hist_rect.contains(p) {
+                        // Opening the history panel closes the inline
+                        // search (restore first — one history surface at a
+                        // time; the panel must see the real draft).
+                        state.search_cancel();
                         out.toggle_history = true;
                     } else if run_rect.contains(p) {
-                        if can_submit && has_draft {
+                        if state.search_active() {
+                            // Run while searching can only mean "back out":
+                            // the visible text is the QUERY — submitting it
+                            // as a command would be the worst surprise.
+                            // Close, restore, and let the user click again.
+                            state.search_cancel();
+                        } else if can_submit && has_draft {
                             // Run ▸ is gated on a non-empty draft, so this is
                             // never the spacer gesture (that is Enter only).
                             // Focus stays in the editor (typeahead window).
@@ -3615,6 +4054,105 @@ pub fn show(
                         // Anywhere else on the strip: focus the editor.
                         state.want_focus = true;
                     }
+                }
+            }
+
+            // ── Ctrl-R overlay paint (Tier-2b #1): the ranked results float
+            // directly above the strip in the SAME Foreground-area pattern
+            // as the multi-line draft editor (composer_pop) — the composer
+            // growing upward, never a foreign window (seamless doctrine).
+            // Rendered AFTER the TextEdit so the rows always reflect THIS
+            // frame's query; the key handling at the top of the branch acted
+            // on last frame's list (what the user actually saw). Depth by
+            // shadow + background, selection by fill shift — no strokes.
+            if searching && !overlay_open {
+                let hits = search_results(recs, &state.draft, SEARCH_MAX);
+                state.search_clamp(hits.len());
+                let sel = state.search.as_ref().map(|s| s.sel).unwrap_or(0);
+                let mut clicked: Option<String> = None;
+                let pop_w = strip_rect.width() - 16.0;
+                egui::Area::new(Id::new(("composer_search", terminal_id)))
+                    .order(egui::Order::Foreground)
+                    .pivot(Align2::LEFT_BOTTOM)
+                    .fixed_pos(Pos2::new(strip_rect.min.x + 8.0, strip_rect.min.y))
+                    .show(ui.ctx(), |aui| {
+                        egui::Frame::new()
+                            .fill(super::TERM_BG)
+                            .corner_radius(CornerRadius::same(8))
+                            .shadow(egui::epaint::Shadow {
+                                offset: [0, 6],
+                                blur: 28,
+                                spread: 0,
+                                color: Color32::from_black_alpha(150),
+                            })
+                            .inner_margin(egui::Margin::symmetric(10, 6))
+                            .show(aui, |aui| {
+                                aui.set_width(pop_w - 20.0);
+                                if hits.is_empty() {
+                                    let (rect, _) = aui.allocate_exact_size(
+                                        Vec2::new(pop_w - 20.0, row_h + 6.0),
+                                        Sense::hover(),
+                                    );
+                                    aui.painter().text(
+                                        Pos2::new(rect.min.x + 6.0, rect.center().y),
+                                        Align2::LEFT_CENTER,
+                                        "no matches",
+                                        FontId::proportional(10.0),
+                                        super::TEXT_FAINT,
+                                    );
+                                    return;
+                                }
+                                // Best match at the BOTTOM, adjacent to the
+                                // query lane; the eye travels UP for older /
+                                // lower-ranked (readline's spatial model,
+                                // upward like the multi-line editor).
+                                for (i, hit) in hits.iter().enumerate().rev() {
+                                    let (rect, rresp) = aui.allocate_exact_size(
+                                        Vec2::new(pop_w - 20.0, row_h + 6.0),
+                                        Sense::click(),
+                                    );
+                                    let rp = aui.painter();
+                                    if i == sel {
+                                        // Selected: subtle fill shift, the
+                                        // app's standard selected surface.
+                                        rp.rect_filled(
+                                            rect,
+                                            CornerRadius::same(4),
+                                            super::SURFACE_2,
+                                        );
+                                    } else if rresp.hovered() {
+                                        rp.rect_filled(
+                                            rect,
+                                            CornerRadius::same(4),
+                                            super::OV_HOVER,
+                                        );
+                                    }
+                                    let base = if i == sel {
+                                        super::TEXT
+                                    } else {
+                                        super::TEXT_SECONDARY
+                                    };
+                                    let job =
+                                        search_row_job(&hit.disp, &hit.hl, base, &font);
+                                    let g = aui.fonts_mut(|f| f.layout_job(job));
+                                    let pos = Pos2::new(
+                                        rect.min.x + 6.0,
+                                        rect.center().y - g.size().y / 2.0,
+                                    );
+                                    // Long commands CLIP at the row edge —
+                                    // honest truncation, indices stay true
+                                    // (an ellipsis would shift the
+                                    // highlight spans).
+                                    rp.with_clip_rect(rect).galley(pos, g, base);
+                                    if rresp.clicked() {
+                                        clicked = Some(hit.cmd.clone());
+                                    }
+                                }
+                            });
+                    });
+                // Mouse-first parity: a row click IS the Enter gesture.
+                if let Some(cmd) = clicked {
+                    state.search_accept(&cmd);
                 }
             }
 
@@ -6245,34 +6783,38 @@ mod tests {
     /// never suggests.
     #[test]
     fn history_ghost_selection() {
+        // Location-independent commands: cwd plays no part (both None here).
+        let g = |recs: &[BlockRec], d: &str| {
+            history_ghost(recs, d, &complete::Family::Pwsh, None)
+        };
         let recs: Vec<BlockRec> = ["git status", "cargo build", "", "git stash pop", "ls"]
             .iter()
             .map(|c| rec(c))
             .collect();
         // Most-recent prefix match wins: "git " hits "git stash pop", not
         // the older "git status".
-        assert_eq!(history_ghost(&recs, "git "), Some("stash pop".into()));
-        assert_eq!(history_ghost(&recs, "git sta"), Some("sh pop".into()));
+        assert_eq!(g(&recs, "git "), Some("stash pop".into()));
+        assert_eq!(g(&recs, "git sta"), Some("sh pop".into()));
         // The newer match gone from the prefix set, the older one serves.
-        assert_eq!(history_ghost(&recs, "git stat"), Some("us".into()));
-        assert_eq!(history_ghost(&recs, "car"), Some("go build".into()));
+        assert_eq!(g(&recs, "git stat"), Some("us".into()));
+        assert_eq!(g(&recs, "car"), Some("go build".into()));
         // Case-sensitive: "GIT" matches nothing.
-        assert_eq!(history_ghost(&recs, "GIT"), None);
+        assert_eq!(g(&recs, "GIT"), None);
         // Empty draft = no ghost; no-match = no ghost.
-        assert_eq!(history_ghost(&recs, ""), None);
-        assert_eq!(history_ghost(&recs, "docker"), None);
+        assert_eq!(g(&recs, ""), None);
+        assert_eq!(g(&recs, "docker"), None);
         // Exact match yields no remainder and falls through to an OLDER,
         // longer command with the same prefix.
         let recs2: Vec<BlockRec> = ["ls -la", "ls"].iter().map(|c| rec(c)).collect();
-        assert_eq!(history_ghost(&recs2, "ls"), Some(" -la".into()));
+        assert_eq!(g(&recs2, "ls"), Some(" -la".into()));
         // Multiline drafts and multiline history commands never ghost
         // (the ghost paints inline in the single-line lane).
-        assert_eq!(history_ghost(&recs, "git\nls"), None);
+        assert_eq!(g(&recs, "git\nls"), None);
         let recs3: Vec<BlockRec> = ["echo a\necho b"].iter().map(|c| rec(c)).collect();
-        assert_eq!(history_ghost(&recs3, "echo"), None);
+        assert_eq!(g(&recs3, "echo"), None);
         // Blank commands are skipped even for a whitespace draft.
         let recs4: Vec<BlockRec> = ["   "].iter().map(|c| rec(c)).collect();
-        assert_eq!(history_ghost(&recs4, " "), None);
+        assert_eq!(g(&recs4, " "), None);
     }
 
     /// Tier-2a #2 history ghost — accept appends the remainder, puts the
@@ -6285,20 +6827,556 @@ mod tests {
             draft: "git st".into(),
             ..Default::default()
         };
-        let rest = history_ghost(&recs, &st.draft).expect("ghost offered");
+        let fam = complete::Family::Pwsh;
+        let rest =
+            history_ghost(&recs, &st.draft, &fam, None).expect("ghost offered");
         assert_eq!(rest, "atus");
         let caret = st.ghost_accept(&rest);
         assert_eq!(st.draft, "git status");
         assert_eq!(caret, "git status".chars().count());
         // Derived state: with the full command in the draft, the ghost is
         // simply gone — nothing to clear, nothing stored.
-        assert_eq!(history_ghost(&recs, &st.draft), None);
+        assert_eq!(history_ghost(&recs, &st.draft, &fam, None), None);
         // And typing PAST the suggestion (mismatch) clears it the same way.
         st.draft.push('x');
-        assert_eq!(history_ghost(&recs, &st.draft), None);
+        assert_eq!(history_ghost(&recs, &st.draft, &fam, None), None);
         // The accepted text is draft-only: submission machinery sees it as
         // any typed draft (nothing queued, no bytes emitted by accept).
         assert!(st.pending.is_empty());
+    }
+
+    fn rec_at(cmd: &str, cwd: Option<&str>) -> BlockRec {
+        BlockRec {
+            cwd: cwd.map(std::path::PathBuf::from),
+            ..rec(cmd)
+        }
+    }
+
+    /// Ghost cwd fix (sandbox field failure: `cd Users\` ghosted in
+    /// C:\Users from a C:\ session → `C:\Users\Users` error): the
+    /// eligibility matrix. Path-sensitive commands ghost only from the SAME
+    /// cwd; location-independent commands ghost across cwds; unknown cwd on
+    /// either side is conservative (no ghost when path-sensitive).
+    #[test]
+    fn history_ghost_cwd_eligibility_matrix() {
+        let fam = complete::Family::Pwsh;
+        let g = |recs: &[BlockRec], d: &str, cwd: Option<&str>| {
+            history_ghost(recs, d, &fam, cwd)
+        };
+        // Same-cwd cd → ghost OK (trailing separator + case differences in
+        // the tracked string must not break the match).
+        let cd = vec![rec_at("cd Users\\proj", Some("C:\\"))];
+        assert_eq!(g(&cd, "cd U", Some("C:\\")), Some("sers\\proj".into()));
+        assert_eq!(g(&cd, "cd U", Some("c:")), Some("sers\\proj".into()));
+        // Different-cwd cd → INELIGIBLE (the exact field failure).
+        assert_eq!(g(&cd, "cd U", Some("C:\\Users")), None);
+        // Unknown on either side + path-sensitive → conservative, no ghost.
+        assert_eq!(g(&cd, "cd U", None), None);
+        let cd_unknown = vec![rec_at("cd Users\\proj", None)];
+        assert_eq!(g(&cd_unknown, "cd U", Some("C:\\")), None);
+        // Different-cwd git status → still ghosts (the useful case).
+        let git = vec![rec_at("git status", Some("C:\\repo"))];
+        assert_eq!(g(&git, "git s", Some("D:\\other")), Some("tatus".into()));
+        assert_eq!(g(&git, "git s", None), Some("tatus".into()));
+        // Different-cwd RELATIVE path argument → ineligible.
+        let rel = vec![rec_at("type foo\\bar.txt", Some("C:\\a"))];
+        assert_eq!(g(&rel, "type f", Some("C:\\b")), None);
+        assert_eq!(g(&rel, "type f", Some("C:\\a")), Some("oo\\bar.txt".into()));
+        // ABSOLUTE path argument → cwd-independent, ghosts anywhere.
+        let abs = vec![rec_at("type C:\\foo\\bar.txt", Some("C:\\a"))];
+        assert_eq!(
+            g(&abs, "type C", Some("D:\\b")),
+            Some(":\\foo\\bar.txt".into())
+        );
+        // Ineligible newest falls through to an older ELIGIBLE match.
+        let recs = vec![
+            rec_at("git checkout main", Some("C:\\repo")),
+            rec_at("git checkout feature\\x", Some("C:\\elsewhere")),
+        ];
+        assert_eq!(
+            g(&recs, "git c", Some("C:\\repo")),
+            Some("heckout main".into()),
+            "ineligible entry must fall through, not kill the ghost"
+        );
+        // Posix families: absolute stays eligible cross-cwd, relative not.
+        let wsl = complete::Family::Wsl { distro: None };
+        let recs = vec![rec_at("cat /etc/hosts", Some("/home/u"))];
+        assert_eq!(
+            history_ghost(&recs, "cat /e", &wsl, Some("/tmp")),
+            Some("tc/hosts".into())
+        );
+        let recs = vec![rec_at("cat sub/file", Some("/home/u"))];
+        assert_eq!(history_ghost(&recs, "cat s", &wsl, Some("/tmp")), None);
+    }
+
+    /// The path-sensitivity classifier itself: cd-family verbs (with an
+    /// argument, across separators, case-folded), relative vs anchored
+    /// tokens, flags and URLs exempt.
+    #[test]
+    fn path_sensitive_classifier() {
+        let fam = complete::Family::Pwsh;
+        let ps = |s: &str| path_sensitive(&fam, s);
+        // cd-family heads with any argument; bare cd is not.
+        assert!(ps("cd sub"));
+        assert!(ps("Set-Location 'my dir'"));
+        assert!(ps("pushd .."));
+        assert!(ps("sl x"));
+        assert!(ps("chdir C:\\abs")); // cd is stateful even to an absolute
+        assert!(!ps("cd"));
+        // A cd behind a separator is still caught (classify's head rule).
+        assert!(ps("git pull && cd sub"));
+        assert!(!ps("git pull && cd"));
+        // Relative path tokens anywhere → sensitive.
+        assert!(ps("type foo\\bar.txt"));
+        assert!(ps("cat sub/dir/file"));
+        assert!(ps(".\\build.ps1 -Fast")); // relative HEAD
+        assert!(ps("type C:foo\\bar")); // drive-RELATIVE
+        // Anchored forms → not sensitive.
+        assert!(!ps("type C:\\foo\\bar.txt"));
+        assert!(!ps("type c:/foo/bar"));
+        assert!(!ps("dir \\\\srv\\share\\x"));
+        assert!(!ps("cat ~/notes.txt"));
+        assert!(!ps("git clone https://github.com/a/b"));
+        // Flags with separators are exempt (the non-flag rule).
+        assert!(!ps("git log --pretty=format:a/b"));
+        // Location-independent commands.
+        assert!(!ps("git status"));
+        assert!(!ps("cargo build --release"));
+        // Posix family: `/…` is absolute there, but not on pwsh (a pwsh
+        // `/foo` is drive-root-relative — stays conservative).
+        let wsl = complete::Family::Wsl { distro: None };
+        assert!(!path_sensitive(&wsl, "cat /etc/hosts"));
+        assert!(ps("cat /etc/hosts"));
+        assert!(path_sensitive(&wsl, "cat etc/hosts"));
+    }
+
+    /// The interplay the user suspected in the sandbox: with a ghost
+    /// visible and Tab yielding ZERO completion candidates, the ghost must
+    /// neither be accepted nor become the draft (Tab is inert; ArrowRight
+    /// remains the only accept gesture). Driven through show() against a
+    /// real empty directory so complete.rs genuinely enumerates nothing.
+    #[test]
+    fn show_tab_without_candidates_never_accepts_ghost() {
+        let dir = tab_scratch(&[]); // an EMPTY dir: no "U*" entries exist
+        let cwd = dir.to_str().unwrap().to_owned();
+        let b = backend_at_clean_prompt();
+        let mut st = ComposerState::default();
+        let now = Instant::now();
+        let f = b.block_feed.as_ref().unwrap();
+        st.on_stream_events(f.pre_seen, f.exec_seen, now);
+        // Same-cwd history entry, so the ghost IS eligible and visible.
+        let recs = vec![rec_at("cd Users\\proj", Some(&cwd))];
+        st.tick(&b, &recs, true, true, now);
+        assert_eq!(st.mode, ComposerMode::Compose);
+
+        let ctx = egui::Context::default();
+        let strip = Rect::from_min_max(Pos2::new(0.0, 564.0), Pos2::new(800.0, 600.0));
+        let grid = Rect::from_min_max(Pos2::ZERO, Pos2::new(800.0, 564.0));
+        let frame = |st: &mut ComposerState, events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_max(
+                    Pos2::ZERO,
+                    Pos2::new(800.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let mut out = None;
+            let _ = ctx.run_ui(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    out = Some(show(
+                        ui,
+                        strip,
+                        grid,
+                        Uuid::nil(),
+                        st,
+                        &b,
+                        &recs,
+                        1,
+                        true,
+                        false,
+                        false,
+                        FontId::monospace(13.0),
+                        None,
+                        Some(&cwd), // the SAME cwd Tab and the ghost share
+                    ));
+                });
+            });
+            let o = out.unwrap();
+            st.has_focus = o.has_focus;
+            o
+        };
+        let key = |k: Key| egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        frame(&mut st, vec![]);
+        frame(&mut st, vec![egui::Event::Text("cd U".into())]);
+        assert_eq!(st.draft, "cd U");
+        // The ghost is genuinely on offer this frame.
+        assert_eq!(
+            history_ghost(&recs, &st.draft, &st.fam, Some(&cwd)).as_deref(),
+            Some("sers\\proj")
+        );
+        // Tab with zero candidates: draft untouched — no literal tab, no
+        // completion, and ABOVE ALL no ghost acceptance.
+        frame(&mut st, vec![key(Key::Tab)]);
+        assert_eq!(st.draft, "cd U", "Tab must not accept the ghost");
+        assert!(!st.tab_active(), "no cycle exists without candidates");
+        // ArrowRight (caret at end) remains the accept gesture.
+        frame(&mut st, vec![key(Key::ArrowRight)]);
+        assert_eq!(st.draft, "cd Users\\proj", "ArrowRight accepts");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Ctrl-R history search (Tier-2b #1) ───────────────────────────────
+
+    /// The overlay state machine: open stashes the draft (the lane becomes
+    /// the query), accept sets the draft and NEVER submits, and the
+    /// displaced pre-search draft rides the recall stash (ArrowDown
+    /// restores it — the one stash contract shared with insert_history).
+    #[test]
+    fn search_accept_sets_draft_and_never_submits() {
+        let mut st = ComposerState {
+            mode: ComposerMode::Compose,
+            draft: "half typed".into(),
+            ..Default::default()
+        };
+        st.search_begin();
+        assert!(st.search_active());
+        assert_eq!(st.draft, "", "query starts empty — the draft is stashed");
+        st.draft = "gco".into(); // typing = query edits while open
+        st.search_edited();
+        st.search_accept("git checkout main");
+        assert!(!st.search_active());
+        assert_eq!(st.draft, "git checkout main");
+        // NOT a submission: no ledger command, no bytes, no queue, no
+        // typeahead window — the draft is simply ready to edit/run.
+        assert!(st.take_submit_cmd().is_none());
+        assert!(st.take_pending_clear().is_none());
+        assert!(st.pending.is_empty());
+        assert!(!st.buffering());
+        assert_eq!(st.mode, ComposerMode::Compose);
+        assert!(st.want_focus, "focus returns to the editor on close");
+        // Stash contract: ArrowDown restores the displaced draft.
+        st.recall_next(&[]);
+        assert_eq!(st.draft, "half typed");
+        // Re-opening while already open is a no-op (the stash is kept).
+        st.search_begin();
+        st.search_begin();
+        assert_eq!(st.search.as_ref().unwrap().saved, "half typed");
+    }
+
+    /// Esc (and every close-without-accept path) restores the pre-search
+    /// draft EXACTLY, regardless of what was typed into the query.
+    #[test]
+    fn search_cancel_restores_pre_search_draft_exactly() {
+        let mut st = ComposerState {
+            mode: ComposerMode::Compose,
+            draft: "cargo build --release".into(),
+            ..Default::default()
+        };
+        st.search_begin();
+        st.draft = "zzz no match".into();
+        st.search_cancel();
+        assert!(!st.search_active());
+        assert_eq!(st.draft, "cargo build --release");
+        assert!(st.want_focus);
+        // A pre-existing recall stash survives the whole round trip (query
+        // edits are NOT draft edits).
+        let mut st = ComposerState {
+            mode: ComposerMode::Compose,
+            draft: "recalled".into(),
+            recall: Some((RecallSrc::History, "original".into())),
+            ..Default::default()
+        };
+        st.search_begin();
+        st.draft = "query".into();
+        st.search_cancel();
+        assert_eq!(st.draft, "recalled");
+        st.recall_next(&[]);
+        assert_eq!(st.draft, "original", "recall stash survived the search");
+    }
+
+    /// Ctrl-R cycles with wrap; Up/Down clamp at the ends; a shrinking
+    /// result list clamps the selection; empty lists never panic.
+    #[test]
+    fn search_cycle_wraps_and_nav_clamps() {
+        let mut st = ComposerState::default();
+        st.search_begin();
+        st.search_cycle(3);
+        st.search_cycle(3);
+        assert_eq!(st.search.as_ref().unwrap().sel, 2);
+        st.search_cycle(3);
+        assert_eq!(st.search.as_ref().unwrap().sel, 0, "Ctrl-R wraps");
+        st.search_nav(1, 3);
+        st.search_nav(1, 3);
+        st.search_nav(1, 3);
+        assert_eq!(st.search.as_ref().unwrap().sel, 2, "Up clamps at oldest");
+        st.search_nav(-1, 3);
+        assert_eq!(st.search.as_ref().unwrap().sel, 1);
+        st.search_nav(-5, 3);
+        assert_eq!(st.search.as_ref().unwrap().sel, 0, "Down clamps at best");
+        st.search_nav(1, 3);
+        st.search_clamp(1);
+        assert_eq!(st.search.as_ref().unwrap().sel, 0, "shrink clamps");
+        st.search_cycle(0); // empty list: no-ops, no panic
+        st.search_nav(1, 0);
+        st.search_edited();
+        assert_eq!(st.search.as_ref().unwrap().sel, 0);
+    }
+
+    /// The ranked list: same source the recall walk uses — deduped,
+    /// blanks skipped, most-recent-first — then exact > prefix >
+    /// substring > subsequence, ties by recency, capped, with highlight
+    /// indices aligned to the single-line display form.
+    #[test]
+    fn search_results_rank_dedupe_cap_and_highlight() {
+        let recs: Vec<BlockRec> = [
+            "git", // exact for "git"
+            "grep -i toml",
+            "  ",
+            "legit thing",
+            "git status",
+            "cargo build",
+            "cargo build", // dupe: only the newer survives
+            "git commit -m x",
+        ]
+        .iter()
+        .map(|c| rec(c))
+        .collect();
+        let hits = search_results(&recs, "git", SEARCH_MAX);
+        let cmds: Vec<&str> = hits.iter().map(|h| h.cmd.as_str()).collect();
+        assert_eq!(
+            cmds,
+            vec![
+                "git",             // exact
+                "git commit -m x", // prefix, newer
+                "git status",      // prefix, older
+                "legit thing",     // substring
+                "grep -i toml",    // subsequence
+            ]
+        );
+        // Highlight spans point at the real matched chars.
+        assert_eq!(hits[3].hl, vec![2, 3, 4]); // le[git] thing
+        // Empty query = most-recent-first, deduped, no blanks.
+        let all = search_results(&recs, "", SEARCH_MAX);
+        let cmds: Vec<&str> = all.iter().map(|h| h.cmd.as_str()).collect();
+        assert_eq!(
+            cmds,
+            vec![
+                "git commit -m x",
+                "cargo build",
+                "git status",
+                "legit thing",
+                "grep -i toml",
+                "git",
+            ]
+        );
+        // Cap: nine distinct entries yield SEARCH_MAX rows.
+        let many: Vec<BlockRec> =
+            (0..9).map(|i| rec(&format!("cmd{i}"))).collect();
+        assert_eq!(search_results(&many, "", SEARCH_MAX).len(), SEARCH_MAX);
+        // Multiline commands: display form is one line (indices align with
+        // what's painted), the pristine cmd keeps its newline for accept.
+        let recs = vec![rec("echo a\necho b")];
+        let hits = search_results(&recs, "a e", SEARCH_MAX);
+        assert_eq!(hits[0].disp, "echo a echo b");
+        assert_eq!(hits[0].cmd, "echo a\necho b");
+        assert_eq!(hits[0].hl, vec![5, 6, 7]); // "a e" contiguous in disp
+        // No match at all: empty list.
+        assert!(search_results(&recs, "zzz", SEARCH_MAX).is_empty());
+    }
+
+    /// Suppression interplay + lifecycle: the Tab cycle is dead while the
+    /// overlay is open; leaving Compose (demotion, blur) closes the overlay
+    /// and restores the stash quietly.
+    #[test]
+    fn search_suppresses_tab_and_dies_with_compose() {
+        let dir = tab_scratch(&["alpha"]);
+        let cwd = dir.to_str().unwrap();
+        let mut st = ComposerState {
+            mode: ComposerMode::Compose,
+            draft: "cd ".into(),
+            ..Default::default()
+        };
+        st.search_begin();
+        st.draft = "cd ".into(); // a query that WOULD complete if allowed
+        assert_eq!(
+            st.tab_press(Some(cwd), 3, 1),
+            None,
+            "Tab cycle must be blocked while the search overlay is open"
+        );
+        assert_eq!(st.draft, "cd ", "query untouched by the dead Tab");
+        // Esc-blur while open: the stash is what survives the yield.
+        st.blur_to_grid();
+        assert!(!st.search_active());
+        assert_eq!(st.draft, "cd ", "stash restored on blur");
+        // And a demotion the composer didn't initiate (alt flip / exit)
+        // sweeps the overlay on the next tick.
+        let b = backend_at_clean_prompt();
+        let now = Instant::now();
+        let mut st = ComposerState {
+            mode: ComposerMode::Compose,
+            draft: "kept".into(),
+            ..Default::default()
+        };
+        st.search_begin();
+        st.draft = "query".into();
+        st.mode = ComposerMode::Raw(RawReason::NoPrompt); // external demote
+        let recs: Vec<BlockRec> = Vec::new();
+        st.tick(&b, &recs, true, false, now);
+        assert!(!st.search_active(), "overlay dies with Compose");
+        assert_eq!(st.draft, "kept", "stash restored by the tick sweep");
+        // After blur, tab_press works again (the suppression is scoped).
+        let mut st = ComposerState {
+            mode: ComposerMode::Compose,
+            draft: "cd ".into(),
+            ..Default::default()
+        };
+        assert!(st.tab_press(Some(cwd), 3, 1).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// External inserts (history popup) over an open overlay close it
+    /// first — the recall slot must stash the REAL displaced draft, never
+    /// the transient query string.
+    #[test]
+    fn search_insert_history_stashes_saved_not_query() {
+        let mut st = ComposerState {
+            mode: ComposerMode::Compose,
+            draft: "real draft".into(),
+            ..Default::default()
+        };
+        st.search_begin();
+        st.draft = "qry".into();
+        st.insert_history("picked from popup");
+        assert!(!st.search_active());
+        assert_eq!(st.draft, "picked from popup");
+        st.recall_next(&[]);
+        assert_eq!(st.draft, "real draft", "stash = the draft, not the query");
+    }
+
+    /// The full UI round trip through `show()`: Ctrl-R opens the overlay
+    /// (draft stashed, typing routes to the query), ghost-accept and Tab
+    /// are inert while open, Up navigates the selection, Enter inserts the
+    /// selection WITHOUT submitting, and Esc restores the stash. Zero
+    /// bytes reach the PTY throughout.
+    #[test]
+    fn show_ctrl_r_search_flow() {
+        let b = backend_at_clean_prompt();
+        let mut st = ComposerState::default();
+        let now = Instant::now();
+        let f = b.block_feed.as_ref().unwrap();
+        st.on_stream_events(f.pre_seen, f.exec_seen, now);
+        let recs: Vec<BlockRec> = ["git status", "cargo build", "git commit -m x"]
+            .iter()
+            .map(|c| rec(c))
+            .collect();
+        st.tick(&b, &recs, true, true, now);
+        assert_eq!(st.mode, ComposerMode::Compose);
+
+        let ctx = egui::Context::default();
+        let strip = Rect::from_min_max(Pos2::new(0.0, 564.0), Pos2::new(800.0, 600.0));
+        let grid = Rect::from_min_max(Pos2::ZERO, Pos2::new(800.0, 564.0));
+        let frame = |st: &mut ComposerState, events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_max(
+                    Pos2::ZERO,
+                    Pos2::new(800.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let mut out = None;
+            let _ = ctx.run_ui(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    out = Some(show(
+                        ui,
+                        strip,
+                        grid,
+                        Uuid::nil(),
+                        st,
+                        &b,
+                        &recs,
+                        1,
+                        true,
+                        false,
+                        false,
+                        FontId::monospace(13.0),
+                        None,
+                        None,
+                    ));
+                });
+            });
+            let o = out.unwrap();
+            st.has_focus = o.has_focus; // the app's per-frame sync
+            o
+        };
+        let key = |k: Key, m: Modifiers| egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: m,
+        };
+        // Winit on Windows stamps ctrl AND command for the Ctrl chord.
+        let ctrl_r = key(Key::R, Modifiers::CTRL | Modifiers::COMMAND);
+
+        // Frame 1: the armed editor takes focus.
+        let o = frame(&mut st, vec![]);
+        assert!(o.has_focus);
+        // Frame 2: a half-typed draft.
+        frame(&mut st, vec![egui::Event::Text("car".into())]);
+        assert_eq!(st.draft, "car");
+        // Frame 3: Ctrl-R opens the overlay; the draft is stashed.
+        let o = frame(&mut st, vec![ctrl_r.clone()]);
+        assert!(st.search_active(), "Ctrl-R must open the search overlay");
+        assert_eq!(st.draft, "", "draft stashed; lane is now the query");
+        assert!(o.write.is_empty(), "Ctrl-R at the composer never goes raw");
+        // Frame 4: typing routes to the QUERY.
+        frame(&mut st, vec![egui::Event::Text("git".into())]);
+        assert!(st.search_active());
+        assert_eq!(st.draft, "git");
+        // Frame 5: ghost-accept is suppressed while open — ArrowRight at
+        // the end of "git" must NOT append a history remainder.
+        frame(&mut st, vec![key(Key::ArrowRight, Modifiers::NONE)]);
+        assert_eq!(st.draft, "git", "ghost hidden/inert while searching");
+        // Frame 6: Tab is dead while open — no literal tab, no completion.
+        frame(&mut st, vec![key(Key::Tab, Modifiers::NONE)]);
+        assert_eq!(st.draft, "git", "Tab cycle blocked while searching");
+        // Frame 7: ArrowUp selects the next-older match.
+        frame(&mut st, vec![key(Key::ArrowUp, Modifiers::NONE)]);
+        assert_eq!(st.search.as_ref().unwrap().sel, 1);
+        // Frame 8: Enter inserts the SELECTED match ("git status" — the
+        // older of the two prefix hits) and closes. NOT a submission.
+        let o = frame(&mut st, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert!(!st.search_active(), "Enter closes the overlay");
+        assert_eq!(st.draft, "git status");
+        assert!(o.write.is_empty(), "accept must never submit");
+        assert!(st.take_submit_cmd().is_none());
+        assert!(!st.buffering(), "no post-submit window: nothing ran");
+        assert_eq!(st.mode, ComposerMode::Compose);
+        // Frame 9: focus is back in the editor; typing lands in the draft.
+        let o = frame(&mut st, vec![egui::Event::Text("X".into())]);
+        assert!(o.has_focus, "editor focused after close (§12.11)");
+        assert_eq!(st.draft, "git statusX");
+        // Frames 10-12: reopen, type a junk query, Esc restores exactly.
+        frame(&mut st, vec![ctrl_r]);
+        assert!(st.search_active());
+        frame(&mut st, vec![egui::Event::Text("zzz".into())]);
+        let o = frame(&mut st, vec![key(Key::Escape, Modifiers::NONE)]);
+        assert!(!st.search_active(), "Esc closes the overlay");
+        assert_eq!(st.draft, "git statusX", "Esc restores the stash exactly");
+        assert_eq!(
+            st.mode,
+            ComposerMode::Compose,
+            "the search Esc never blurs to the grid (one Esc per layer)"
+        );
+        assert!(o.write.is_empty());
     }
 
     /// §11 submission bytes: bracketed iff the shell requested DECSET 2004 ×
