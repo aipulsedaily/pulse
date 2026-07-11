@@ -6239,6 +6239,15 @@ fn regex_escape(s: &str) -> String {
 const UI_SEMIBOLD: &str = "ui_semibold";
 
 fn install_fonts(ctx: &egui::Context) {
+    ctx.set_fonts(build_fonts());
+}
+
+/// Build the font definitions Pulse installs (split out of `install_fonts` so
+/// the grid-metrics invariant is unit-testable without an egui context). The
+/// primary monospace/UI faces are PREPENDED (index 0); every per-glyph
+/// fallback face is APPENDED — this ordering is load-bearing (see the fallback
+/// block below).
+fn build_fonts() -> egui::FontDefinitions {
     use std::sync::Arc;
     let mut fonts = egui::FontDefinitions::default();
     let read = |name: &str| std::fs::read(format!("C:\\Windows\\Fonts\\{name}")).ok();
@@ -6294,7 +6303,85 @@ fn install_fonts(ctx: &egui::Context) {
         .families
         .insert(FontFamily::Name(UI_SEMIBOLD.into()), stack);
 
-    ctx.set_fonts(fonts);
+    // Per-glyph fallback faces (Warp-tier1). egui matches each glyph across the
+    // family vector in order, so appending system symbol/CJK/emoji faces AFTER
+    // the primary lets Nerd Font / powerline / box-drawing / CJK / emoji glyphs
+    // render instead of tofu. Loaded from the stock Windows font dirs at
+    // runtime — nothing is shipped in the repo, so there is zero binary-size
+    // cost, and every load is graceful-if-absent (missing file = skip, debug
+    // log). Consulted ONLY for glyphs the primary + egui-default faces lack, so
+    // Latin text is byte-identical.
+    //
+    // CRITICAL — grid metrics: cell_w/cell_h come from row_height/glyph_width
+    // of the Monospace family's FIRST face (epaint `styled_metrics` reads
+    // `fonts.first()`; `glyph_width('m')` resolves to the primary since 'm' is
+    // in Cascadia Mono). Fallbacks are APPENDED, never inserted at 0, so they
+    // cannot shift the grid. `font_fallbacks_never_take_the_metrics_slot`
+    // guards this. `.ttc` collections load their face 0 (FontData index 0).
+    {
+        // Resolve a font file across the stock system dir and the per-user
+        // install dir (Nerd Fonts usually land in %LOCALAPPDATA%). First hit of
+        // `names` wins; returns the matched filename for the debug log.
+        let read_any = |names: &[&str]| -> Option<(String, Vec<u8>)> {
+            let mut dirs = vec!["C:\\Windows\\Fonts".to_string()];
+            if let Some(la) = std::env::var_os("LOCALAPPDATA").and_then(|v| v.into_string().ok()) {
+                dirs.push(format!("{la}\\Microsoft\\Windows\\Fonts"));
+            }
+            for name in names {
+                for dir in &dirs {
+                    if let Ok(bytes) = std::fs::read(format!("{dir}\\{name}")) {
+                        return Some(((*name).to_string(), bytes));
+                    }
+                }
+            }
+            None
+        };
+        let mut add_fallback = |key: &str, names: &[&str]| {
+            match read_any(names) {
+                Some((file, bytes)) => {
+                    fonts
+                        .font_data
+                        .insert(key.into(), Arc::new(egui::FontData::from_owned(bytes)));
+                    for fam in [FontFamily::Monospace, FontFamily::Proportional] {
+                        if let Some(list) = fonts.families.get_mut(&fam) {
+                            list.push(key.into()); // APPEND — never index 0.
+                        }
+                    }
+                    log::debug!("font fallback '{key}' <- {file}");
+                }
+                None => log::debug!("font fallback '{key}' unavailable (none of {names:?})"),
+            }
+        };
+
+        // Priority order: Nerd Font (powerline + PUA icons, if the user has one
+        // installed) → Segoe UI Symbol (box-drawing, arrows, braille, dingbats)
+        // → one CJK face (first present) → Segoe UI Emoji (egui renders it as a
+        // monochrome outline — acceptable parity, we do not chase color emoji).
+        add_fallback(
+            "fb-nerd",
+            &[
+                "Symbols Nerd Font Mono.ttf",
+                "SymbolsNerdFontMono-Regular.ttf",
+                "Symbols Nerd Font.ttf",
+                "SymbolsNerdFont-Regular.ttf",
+            ],
+        );
+        add_fallback("fb-symbol", &["seguisym.ttf"]);
+        add_fallback(
+            "fb-cjk",
+            &[
+                "YuGothR.ttc", // Yu Gothic UI (JP, preferred)
+                "YuGothM.ttc",
+                "msyh.ttc",   // Microsoft YaHei (SC)
+                "malgun.ttf", // Malgun Gothic (KR)
+                "simsun.ttc",
+                "msgothic.ttc",
+            ],
+        );
+        add_fallback("fb-emoji", &["seguiemj.ttf"]);
+    }
+
+    fonts
 }
 
 fn semibold(size: f32) -> FontId {
@@ -6569,6 +6656,31 @@ pub fn run() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// Grid-metrics invariant (Warp-tier1 font fallback): cell_w/cell_h are
+    /// read from the Monospace family's FIRST face, so any per-glyph fallback
+    /// face MUST be appended (index > 0), never inserted at 0 — otherwise it
+    /// would drive the grid and shift every column. This is robust regardless
+    /// of which system fonts exist on the runner (it asserts ordering, not
+    /// presence).
+    #[test]
+    fn font_fallbacks_never_take_the_metrics_slot() {
+        let fonts = build_fonts();
+        let mono = &fonts.families[&FontFamily::Monospace];
+        for (i, name) in mono.iter().enumerate() {
+            if name.starts_with("fb-") {
+                assert!(i > 0, "fallback '{name}' landed at index 0 (drives grid metrics)");
+            }
+        }
+        // When the primary monospace face loaded, it must own the metrics slot.
+        if fonts.font_data.contains_key("term-mono") {
+            assert_eq!(
+                mono.first().map(String::as_str),
+                Some("term-mono"),
+                "primary monospace face must stay at index 0"
+            );
+        }
+    }
 
     /// QOL §3.2/§3.5: the context-menu enabled-state table. Asleep and
     /// Sleeping take the dead-row column for input verbs (sleep inv. 5 —

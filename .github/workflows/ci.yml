@@ -60,10 +60,21 @@ jobs:
       - name: Cargo cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
+      - name: Install cargo-nextest
+        # Prebuilt binary (no compile). nextest runs each test in its own
+        # process with a per-test wall-clock timeout (.config/nextest.toml), so
+        # a wedged ConPTY/daemon test is force-killed in seconds instead of
+        # riding this job's 60-minute cap.
+        uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145 # v2.83.1
+        with:
+          tool: nextest
+
       - name: Clippy (deny warnings)
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Test (release)
+      - name: Test (release, nextest ci profile)
         # --release matches the local house rule (and the release workflow),
-        # so CI green means the shipped profile is green.
-        run: cargo test --release
+        # so CI green means the shipped profile is green. The `ci` nextest
+        # profile adds one retry for runner-timing flakiness and the per-test
+        # hang guard. The crate has no doc tests, so no `--doc` step is needed.
+        run: cargo nextest run --release --profile ci
