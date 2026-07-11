@@ -2476,15 +2476,6 @@ impl ComposerState {
     }
 }
 
-/// Predictive history ghost (Tier-2a #2, PSReadLine-prediction parity — the
-/// composer covers the shell's own inline suggestion; this restores the
-/// feel): the remainder of the MOST-RECENT command the draft is a strict,
-/// case-sensitive prefix of. Pure derivation from `recs` + the live draft —
-/// never stored, so typing past / editing / mismatch clears it naturally.
-/// Single-line only on both sides: the ghost paints inline in the lane, and
-/// a multiline suggestion could not (nor could a multiline draft anchor
-/// one). Blank commands are skipped (recall parity); an exact match yields
-/// no remainder and falls through to an older, longer command.
 /// Overlay row cap (Tier-2b #1): enough to scan at a glance, small enough
 /// to stay a strip garnish rather than a modal (seamless doctrine).
 pub(crate) const SEARCH_MAX: usize = 8;
@@ -2530,15 +2521,126 @@ pub(crate) fn search_results(recs: &[BlockRec], query: &str, cap: usize) -> Vec<
     scored.into_iter().map(|(_, h)| h).collect()
 }
 
-fn history_ghost(recs: &[BlockRec], draft: &str) -> Option<String> {
+/// Predictive history ghost (Tier-2a #2, PSReadLine-prediction parity — the
+/// composer covers the shell's own inline suggestion; this restores the
+/// feel): the remainder of the MOST-RECENT command the draft is a strict,
+/// case-sensitive prefix of. Pure derivation from `recs` + the live draft —
+/// never stored, so typing past / editing / mismatch clears it naturally.
+/// Single-line only on both sides: the ghost paints inline in the lane, and
+/// a multiline suggestion could not (nor could a multiline draft anchor
+/// one). Blank commands are skipped (recall parity); an exact match yields
+/// no remainder and falls through to an older, longer command.
+///
+/// CWD-AWARE (v0.1.10 sandbox fix): an entry whose recorded cwd
+/// (`BlockRec.cwd` — the directory the command STARTED in) differs from the
+/// terminal's current tracked cwd is skipped when its command is
+/// path-sensitive (`path_sensitive`). The field failure: in `C:\Users` the
+/// composer ghosted `cd Users\…` recorded from a session rooted at `C:\`;
+/// accepted + submitted, PowerShell errored on `C:\Users\Users`. Unknown
+/// cwd on EITHER side counts as different (conservative — never suggest a
+/// relative path we can't certify), and ineligible entries fall through to
+/// older eligible ones. Location-independent commands (`git status`,
+/// `cargo build`) stay eligible across cwds — the useful case. `cur_cwd`
+/// must be the SAME tracked-cwd string the Tab completer receives
+/// (`prompt_cwd` in show()), so the two features can never disagree about
+/// where we are.
+fn history_ghost(
+    recs: &[BlockRec],
+    draft: &str,
+    fam: &complete::Family,
+    cur_cwd: Option<&str>,
+) -> Option<String> {
     if draft.is_empty() || draft.contains('\n') {
         return None;
     }
     recs.iter().rev().find_map(|r| {
         let rest = r.cmd.strip_prefix(draft)?;
-        (!rest.is_empty() && !rest.contains('\n') && !r.cmd.trim().is_empty())
+        if rest.is_empty() || rest.contains('\n') || r.cmd.trim().is_empty() {
+            return None;
+        }
+        (!path_sensitive(fam, &r.cmd) || same_cwd(r.cwd.as_deref(), cur_cwd))
             .then(|| rest.to_string())
     })
+}
+
+/// The command's meaning depends on the directory it runs in: its head is a
+/// directory-changing verb WITH an argument (`cd x`, `pushd ..`,
+/// `Set-Location y` — pwsh verbs fold case), or any non-flag token names a
+/// RELATIVE filesystem location (`relative_path_token`). Rides the same
+/// classifier the prompt highlighting uses (`highlight::classify`, i.e. the
+/// Tab completer's tokenizer underneath), so quoting and command separators
+/// behave identically everywhere: `git log && cd sub` is caught, a bare
+/// `cd` (no argument) and flag tokens are not.
+fn path_sensitive(fam: &complete::Family, cmd: &str) -> bool {
+    use super::highlight::Class;
+    let mut cd_head = false;
+    for (r, class) in super::highlight::classify(fam, cmd) {
+        let raw = cmd[r].trim_matches(|c| c == '\'' || c == '"');
+        match class {
+            Class::Head => {
+                cd_head = ["cd", "chdir", "pushd", "set-location", "sl"]
+                    .iter()
+                    .any(|v| raw.eq_ignore_ascii_case(v));
+                // A relative-path head (`.\build.ps1`, `bin\tool`) is
+                // location-dependent all by itself.
+                if relative_path_token(fam, raw) {
+                    return true;
+                }
+            }
+            Class::Op | Class::Flag => {}
+            _ => {
+                if cd_head {
+                    return true; // cd-like verb with any argument
+                }
+                if relative_path_token(fam, raw) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The token names a filesystem location RELATIVE to the cwd: it contains a
+/// path separator but is not anchored — drive-rooted (`C:\…` / `C:/…`), UNC
+/// (`\\srv\…` / `//srv/…`), home (`~/…` / `~\…`), a URL (`scheme://…`), or
+/// posix-absolute (`/…`) on the posix-fs families (WSL/ssh). Drive-relative
+/// (`C:foo\bar`) and `.\x`, `..\x`, `a\b`, `sub/dir` all count as relative.
+fn relative_path_token(fam: &complete::Family, raw: &str) -> bool {
+    if !raw.contains('\\') && !raw.contains('/') {
+        return false;
+    }
+    let b = raw.as_bytes();
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+    {
+        return false; // drive-rooted
+    }
+    if raw.starts_with("\\\\") || raw.starts_with("//") {
+        return false; // UNC
+    }
+    if raw.starts_with("~/") || raw.starts_with("~\\") {
+        return false; // home-anchored: cwd-independent
+    }
+    if raw.contains("://") {
+        return false; // URL, not a path (git clone https://…)
+    }
+    if raw.starts_with('/')
+        && matches!(fam, complete::Family::Wsl { .. } | complete::Family::Ssh)
+    {
+        return false; // posix-absolute on a posix fs
+    }
+    true
+}
+
+/// Both sides known and naming the same directory (trailing separators
+/// trimmed, ASCII case folded — Windows paths dominate and hook feeds vary
+/// drive-letter case). Either side unknown ⇒ NOT the same (conservative).
+fn same_cwd(rec: Option<&std::path::Path>, cur: Option<&str>) -> bool {
+    let (Some(rec), Some(cur)) = (rec, cur) else {
+        return false;
+    };
+    let norm = |s: &str| s.trim_end_matches(['\\', '/']).to_ascii_lowercase();
+    norm(&rec.to_string_lossy()) == norm(cur)
 }
 
 /// The grid row the CURRENT-PROMPT cover should BLANK this frame, if any
@@ -3495,7 +3597,9 @@ pub fn show(
                 // end-of-text is otherwise a TextEdit no-op. End is left
                 // alone (it has row-end semantics under soft wrap).
                 if !state.tab_active() && state.recall.is_none() {
-                    if let Some(rest) = history_ghost(recs, &state.draft) {
+                    if let Some(rest) =
+                        history_ghost(recs, &state.draft, &state.fam, prompt_cwd)
+                    {
                         if caret_byte_of(ui.ctx(), ed_id, &state.draft) == state.draft.len()
                             && ui.input_mut(|i| {
                                 i.consume_key(Modifiers::NONE, Key::ArrowRight)
@@ -3738,7 +3842,9 @@ pub fn show(
                     && state.recall.is_none()
                     && !searching
                 {
-                    if let Some(rest) = history_ghost(recs, &state.draft) {
+                    if let Some(rest) =
+                        history_ghost(recs, &state.draft, &state.fam, prompt_cwd)
+                    {
                         let end = te.galley.pos_from_cursor(te.galley.end());
                         let pos = Pos2::new(
                             te.galley_pos.x + end.max.x,
@@ -6677,34 +6783,38 @@ mod tests {
     /// never suggests.
     #[test]
     fn history_ghost_selection() {
+        // Location-independent commands: cwd plays no part (both None here).
+        let g = |recs: &[BlockRec], d: &str| {
+            history_ghost(recs, d, &complete::Family::Pwsh, None)
+        };
         let recs: Vec<BlockRec> = ["git status", "cargo build", "", "git stash pop", "ls"]
             .iter()
             .map(|c| rec(c))
             .collect();
         // Most-recent prefix match wins: "git " hits "git stash pop", not
         // the older "git status".
-        assert_eq!(history_ghost(&recs, "git "), Some("stash pop".into()));
-        assert_eq!(history_ghost(&recs, "git sta"), Some("sh pop".into()));
+        assert_eq!(g(&recs, "git "), Some("stash pop".into()));
+        assert_eq!(g(&recs, "git sta"), Some("sh pop".into()));
         // The newer match gone from the prefix set, the older one serves.
-        assert_eq!(history_ghost(&recs, "git stat"), Some("us".into()));
-        assert_eq!(history_ghost(&recs, "car"), Some("go build".into()));
+        assert_eq!(g(&recs, "git stat"), Some("us".into()));
+        assert_eq!(g(&recs, "car"), Some("go build".into()));
         // Case-sensitive: "GIT" matches nothing.
-        assert_eq!(history_ghost(&recs, "GIT"), None);
+        assert_eq!(g(&recs, "GIT"), None);
         // Empty draft = no ghost; no-match = no ghost.
-        assert_eq!(history_ghost(&recs, ""), None);
-        assert_eq!(history_ghost(&recs, "docker"), None);
+        assert_eq!(g(&recs, ""), None);
+        assert_eq!(g(&recs, "docker"), None);
         // Exact match yields no remainder and falls through to an OLDER,
         // longer command with the same prefix.
         let recs2: Vec<BlockRec> = ["ls -la", "ls"].iter().map(|c| rec(c)).collect();
-        assert_eq!(history_ghost(&recs2, "ls"), Some(" -la".into()));
+        assert_eq!(g(&recs2, "ls"), Some(" -la".into()));
         // Multiline drafts and multiline history commands never ghost
         // (the ghost paints inline in the single-line lane).
-        assert_eq!(history_ghost(&recs, "git\nls"), None);
+        assert_eq!(g(&recs, "git\nls"), None);
         let recs3: Vec<BlockRec> = ["echo a\necho b"].iter().map(|c| rec(c)).collect();
-        assert_eq!(history_ghost(&recs3, "echo"), None);
+        assert_eq!(g(&recs3, "echo"), None);
         // Blank commands are skipped even for a whitespace draft.
         let recs4: Vec<BlockRec> = ["   "].iter().map(|c| rec(c)).collect();
-        assert_eq!(history_ghost(&recs4, " "), None);
+        assert_eq!(g(&recs4, " "), None);
     }
 
     /// Tier-2a #2 history ghost — accept appends the remainder, puts the
@@ -6717,20 +6827,209 @@ mod tests {
             draft: "git st".into(),
             ..Default::default()
         };
-        let rest = history_ghost(&recs, &st.draft).expect("ghost offered");
+        let fam = complete::Family::Pwsh;
+        let rest =
+            history_ghost(&recs, &st.draft, &fam, None).expect("ghost offered");
         assert_eq!(rest, "atus");
         let caret = st.ghost_accept(&rest);
         assert_eq!(st.draft, "git status");
         assert_eq!(caret, "git status".chars().count());
         // Derived state: with the full command in the draft, the ghost is
         // simply gone — nothing to clear, nothing stored.
-        assert_eq!(history_ghost(&recs, &st.draft), None);
+        assert_eq!(history_ghost(&recs, &st.draft, &fam, None), None);
         // And typing PAST the suggestion (mismatch) clears it the same way.
         st.draft.push('x');
-        assert_eq!(history_ghost(&recs, &st.draft), None);
+        assert_eq!(history_ghost(&recs, &st.draft, &fam, None), None);
         // The accepted text is draft-only: submission machinery sees it as
         // any typed draft (nothing queued, no bytes emitted by accept).
         assert!(st.pending.is_empty());
+    }
+
+    fn rec_at(cmd: &str, cwd: Option<&str>) -> BlockRec {
+        BlockRec {
+            cwd: cwd.map(std::path::PathBuf::from),
+            ..rec(cmd)
+        }
+    }
+
+    /// Ghost cwd fix (sandbox field failure: `cd Users\` ghosted in
+    /// C:\Users from a C:\ session → `C:\Users\Users` error): the
+    /// eligibility matrix. Path-sensitive commands ghost only from the SAME
+    /// cwd; location-independent commands ghost across cwds; unknown cwd on
+    /// either side is conservative (no ghost when path-sensitive).
+    #[test]
+    fn history_ghost_cwd_eligibility_matrix() {
+        let fam = complete::Family::Pwsh;
+        let g = |recs: &[BlockRec], d: &str, cwd: Option<&str>| {
+            history_ghost(recs, d, &fam, cwd)
+        };
+        // Same-cwd cd → ghost OK (trailing separator + case differences in
+        // the tracked string must not break the match).
+        let cd = vec![rec_at("cd Users\\proj", Some("C:\\"))];
+        assert_eq!(g(&cd, "cd U", Some("C:\\")), Some("sers\\proj".into()));
+        assert_eq!(g(&cd, "cd U", Some("c:")), Some("sers\\proj".into()));
+        // Different-cwd cd → INELIGIBLE (the exact field failure).
+        assert_eq!(g(&cd, "cd U", Some("C:\\Users")), None);
+        // Unknown on either side + path-sensitive → conservative, no ghost.
+        assert_eq!(g(&cd, "cd U", None), None);
+        let cd_unknown = vec![rec_at("cd Users\\proj", None)];
+        assert_eq!(g(&cd_unknown, "cd U", Some("C:\\")), None);
+        // Different-cwd git status → still ghosts (the useful case).
+        let git = vec![rec_at("git status", Some("C:\\repo"))];
+        assert_eq!(g(&git, "git s", Some("D:\\other")), Some("tatus".into()));
+        assert_eq!(g(&git, "git s", None), Some("tatus".into()));
+        // Different-cwd RELATIVE path argument → ineligible.
+        let rel = vec![rec_at("type foo\\bar.txt", Some("C:\\a"))];
+        assert_eq!(g(&rel, "type f", Some("C:\\b")), None);
+        assert_eq!(g(&rel, "type f", Some("C:\\a")), Some("oo\\bar.txt".into()));
+        // ABSOLUTE path argument → cwd-independent, ghosts anywhere.
+        let abs = vec![rec_at("type C:\\foo\\bar.txt", Some("C:\\a"))];
+        assert_eq!(
+            g(&abs, "type C", Some("D:\\b")),
+            Some(":\\foo\\bar.txt".into())
+        );
+        // Ineligible newest falls through to an older ELIGIBLE match.
+        let recs = vec![
+            rec_at("git checkout main", Some("C:\\repo")),
+            rec_at("git checkout feature\\x", Some("C:\\elsewhere")),
+        ];
+        assert_eq!(
+            g(&recs, "git c", Some("C:\\repo")),
+            Some("heckout main".into()),
+            "ineligible entry must fall through, not kill the ghost"
+        );
+        // Posix families: absolute stays eligible cross-cwd, relative not.
+        let wsl = complete::Family::Wsl { distro: None };
+        let recs = vec![rec_at("cat /etc/hosts", Some("/home/u"))];
+        assert_eq!(
+            history_ghost(&recs, "cat /e", &wsl, Some("/tmp")),
+            Some("tc/hosts".into())
+        );
+        let recs = vec![rec_at("cat sub/file", Some("/home/u"))];
+        assert_eq!(history_ghost(&recs, "cat s", &wsl, Some("/tmp")), None);
+    }
+
+    /// The path-sensitivity classifier itself: cd-family verbs (with an
+    /// argument, across separators, case-folded), relative vs anchored
+    /// tokens, flags and URLs exempt.
+    #[test]
+    fn path_sensitive_classifier() {
+        let fam = complete::Family::Pwsh;
+        let ps = |s: &str| path_sensitive(&fam, s);
+        // cd-family heads with any argument; bare cd is not.
+        assert!(ps("cd sub"));
+        assert!(ps("Set-Location 'my dir'"));
+        assert!(ps("pushd .."));
+        assert!(ps("sl x"));
+        assert!(ps("chdir C:\\abs")); // cd is stateful even to an absolute
+        assert!(!ps("cd"));
+        // A cd behind a separator is still caught (classify's head rule).
+        assert!(ps("git pull && cd sub"));
+        assert!(!ps("git pull && cd"));
+        // Relative path tokens anywhere → sensitive.
+        assert!(ps("type foo\\bar.txt"));
+        assert!(ps("cat sub/dir/file"));
+        assert!(ps(".\\build.ps1 -Fast")); // relative HEAD
+        assert!(ps("type C:foo\\bar")); // drive-RELATIVE
+        // Anchored forms → not sensitive.
+        assert!(!ps("type C:\\foo\\bar.txt"));
+        assert!(!ps("type c:/foo/bar"));
+        assert!(!ps("dir \\\\srv\\share\\x"));
+        assert!(!ps("cat ~/notes.txt"));
+        assert!(!ps("git clone https://github.com/a/b"));
+        // Flags with separators are exempt (the non-flag rule).
+        assert!(!ps("git log --pretty=format:a/b"));
+        // Location-independent commands.
+        assert!(!ps("git status"));
+        assert!(!ps("cargo build --release"));
+        // Posix family: `/…` is absolute there, but not on pwsh (a pwsh
+        // `/foo` is drive-root-relative — stays conservative).
+        let wsl = complete::Family::Wsl { distro: None };
+        assert!(!path_sensitive(&wsl, "cat /etc/hosts"));
+        assert!(ps("cat /etc/hosts"));
+        assert!(path_sensitive(&wsl, "cat etc/hosts"));
+    }
+
+    /// The interplay the user suspected in the sandbox: with a ghost
+    /// visible and Tab yielding ZERO completion candidates, the ghost must
+    /// neither be accepted nor become the draft (Tab is inert; ArrowRight
+    /// remains the only accept gesture). Driven through show() against a
+    /// real empty directory so complete.rs genuinely enumerates nothing.
+    #[test]
+    fn show_tab_without_candidates_never_accepts_ghost() {
+        let dir = tab_scratch(&[]); // an EMPTY dir: no "U*" entries exist
+        let cwd = dir.to_str().unwrap().to_owned();
+        let b = backend_at_clean_prompt();
+        let mut st = ComposerState::default();
+        let now = Instant::now();
+        let f = b.block_feed.as_ref().unwrap();
+        st.on_stream_events(f.pre_seen, f.exec_seen, now);
+        // Same-cwd history entry, so the ghost IS eligible and visible.
+        let recs = vec![rec_at("cd Users\\proj", Some(&cwd))];
+        st.tick(&b, &recs, true, true, now);
+        assert_eq!(st.mode, ComposerMode::Compose);
+
+        let ctx = egui::Context::default();
+        let strip = Rect::from_min_max(Pos2::new(0.0, 564.0), Pos2::new(800.0, 600.0));
+        let grid = Rect::from_min_max(Pos2::ZERO, Pos2::new(800.0, 564.0));
+        let frame = |st: &mut ComposerState, events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_max(
+                    Pos2::ZERO,
+                    Pos2::new(800.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let mut out = None;
+            let _ = ctx.run_ui(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    out = Some(show(
+                        ui,
+                        strip,
+                        grid,
+                        Uuid::nil(),
+                        st,
+                        &b,
+                        &recs,
+                        1,
+                        true,
+                        false,
+                        false,
+                        FontId::monospace(13.0),
+                        None,
+                        Some(&cwd), // the SAME cwd Tab and the ghost share
+                    ));
+                });
+            });
+            let o = out.unwrap();
+            st.has_focus = o.has_focus;
+            o
+        };
+        let key = |k: Key| egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        frame(&mut st, vec![]);
+        frame(&mut st, vec![egui::Event::Text("cd U".into())]);
+        assert_eq!(st.draft, "cd U");
+        // The ghost is genuinely on offer this frame.
+        assert_eq!(
+            history_ghost(&recs, &st.draft, &st.fam, Some(&cwd)).as_deref(),
+            Some("sers\\proj")
+        );
+        // Tab with zero candidates: draft untouched — no literal tab, no
+        // completion, and ABOVE ALL no ghost acceptance.
+        frame(&mut st, vec![key(Key::Tab)]);
+        assert_eq!(st.draft, "cd U", "Tab must not accept the ghost");
+        assert!(!st.tab_active(), "no cycle exists without candidates");
+        // ArrowRight (caret at end) remains the accept gesture.
+        frame(&mut st, vec![key(Key::ArrowRight)]);
+        assert_eq!(st.draft, "cd Users\\proj", "ArrowRight accepts");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── Ctrl-R history search (Tier-2b #1) ───────────────────────────────
