@@ -731,6 +731,10 @@ fn case_remnant() -> anyhow::Result<()> {
 ///     shell's first prompt — the GUI's boot timing — already carries no
 ///     dead dangling prompt (build-time preface truncation on 133;B byte
 ///     proof), and the settled replay holds exactly ONE bare prompt (live);
+///   - the seam GEOMETRY is live-tight (the "~3-row gap" follow-up): after
+///     every cycle the live prompt sits ≤1 blank row under the old output
+///     (the truncation removes the dead prompt's seam-residue blanks), and
+///     repeated restores never eat an extra row;
 ///   - first spawn is honest: banner bytes precede the first prompt;
 ///   - probe terminals elsewhere pass -NoLogo and stay bannerless (honored).
 fn case_banner() -> anyhow::Result<()> {
@@ -846,8 +850,50 @@ fn case_banner() -> anyhow::Result<()> {
         }
         // Let the restored shell print its first prompt — NO banner: the
         // respawn bootstrap is generated bannerless (the next cycle's
-        // journal must contain a full lifetime).
-        std::thread::sleep(Duration::from_millis(2000));
+        // journal must contain a full lifetime). >3s: a shorter-lived
+        // lifetime counts as a FAST EXIT (note_fast_exit) and two in a row
+        // push the honest "exited immediately N×" info line into the next
+        // preface — real restores live minutes, so the probe must not
+        // trigger the crash-loop warning the geometry pin would then trip
+        // on (it sits, correctly, above the live prompt).
+        std::thread::sleep(Duration::from_millis(3200));
+        // Seam GEOMETRY pin (the "~3-row gap above Pulse's prompt row"
+        // follow-up): once settled, the live prompt is the LAST content row,
+        // sitting directly under the old output — at most one blank row, the
+        // spacing an unbroken live session shows (pwsh renders its prompt
+        // flush under output). Checked after EVERY cycle: the truncation
+        // takes the dead prompt's seam-residue blanks with it and must not
+        // eat one more row per restore (BANNER_OLD_1 stays the row above).
+        let mut cg = Conn::open()?;
+        let _ = cg.first_snapshot()?;
+        let gtext = strip_ansi(&String::from_utf8_lossy(&cg.replay(id)?));
+        let glines: Vec<&str> = gtext.lines().collect();
+        let last = glines
+            .iter()
+            .rposition(|l| !l.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("cycle {cycle}: empty settled replay"))?;
+        anyhow::ensure!(
+            glines[last].trim() == "PS C:\\>",
+            "cycle {cycle}: last content row must be the live prompt, got {:?}",
+            glines[last]
+        );
+        let prev = glines[..last]
+            .iter()
+            .rposition(|l| !l.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("cycle {cycle}: nothing above the live prompt"))?;
+        let gap = last - prev - 1;
+        anyhow::ensure!(
+            gap <= 1,
+            "cycle {cycle}: {gap} blank rows between the last output and the live \
+             prompt (live-session spacing allows at most 1): {:?}",
+            &glines[prev..=last]
+        );
+        anyhow::ensure!(
+            glines[prev].trim_start().starts_with("BANNER_OLD_1"),
+            "cycle {cycle}: the row above the live prompt must be the old output \
+             (trimming must not eat content across cycles), got {:?}",
+            glines[prev]
+        );
     }
 
     let mut c2 = Conn::open()?;

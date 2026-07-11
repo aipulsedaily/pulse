@@ -96,6 +96,15 @@ pub struct Preface {
     /// removes the dead session's dangling prompt when it matches the live
     /// session's first line.
     pub last_line_start: usize,
+    /// Byte offset where the final content BLOCK starts: the (cap-surviving)
+    /// blank run directly above the final content line, else
+    /// `last_line_start`. `truncate_trailing_prompt` cuts HERE so the
+    /// dropped dead prompt takes its seam-residue spacer rows with it (the
+    /// "~3-row gap above Pulse's prompt row" field follow-up): the preface
+    /// then ends at the last real output line and the live shell's OWN
+    /// rendering determines every row below the seam — the same spacing an
+    /// unbroken session would show, measured, not guessed.
+    pub last_block_start: usize,
     /// Plain trimmed text of that final line.
     pub last_line_plain: String,
     /// The final session's opening block (its banner/MOTD: lines printed
@@ -123,6 +132,7 @@ impl Preface {
     /// Append a daemon-authored informational line (visible, plain gray).
     pub fn push_info_line(&mut self, text: &str) {
         self.last_line_start = self.bytes.len();
+        self.last_block_start = self.bytes.len();
         self.last_line_plain = text.trim().to_string();
         self.bytes
             .extend_from_slice(format!("\x1b[0m\x1b[90m{text}\x1b[0m\r\n").as_bytes());
@@ -150,17 +160,31 @@ impl Preface {
     /// keeps an empty-string custom prompt from truncating a real output
     /// line. `last_line_plain` is cleared so the attach-time matcher stands
     /// down — nothing dangling remains for it to (mis)match.
+    ///
+    /// The cut lands at `last_block_start`, not `last_line_start`: the blank
+    /// run directly above the dead prompt is seam residue (the ≤MAX_BLANK_RUN
+    /// rows the seam erasure leaves where a prior lifetime's deduped prompt
+    /// sat), and keeping it opened a ~3-row void between the last real
+    /// output and the live prompt row (field follow-up screenshot). Dropping
+    /// the run with the prompt leaves the preface ending at real content;
+    /// every row below the seam is then the live shell's own honest
+    /// rendering (pwsh puts its prompt directly under output; cmd prints its
+    /// own separator blank) — live-session spacing by construction, not by a
+    /// hardcoded gap. Blank rows carry no information, and the cut only
+    /// happens under the bare-prompt byte proof.
     pub fn truncate_trailing_prompt(&mut self) {
         if self.last_line_plain.is_empty()
             || !self.last_line_plain.ends_with(['>', '$', '#', '%', ':'])
         {
             return;
         }
-        self.bytes.truncate(self.last_line_start);
+        let cut = self.last_block_start.min(self.last_line_start);
+        self.bytes.truncate(cut);
         // The opening block never overlaps the final content line (see
         // `content_preface`), but keep the invariant explicit.
-        self.opening.retain(|l| l.end <= self.last_line_start);
+        self.opening.retain(|l| l.end <= cut);
         self.last_line_start = self.bytes.len();
+        self.last_block_start = self.bytes.len();
         self.last_line_plain = String::new();
     }
 }
@@ -253,6 +277,11 @@ pub fn content_preface(term: &Term<EventProxy>) -> Preface {
     let mut last_line_plain = String::new();
     let mut blank_run = 0usize;
     let mut line_start = 0usize;
+    // Start of the emitted blank run currently open (respawn-seam fix: when
+    // the final content line turns out to be a dead bare prompt, the run
+    // directly above it — seam residue — must leave with it).
+    let mut run_start: Option<usize> = None;
+    let mut last_block_start = 0usize;
     for (i, rec) in recs.iter().enumerate() {
         if rec.drop {
             continue;
@@ -262,6 +291,7 @@ pub fn content_preface(term: &Term<EventProxy>) -> Preface {
             if blank_run > MAX_BLANK_RUN {
                 continue;
             }
+            run_start.get_or_insert(bytes.len());
         } else {
             blank_run = 0;
         }
@@ -272,6 +302,11 @@ pub fn content_preface(term: &Term<EventProxy>) -> Preface {
             if !rec.blank {
                 last_line_start = line_start;
                 last_line_plain = rec.plain.clone();
+                // The block start reaches back over the immediately
+                // preceding blank run (a wrapped logical line's earlier
+                // segments are between run and terminator; the run start
+                // still bounds the whole block from above).
+                last_block_start = run_start.take().unwrap_or(line_start);
             }
         }
         if last_opening.binary_search(&i).is_ok() {
@@ -291,6 +326,7 @@ pub fn content_preface(term: &Term<EventProxy>) -> Preface {
     Preface {
         bytes,
         last_line_start,
+        last_block_start,
         last_line_plain,
         opening,
     }
@@ -2563,6 +2599,61 @@ mod tests {
         let before = pre2.bytes.clone();
         pre2.truncate_trailing_prompt();
         assert_eq!(pre2.bytes, before, "non-sigil last line kept");
+    }
+
+    /// Respawn-seam fix, gap half (the "~3-row void above Pulse's prompt
+    /// row" field follow-up): the truncation takes the blank run directly
+    /// above the dead prompt with it — those rows are seam residue (the
+    /// ≤MAX_BLANK_RUN pad blanks the seam erasure leaves), and keeping them
+    /// broke live-session geometry. Space-only rows count as blank (the
+    /// scratch grid's `line_length` sees them empty — pinned here), earlier
+    /// real content and its own internal blanks survive, and a second call
+    /// is a no-op (the matcher was neutralized), so repeated restores can
+    /// never eat one more row per cycle.
+    #[test]
+    fn preface_truncation_takes_seam_blanks() {
+        // Output, TWO blank rows (one written as literal spaces — the width
+        // edge), then the bare dead prompt with hook marks, then the kill
+        // resets — the exact post-dedupe shape a twice-restored journal
+        // renders at the seam.
+        let raw = b"first block\r\n\r\nREAL_TAIL\r\n\r\n      \r\n\x1b]133;A\x07PS C:\\> \x1b]133;B\x07\x1b[?9001l\x1b[?1004l\r\n";
+        assert!(tail_ends_at_bare_prompt(raw));
+        let (mut pre, _) = preface_with_alt_fix(raw, 80, 24);
+        assert_eq!(pre.last_line_plain, "PS C:\\>");
+        assert!(
+            pre.last_block_start < pre.last_line_start,
+            "the blank run above the prompt is part of the trailing block"
+        );
+        pre.truncate_trailing_prompt();
+        // The preface now ends AT the real output line: no prompt, no
+        // trailing blank rows (raw line split, unfiltered — blanks visible).
+        let mut strip = crate::strip::AnsiStripper::default();
+        let mut plain = Vec::new();
+        strip.feed_bytes(&pre.bytes, &mut plain);
+        let text = String::from_utf8_lossy(&plain);
+        let rows: Vec<&str> = text.split("\r\n").collect();
+        // Final element is "" (the terminating CRLF); the one before must be
+        // the real output, not a blank.
+        assert_eq!(rows.last(), Some(&""), "preface ends with a CRLF");
+        assert_eq!(
+            rows.get(rows.len().wrapping_sub(2)).map(|s| s.trim_end()),
+            Some("REAL_TAIL"),
+            "preface ends at the last real output line, no residual gap: {rows:?}"
+        );
+        // The internal blank between the two real blocks is untouched.
+        assert!(
+            rows.iter().any(|r| r.trim_end() == "first block"),
+            "earlier content survives"
+        );
+        assert_eq!(
+            rows.iter().filter(|r| r.trim().is_empty() && !r.is_empty()).count(),
+            0,
+            "no space-only rows survive at all here"
+        );
+        // Idempotent: a second call changes nothing (matcher neutralized).
+        let after_once = pre.bytes.clone();
+        pre.truncate_trailing_prompt();
+        assert_eq!(pre.bytes, after_once, "second truncation is a no-op");
     }
 
     /// The report scanner: offsets/values parsed exactly; garbage shapes
