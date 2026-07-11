@@ -2334,6 +2334,40 @@ impl ComposerState {
         self.draft = draft;
         Some(caret)
     }
+
+    // ── History ghost text (Tier-2a #2) ──────────────────────────────────
+
+    /// Accept the history ghost: append the suggested remainder to the
+    /// draft. Returns the caret position (in CHARS) at the new end. The
+    /// ghost itself is derived state (`history_ghost`), so acceptance is
+    /// just a draft edit — the suggestion recomputes (and usually vanishes,
+    /// the full command now matching exactly) next frame. A live Tab cycle
+    /// invalidates lazily like any other edit; recall cannot be active here
+    /// (the caller suppresses the ghost while it is).
+    pub(crate) fn ghost_accept(&mut self, rest: &str) -> usize {
+        self.draft.push_str(rest);
+        self.draft.chars().count()
+    }
+}
+
+/// Predictive history ghost (Tier-2a #2, PSReadLine-prediction parity — the
+/// composer covers the shell's own inline suggestion; this restores the
+/// feel): the remainder of the MOST-RECENT command the draft is a strict,
+/// case-sensitive prefix of. Pure derivation from `recs` + the live draft —
+/// never stored, so typing past / editing / mismatch clears it naturally.
+/// Single-line only on both sides: the ghost paints inline in the lane, and
+/// a multiline suggestion could not (nor could a multiline draft anchor
+/// one). Blank commands are skipped (recall parity); an exact match yields
+/// no remainder and falls through to an older, longer command.
+fn history_ghost(recs: &[BlockRec], draft: &str) -> Option<String> {
+    if draft.is_empty() || draft.contains('\n') {
+        return None;
+    }
+    recs.iter().rev().find_map(|r| {
+        let rest = r.cmd.strip_prefix(draft)?;
+        (!rest.is_empty() && !rest.contains('\n') && !r.cmd.trim().is_empty())
+            .then(|| rest.to_string())
+    })
 }
 
 /// The grid row the CURRENT-PROMPT cover should BLANK this frame, if any
@@ -3170,6 +3204,27 @@ pub fn show(
                 {
                     state.recall_next(recs);
                 }
+                // History ghost accept (Tier-2a #2): Right-arrow with the
+                // caret at the very END of the draft appends the ghosted
+                // remainder (PSReadLine parity). Consumed BEFORE the
+                // TextEdit shows, and ONLY when the ghost is actually
+                // painted this frame — same suppression as the paint (Tab
+                // cycle / recall stash active) — so a mid-draft Right stays
+                // native caret movement and no binding is stolen: Right at
+                // end-of-text is otherwise a TextEdit no-op. End is left
+                // alone (it has row-end semantics under soft wrap).
+                if !state.tab_active() && state.recall.is_none() {
+                    if let Some(rest) = history_ghost(recs, &state.draft) {
+                        if caret_byte_of(ui.ctx(), ed_id, &state.draft) == state.draft.len()
+                            && ui.input_mut(|i| {
+                                i.consume_key(Modifiers::NONE, Key::ArrowRight)
+                            })
+                        {
+                            let caret = state.ghost_accept(&rest);
+                            set_caret_chars(ui.ctx(), ed_id, caret);
+                        }
+                    }
+                }
             }
 
             // ── Tab completion (task #24): consumed BEFORE the TextEdit
@@ -3270,6 +3325,23 @@ pub fn show(
                 .filter(|_| state.draft.is_empty())
                 .map(|h| h.ghost.lines().next().unwrap_or("").to_string());
             let n_lines = editor_rows(&state.draft);
+            // Prompt syntax highlighting (Tier-2a #1): both TextEdits render
+            // through this layouter — a token-level colorizer over the SAME
+            // lexer Tab completion uses (highlight.rs). Presentation only:
+            // the job matches egui's default layouter in every geometry knob
+            // (font, wrap width, halign, keep_trailing_whitespace), so rows/
+            // wraps/caret rects are identical to an uncolored draft. The
+            // closure tokenizes the text it is HANDED (never a cached draft:
+            // mid-frame edits re-layout before `state.draft` settles); one
+            // O(len) pass per call, galley cache absorbs repeat jobs.
+            let hl_fam = state.fam.clone();
+            let hl_font = font.clone();
+            let mut hl_layouter =
+                move |lui: &Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
+                    let job =
+                        super::highlight::layout_job(&hl_fam, buf.as_str(), &hl_font, wrap_width);
+                    lui.fonts_mut(|f| f.layout_job(job))
+                };
             let resp = if n_lines > 1 {
                 let h = (n_lines.min(EDITOR_MAX_ROWS) as f32) * row_h + 12.0;
                 let h = h.min(grid_rect.height().max(row_h + 12.0));
@@ -3301,6 +3373,7 @@ pub fn show(
                                             egui::TextEdit::multiline(&mut state.draft)
                                                 .id(ed_id)
                                                 .font(font.clone())
+                                                .layouter(&mut hl_layouter)
                                                 .desired_rows(2)
                                                 .desired_width(f32::INFINITY)
                                                 .lock_focus(true)
@@ -3322,20 +3395,22 @@ pub fn show(
                         .max_rect(ed_rect)
                         .layout(egui::Layout::top_down(egui::Align::Min)),
                 );
-                let resp = ed_ui.add(
-                    egui::TextEdit::multiline(&mut state.draft)
-                        .id(ed_id)
-                        .font(font.clone())
-                        .hint_text(if lane_ghost.is_some() {
-                            ""
-                        } else {
-                            "Type a command\u{2026}"
-                        })
-                        .desired_rows(1)
-                        .desired_width(ed_rect.width())
-                        .lock_focus(true)
-                        .frame(egui::Frame::NONE),
-                );
+                // `.show` (not `.add`): the rich output's galley anchors the
+                // history ghost right after the draft's last glyph.
+                let te = egui::TextEdit::multiline(&mut state.draft)
+                    .id(ed_id)
+                    .font(font.clone())
+                    .layouter(&mut hl_layouter)
+                    .hint_text(if lane_ghost.is_some() {
+                        ""
+                    } else {
+                        "Type a command\u{2026}"
+                    })
+                    .desired_rows(1)
+                    .desired_width(ed_rect.width())
+                    .lock_focus(true)
+                    .frame(egui::Frame::NONE)
+                    .show(&mut ed_ui);
                 if let Some(g) = &lane_ghost {
                     if !g.is_empty() {
                         let galley =
@@ -3347,7 +3422,30 @@ pub fn show(
                         );
                     }
                 }
-                resp
+                // History ghost paint (Tier-2a #2): the dim remainder of the
+                // most-recent prefix-matching command, drawn after the draft
+                // text. Derived per frame (never stored) — typing past it,
+                // editing, or a mismatch clears it naturally. Suppressed
+                // while a Tab cycle or recall stash owns the draft (no
+                // fighting existing UX) and clipped at the hint slot so it
+                // never runs under the right-side chrome.
+                if state.has_focus && !state.tab_active() && state.recall.is_none() {
+                    if let Some(rest) = history_ghost(recs, &state.draft) {
+                        let end = te.galley.pos_from_cursor(te.galley.end());
+                        let pos = Pos2::new(
+                            te.galley_pos.x + end.max.x,
+                            te.galley_pos.y + end.min.y,
+                        );
+                        let g =
+                            painter.layout_no_wrap(rest, font.clone(), super::TEXT_FAINT);
+                        let clip = painter.clip_rect().intersect(Rect::from_min_max(
+                            pos,
+                            Pos2::new(slot_right, strip_rect.max.y),
+                        ));
+                        painter.with_clip_rect(clip).galley(pos, g, super::TEXT_FAINT);
+                    }
+                }
+                te.response.response
             };
 
             // A user edit forks off any active recall (§6.2).
@@ -6140,6 +6238,67 @@ mod tests {
         st.draft = "x".into();
         let _ = st.submit(&backend, None, None);
         assert!(st.recall.is_none());
+    }
+
+    /// Tier-2a #2 history ghost — selection: strict case-sensitive prefix,
+    /// most-recent wins, blanks/multiline/exact-match skipped, empty draft
+    /// never suggests.
+    #[test]
+    fn history_ghost_selection() {
+        let recs: Vec<BlockRec> = ["git status", "cargo build", "", "git stash pop", "ls"]
+            .iter()
+            .map(|c| rec(c))
+            .collect();
+        // Most-recent prefix match wins: "git " hits "git stash pop", not
+        // the older "git status".
+        assert_eq!(history_ghost(&recs, "git "), Some("stash pop".into()));
+        assert_eq!(history_ghost(&recs, "git sta"), Some("sh pop".into()));
+        // The newer match gone from the prefix set, the older one serves.
+        assert_eq!(history_ghost(&recs, "git stat"), Some("us".into()));
+        assert_eq!(history_ghost(&recs, "car"), Some("go build".into()));
+        // Case-sensitive: "GIT" matches nothing.
+        assert_eq!(history_ghost(&recs, "GIT"), None);
+        // Empty draft = no ghost; no-match = no ghost.
+        assert_eq!(history_ghost(&recs, ""), None);
+        assert_eq!(history_ghost(&recs, "docker"), None);
+        // Exact match yields no remainder and falls through to an OLDER,
+        // longer command with the same prefix.
+        let recs2: Vec<BlockRec> = ["ls -la", "ls"].iter().map(|c| rec(c)).collect();
+        assert_eq!(history_ghost(&recs2, "ls"), Some(" -la".into()));
+        // Multiline drafts and multiline history commands never ghost
+        // (the ghost paints inline in the single-line lane).
+        assert_eq!(history_ghost(&recs, "git\nls"), None);
+        let recs3: Vec<BlockRec> = ["echo a\necho b"].iter().map(|c| rec(c)).collect();
+        assert_eq!(history_ghost(&recs3, "echo"), None);
+        // Blank commands are skipped even for a whitespace draft.
+        let recs4: Vec<BlockRec> = ["   "].iter().map(|c| rec(c)).collect();
+        assert_eq!(history_ghost(&recs4, " "), None);
+    }
+
+    /// Tier-2a #2 history ghost — accept appends the remainder, puts the
+    /// caret at the end, and the suggestion clears naturally (the completed
+    /// draft now matches exactly ⇒ no remainder).
+    #[test]
+    fn history_ghost_accept_appends_and_clears() {
+        let recs: Vec<BlockRec> = ["git status"].iter().map(|c| rec(c)).collect();
+        let mut st = ComposerState {
+            draft: "git st".into(),
+            ..Default::default()
+        };
+        let rest = history_ghost(&recs, &st.draft).expect("ghost offered");
+        assert_eq!(rest, "atus");
+        let caret = st.ghost_accept(&rest);
+        assert_eq!(st.draft, "git status");
+        assert_eq!(caret, "git status".chars().count());
+        // Derived state: with the full command in the draft, the ghost is
+        // simply gone — nothing to clear, nothing stored.
+        assert_eq!(history_ghost(&recs, &st.draft), None);
+        // And typing PAST the suggestion (mismatch) clears it the same way.
+        st.draft.push('x');
+        assert_eq!(history_ghost(&recs, &st.draft), None);
+        // The accepted text is draft-only: submission machinery sees it as
+        // any typed draft (nothing queued, no bytes emitted by accept).
+        assert!(st.pending.is_empty());
     }
 
     /// §11 submission bytes: bracketed iff the shell requested DECSET 2004 ×

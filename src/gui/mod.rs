@@ -9,6 +9,7 @@ pub mod composer;
 /// `bash_single_quote` and replaces the one Ssh arm in `route_file_drop`.
 pub mod drop;
 mod glyph_cache;
+mod highlight;
 /// Public within the crate: the history_cross_session probe feeds captured
 /// Blocks lists through the same build_index/filter the popup uses.
 pub mod history;
