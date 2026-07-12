@@ -96,6 +96,15 @@ pub struct Preface {
     /// removes the dead session's dangling prompt when it matches the live
     /// session's first line.
     pub last_line_start: usize,
+    /// Byte offset where the final content BLOCK starts: the (cap-surviving)
+    /// blank run directly above the final content line, else
+    /// `last_line_start`. `truncate_trailing_prompt` cuts HERE so the
+    /// dropped dead prompt takes its seam-residue spacer rows with it (the
+    /// "~3-row gap above Pulse's prompt row" field follow-up): the preface
+    /// then ends at the last real output line and the live shell's OWN
+    /// rendering determines every row below the seam — the same spacing an
+    /// unbroken session would show, measured, not guessed.
+    pub last_block_start: usize,
     /// Plain trimmed text of that final line.
     pub last_line_plain: String,
     /// The final session's opening block (its banner/MOTD: lines printed
@@ -123,10 +132,129 @@ impl Preface {
     /// Append a daemon-authored informational line (visible, plain gray).
     pub fn push_info_line(&mut self, text: &str) {
         self.last_line_start = self.bytes.len();
+        self.last_block_start = self.bytes.len();
         self.last_line_plain = text.trim().to_string();
         self.bytes
             .extend_from_slice(format!("\x1b[0m\x1b[90m{text}\x1b[0m\r\n").as_bytes());
     }
+
+    /// Respawn-seam continuity (the "bare `PS C:\>` under the replayed
+    /// scrollback" field bug, second half of the respawn-banner fix): drop
+    /// the dead session's trailing BARE prompt line at PREFACE BUILD time.
+    ///
+    /// The attach-time dangling-prompt matcher in `serialize_term` collapses
+    /// that line only when the NEW session's own first prompt is already in
+    /// the live mirror — but the GUI attaches at boot within milliseconds of
+    /// the respawn, long before a cold pwsh prints its first prompt, so the
+    /// dead prompt rode every boot replay and sat above the composer forever
+    /// (nothing revisits already-delivered preface bytes). When the caller
+    /// has BYTE PROOF the dead session ended at an empty prompt
+    /// (`tail_ends_at_bare_prompt`), the drop needs no future to compare
+    /// against: the restored shell will render an equivalent prompt, so the
+    /// dead copy is exactly the duplicate the seam must not show. Purely
+    /// presentational — journal and mirror untouched; older lifetimes'
+    /// copies keep collapsing via the render-time seam pass (both sides in
+    /// the journal by then).
+    ///
+    /// The sigil guard (same terminator set as `dangling_prompt_match`)
+    /// keeps an empty-string custom prompt from truncating a real output
+    /// line. `last_line_plain` is cleared so the attach-time matcher stands
+    /// down — nothing dangling remains for it to (mis)match.
+    ///
+    /// The cut lands at `last_block_start`, not `last_line_start`: the blank
+    /// run directly above the dead prompt is seam residue (the ≤MAX_BLANK_RUN
+    /// rows the seam erasure leaves where a prior lifetime's deduped prompt
+    /// sat), and keeping it opened a ~3-row void between the last real
+    /// output and the live prompt row (field follow-up screenshot). Dropping
+    /// the run with the prompt leaves the preface ending at real content;
+    /// every row below the seam is then the live shell's own honest
+    /// rendering (pwsh puts its prompt directly under output; cmd prints its
+    /// own separator blank) — live-session spacing by construction, not by a
+    /// hardcoded gap. Blank rows carry no information, and the cut only
+    /// happens under the bare-prompt byte proof.
+    pub fn truncate_trailing_prompt(&mut self) {
+        if self.last_line_plain.is_empty()
+            || !self.last_line_plain.ends_with(['>', '$', '#', '%', ':'])
+        {
+            return;
+        }
+        let cut = self.last_block_start.min(self.last_line_start);
+        self.bytes.truncate(cut);
+        // The opening block never overlaps the final content line (see
+        // `content_preface`), but keep the invariant explicit.
+        self.opening.retain(|l| l.end <= cut);
+        self.last_line_start = self.bytes.len();
+        self.last_block_start = self.bytes.len();
+        self.last_line_plain = String::new();
+    }
+}
+
+/// Byte proof that a dead session's journal tail ends at an EMPTY prompt:
+/// the last OSC 133;B (prompt end — the hooks emit it after the prompt text
+/// on every family: pwsh bootstrap, bash PS1 wrap, cmd PROMPT macro) is
+/// followed by NOTHING that could render or erase a cell — only escape
+/// sequences (SGR, mode resets like the `?9001l ?1004l` conhost emits when
+/// the PTY closes, OSCs) and bare CR/LF. Any printable byte (typed-but-unrun
+/// text), BS/HT (cursor surgery), or missing 133;B (hookless/degraded spawn,
+/// death inside a TUI) returns false — the caller then leaves the preface
+/// alone and the attach-time matcher keeps today's conservative behavior.
+pub fn tail_ends_at_bare_prompt(tail: &[u8]) -> bool {
+    let needle = b"\x1b]133;B";
+    let Some(pos) = memchr::memmem::rfind(tail, needle) else {
+        return false;
+    };
+    // Step past the OSC terminator (BEL or ST).
+    let mut i = pos + needle.len();
+    match tail.get(i) {
+        Some(0x07) => i += 1,
+        Some(0x1b) if tail.get(i + 1) == Some(&b'\\') => i += 2,
+        _ => return false, // malformed / truncated — don't guess
+    }
+    while i < tail.len() {
+        match tail[i] {
+            b'\r' | b'\n' => i += 1,
+            0x1b => {
+                i += 1;
+                match tail.get(i) {
+                    Some(b'[') => {
+                        // CSI: params/intermediates until a final byte @..~.
+                        i += 1;
+                        while i < tail.len() && !(0x40..=0x7e).contains(&tail[i]) {
+                            i += 1;
+                        }
+                        if i >= tail.len() {
+                            return false; // truncated sequence — don't guess
+                        }
+                        i += 1;
+                    }
+                    Some(b']') => {
+                        // OSC: until BEL or ST.
+                        i += 1;
+                        loop {
+                            match tail.get(i) {
+                                Some(0x07) => {
+                                    i += 1;
+                                    break;
+                                }
+                                Some(0x1b) if tail.get(i + 1) == Some(&b'\\') => {
+                                    i += 2;
+                                    break;
+                                }
+                                Some(_) => i += 1,
+                                None => return false,
+                            }
+                        }
+                    }
+                    Some(_) => i += 2, // ESC + single (RIS, DECSC, ST, …)
+                    None => return false,
+                }
+            }
+            // Printables, BS, HT, other C0 — something rendered or moved
+            // after the prompt end: not a bare prompt.
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Render + seam-erase a term's full grid (history + visible screen) into a
@@ -149,6 +277,11 @@ pub fn content_preface(term: &Term<EventProxy>) -> Preface {
     let mut last_line_plain = String::new();
     let mut blank_run = 0usize;
     let mut line_start = 0usize;
+    // Start of the emitted blank run currently open (respawn-seam fix: when
+    // the final content line turns out to be a dead bare prompt, the run
+    // directly above it — seam residue — must leave with it).
+    let mut run_start: Option<usize> = None;
+    let mut last_block_start = 0usize;
     for (i, rec) in recs.iter().enumerate() {
         if rec.drop {
             continue;
@@ -158,6 +291,7 @@ pub fn content_preface(term: &Term<EventProxy>) -> Preface {
             if blank_run > MAX_BLANK_RUN {
                 continue;
             }
+            run_start.get_or_insert(bytes.len());
         } else {
             blank_run = 0;
         }
@@ -168,6 +302,11 @@ pub fn content_preface(term: &Term<EventProxy>) -> Preface {
             if !rec.blank {
                 last_line_start = line_start;
                 last_line_plain = rec.plain.clone();
+                // The block start reaches back over the immediately
+                // preceding blank run (a wrapped logical line's earlier
+                // segments are between run and terminator; the run start
+                // still bounds the whole block from above).
+                last_block_start = run_start.take().unwrap_or(line_start);
             }
         }
         if last_opening.binary_search(&i).is_ok() {
@@ -187,6 +326,7 @@ pub fn content_preface(term: &Term<EventProxy>) -> Preface {
     Preface {
         bytes,
         last_line_start,
+        last_block_start,
         last_line_plain,
         opening,
     }
@@ -681,10 +821,14 @@ fn dangling_prompt_match(prev: &str, next: &str) -> bool {
 
 /// Seam-adjacent banner dedupe (the "15 stacked `Microsoft Windows
 /// [Version …]` banners after restarts" fix). cmd prints its banner on every
-/// REAL spawn (no off switch exists), the pwsh bootstrap now reproduces the
-/// `-Command`-suppressed logo per spawn, and WSL/ssh sessions re-print their
-/// MOTD per login — so every restore appends one more identical copy to the
-/// journal, and reconstructions showed them all stacked at the seams.
+/// REAL spawn (no off switch exists) and ssh sessions re-print their MOTD
+/// per login — so every restore appends one more identical copy to the
+/// journal, and reconstructions showed them all stacked at the seams. The
+/// pwsh bootstrap used to reproduce the `-Command`-suppressed logo per spawn
+/// too; since the respawn-banner fix it only does so on the FIRST-EVER spawn
+/// (`pwsh_banner_for_spawn`), but this pass stays load-bearing for pwsh as
+/// well: journals written before that fix carry one banner copy per
+/// lifetime, and they must keep collapsing to one on every future restore.
 ///
 /// Rule: a session's OPENING BLOCK — the lines it printed after its boundary
 /// (a restore seam, or the tail start) BEFORE its first prompt-sigil line —
@@ -2375,6 +2519,141 @@ mod tests {
         assert_eq!(hist_content, 0, "no stacked dead prompts in history");
         assert!(hist_blank <= MAX_BLANK_RUN);
         assert_eq!(cursor.0, 0, "cursor on the prompt row");
+    }
+
+    /// Respawn-seam fix: the byte test that licenses the preface's
+    /// trailing-prompt drop. Vectors are journal-verbatim (byte-dumped from a
+    /// real killed pwsh session — `--probe banner_diag`): the hooks' 133;B,
+    /// then only the conhost close-time mode resets and CRLF.
+    #[test]
+    fn tail_ends_at_bare_prompt_matrix() {
+        // The real kill shape: prompt, 133;B BEL, ?9001l ?1004l, CRLF.
+        let bare = b"\x1b]133;A\x07PS C:\\> \x1b]133;B\x07\x1b[?9001l\x1b[?1004l\r\n";
+        assert!(tail_ends_at_bare_prompt(bare));
+        // ST-terminated 133;B, trailing SGR + OSC also inert.
+        assert!(tail_ends_at_bare_prompt(
+            b"x\x1b]133;B\x1b\\\x1b[0m\x1b]0;title\x07\r\n"
+        ));
+        // Exactly at the terminator, nothing after.
+        assert!(tail_ends_at_bare_prompt(b"\x1b]133;B\x07"));
+        // Typed-but-unrun text after prompt end: NOT bare (keep everything).
+        assert!(!tail_ends_at_bare_prompt(b"\x1b]133;B\x07ls"));
+        // Output rendered after the prompt end: not bare.
+        assert!(!tail_ends_at_bare_prompt(b"\x1b]133;B\x07\r\nhello\r\n"));
+        // Cursor surgery (BS/HT) after the prompt end: not bare.
+        assert!(!tail_ends_at_bare_prompt(b"\x1b]133;B\x07\x08"));
+        assert!(!tail_ends_at_bare_prompt(b"\x1b]133;B\x07\t"));
+        // No prompt-end mark at all (hookless / degraded / died in a TUI).
+        assert!(!tail_ends_at_bare_prompt(b"PS C:\\> "));
+        assert!(!tail_ends_at_bare_prompt(b""));
+        // Truncated sequences after the mark: don't guess.
+        assert!(!tail_ends_at_bare_prompt(b"\x1b]133;B\x07\x1b["));
+        assert!(!tail_ends_at_bare_prompt(b"\x1b]133;B\x07\x1b]0;unterminated"));
+        assert!(!tail_ends_at_bare_prompt(b"\x1b]133;B"));
+        // Only the LAST 133;B decides: an old bare mark followed by a later
+        // lifetime's output does not license a drop.
+        let mut hist = Vec::new();
+        hist.extend_from_slice(bare);
+        hist.extend_from_slice(b"later output, no more prompt marks\r\n");
+        assert!(!tail_ends_at_bare_prompt(&hist));
+    }
+
+    /// Respawn-seam fix, preface half: the trailing bare prompt line is
+    /// dropped at BUILD time (no future prompt needed — the field GUI
+    /// attaches seconds before a cold pwsh prompts, so the attach-time
+    /// matcher never fired and the dead `PS C:\>` rode every boot replay).
+    /// The sigil guard keeps a non-prompt-shaped last line untouched, and
+    /// the neutralized matcher can no longer mis-truncate real output.
+    #[test]
+    fn preface_trailing_prompt_truncation() {
+        // A dead pwsh lifetime: banner-ish content, a command, its output,
+        // then the bare prompt the kill left behind (real journal shape).
+        let raw = b"old content line\r\nPS C:\\> echo DONE\r\nDONE\r\n\x1b]133;A\x07PS C:\\> \x1b]133;B\x07\x1b[?9001l\x1b[?1004l\r\n";
+        assert!(tail_ends_at_bare_prompt(raw));
+        let (mut pre, fix) = preface_with_alt_fix(raw, 80, 24);
+        assert!(fix.is_empty());
+        assert_eq!(pre.last_line_plain, "PS C:\\>");
+        pre.truncate_trailing_prompt();
+        let lines = plain_lines(&pre.bytes);
+        assert!(
+            !lines.iter().any(|l| l.trim() == "PS C:\\>"),
+            "trailing bare prompt dropped from the preface: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.trim() == "DONE"),
+            "real output survives: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("echo DONE")),
+            "the typed command survives: {lines:?}"
+        );
+        // The attach-time dangling matcher is stood down (nothing dangles).
+        assert!(pre.last_line_plain.is_empty());
+        assert_eq!(pre.last_line_start, pre.bytes.len());
+
+        // Sigil guard: a last line that is not prompt-shaped never truncates
+        // (the empty-custom-prompt hazard — 133;B present, but the last
+        // visible line is real output).
+        let mut pre2 = Preface::default();
+        pre2.push_info_line("plain output, no sigil ending");
+        let before = pre2.bytes.clone();
+        pre2.truncate_trailing_prompt();
+        assert_eq!(pre2.bytes, before, "non-sigil last line kept");
+    }
+
+    /// Respawn-seam fix, gap half (the "~3-row void above Pulse's prompt
+    /// row" field follow-up): the truncation takes the blank run directly
+    /// above the dead prompt with it — those rows are seam residue (the
+    /// ≤MAX_BLANK_RUN pad blanks the seam erasure leaves), and keeping them
+    /// broke live-session geometry. Space-only rows count as blank (the
+    /// scratch grid's `line_length` sees them empty — pinned here), earlier
+    /// real content and its own internal blanks survive, and a second call
+    /// is a no-op (the matcher was neutralized), so repeated restores can
+    /// never eat one more row per cycle.
+    #[test]
+    fn preface_truncation_takes_seam_blanks() {
+        // Output, TWO blank rows (one written as literal spaces — the width
+        // edge), then the bare dead prompt with hook marks, then the kill
+        // resets — the exact post-dedupe shape a twice-restored journal
+        // renders at the seam.
+        let raw = b"first block\r\n\r\nREAL_TAIL\r\n\r\n      \r\n\x1b]133;A\x07PS C:\\> \x1b]133;B\x07\x1b[?9001l\x1b[?1004l\r\n";
+        assert!(tail_ends_at_bare_prompt(raw));
+        let (mut pre, _) = preface_with_alt_fix(raw, 80, 24);
+        assert_eq!(pre.last_line_plain, "PS C:\\>");
+        assert!(
+            pre.last_block_start < pre.last_line_start,
+            "the blank run above the prompt is part of the trailing block"
+        );
+        pre.truncate_trailing_prompt();
+        // The preface now ends AT the real output line: no prompt, no
+        // trailing blank rows (raw line split, unfiltered — blanks visible).
+        let mut strip = crate::strip::AnsiStripper::default();
+        let mut plain = Vec::new();
+        strip.feed_bytes(&pre.bytes, &mut plain);
+        let text = String::from_utf8_lossy(&plain);
+        let rows: Vec<&str> = text.split("\r\n").collect();
+        // Final element is "" (the terminating CRLF); the one before must be
+        // the real output, not a blank.
+        assert_eq!(rows.last(), Some(&""), "preface ends with a CRLF");
+        assert_eq!(
+            rows.get(rows.len().wrapping_sub(2)).map(|s| s.trim_end()),
+            Some("REAL_TAIL"),
+            "preface ends at the last real output line, no residual gap: {rows:?}"
+        );
+        // The internal blank between the two real blocks is untouched.
+        assert!(
+            rows.iter().any(|r| r.trim_end() == "first block"),
+            "earlier content survives"
+        );
+        assert_eq!(
+            rows.iter().filter(|r| r.trim().is_empty() && !r.is_empty()).count(),
+            0,
+            "no space-only rows survive at all here"
+        );
+        // Idempotent: a second call changes nothing (matcher neutralized).
+        let after_once = pre.bytes.clone();
+        pre.truncate_trailing_prompt();
+        assert_eq!(pre.bytes, after_once, "second truncation is a no-op");
     }
 
     /// The report scanner: offsets/values parsed exactly; garbage shapes

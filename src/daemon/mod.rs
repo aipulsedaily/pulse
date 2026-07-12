@@ -1581,11 +1581,21 @@ impl Core {
                 bootstrap::write_cmd_prompt(id, &token)
             } else {
                 // Banner-visibility fix: `-Command` suppresses PowerShell's
-                // logo, so the bootstrap reproduces it (top of the script,
-                // once per real spawn) unless the terminal's own args say
-                // -NoLogo. Checked on the PERSISTED meta args (the user's),
-                // not spawn_meta's synthesized tail.
-                bootstrap::write_script(id, &token, bootstrap::pwsh_wants_banner(&meta.args))
+                // logo, so the bootstrap reproduces it (top of the script)
+                // on the FIRST-EVER spawn only, unless the terminal's own
+                // args say -NoLogo. Respawns/restores (launched_once — the
+                // same flag that gates the seam + journal replay below)
+                // NEVER reprint it: the replayed scrollback already carries
+                // the first launch's banner, and a fresh copy under the seam
+                // broke the continuous-terminal illusion on every daemon
+                // restart (respawn-banner field bug; pwsh mirror of the
+                // WslMotd::Restore rule above). Checked on the PERSISTED
+                // meta args (the user's), not spawn_meta's synthesized tail.
+                bootstrap::write_script(
+                    id,
+                    &token,
+                    bootstrap::pwsh_banner_for_spawn(!meta.launched_once, &meta.args),
+                )
             };
             let path = match write_result {
                 Ok(p) => Some(p),
@@ -1659,6 +1669,20 @@ impl Core {
                 let pre_t0 = perf::on().then(Instant::now);
                 let (p, alt_fix) = serialize::preface_with_alt_fix(&tail, cols, rows);
                 preface = p;
+                // Respawn-seam continuity (respawn-banner fix, second half):
+                // when the dead session provably ended at an EMPTY prompt
+                // (hook byte truth — last 133;B followed by nothing visible),
+                // drop its trailing bare prompt line from the preface NOW,
+                // at build time. The attach-time dangling matcher only fires
+                // once the new shell's first prompt is in the mirror, and
+                // the GUI's boot attach beats a cold pwsh's first prompt by
+                // seconds — so the dead `PS C:\>` rode every boot replay and
+                // stacked above the composer (field screenshots, pre- AND
+                // post-banner-fix). Journal untouched; typed-but-unrun text
+                // after the prompt fails the byte test and keeps everything.
+                if serialize::tail_ends_at_bare_prompt(&tail) {
+                    preface.truncate_trailing_prompt();
+                }
                 if let Some(t0) = pre_t0 {
                     log::info!(
                         "[perf] preface_from_raw id={id} tail_bytes={} us={}",
