@@ -715,9 +715,13 @@ fn case_dead_relaunch() -> anyhow::Result<()> {
 /// rose), exactly the field gap. The manual C2D::RetryReconnect raises
 /// supervision anyway (the click is the consent), and CancelReconnect
 /// inside the 2s pre-attempt window stops the ladder cleanly: flag down,
-/// still dead, zero attempts fired. The full reconnect round-trip lives in
-/// `ssh_reconnect` (WSL-gated); this case pins the manual entry + cancel
-/// on any box with an OpenSSH client.
+/// still dead, zero attempts fired. With the TC_RETRY_BACKOFF_MS staging
+/// env (sandbox daemons only) a second leg proves the F1 UNLIMITED manual
+/// ladder: attempts sail past the auto path's 3-attempt cap with the
+/// Snapshot-stamped progress rising, no give-up line ever, and Cancel
+/// stops it mid-ladder clearing the stamps. The full reconnect round-trip
+/// lives in `ssh_reconnect` (WSL-gated); this case pins the manual entry +
+/// cancel on any box with an OpenSSH client.
 fn case_dead_retry_manual() -> anyhow::Result<()> {
     if std::process::Command::new("ssh.exe").arg("-V").output().is_err() {
         return Err(skip("no ssh.exe on PATH (Windows OpenSSH client)".into()));
@@ -785,6 +789,44 @@ fn case_dead_retry_manual() -> anyhow::Result<()> {
         !log.contains("ssh reconnect attempt"),
         "cancel preceded the first rung — no attempt may fire"
     );
+
+    // ── F1 (ssh-reestablish): the UNLIMITED manual ladder. Needs the
+    // flattened-backoff staging env (TC_RETRY_BACKOFF_MS on the SANDBOX
+    // daemon — TC_DATA_DIR-gated, the TC_SSH_VIA_WSL guard class); without
+    // it the 2s/10s/30s ramp makes attempt 4 a ~90s wait, so this leg skips
+    // honestly rather than lying with a shorter assertion.
+    if std::env::var("TC_RETRY_BACKOFF_MS").is_ok() {
+        c.send(&C2D::RetryReconnect { id })?;
+        // Past the AUTO cap: the old ladder gave up after 3 attempts; the
+        // manual one must sail past 4 and NEVER log the give-up line. The
+        // Snapshot-stamped progress (retry_attempt) is the witness the GUI
+        // lane renders from.
+        c.snapshot_until(90, |s| {
+            s.terminals
+                .iter()
+                .any(|t| t.id == id && t.retry_attempt >= 4)
+        })?;
+        let log = log_since(log0);
+        anyhow::ensure!(
+            !log.contains("ssh reconnect gave up"),
+            "manual ladder must never give up (unlimited attempts)"
+        );
+        anyhow::ensure!(
+            log.contains("(manual, unlimited)"),
+            "manual attempts must log their unlimited class"
+        );
+        // Cancel stops it mid-ladder and clears the progress stamps.
+        c.send(&C2D::CancelReconnect { id })?;
+        c.snapshot_until(10, |s| {
+            s.terminals
+                .iter()
+                .any(|t| t.id == id && !t.reconnecting && t.retry_attempt == 0 && t.retry_next_s == 0)
+        })?;
+    } else {
+        eprintln!(
+            "  [dead_retry_manual] unlimited-ladder leg skipped (TC_RETRY_BACKOFF_MS not staged)"
+        );
+    }
     ensure_no_new_panics(log0)?;
     delete_terminal(&mut c, id);
     Ok(())
