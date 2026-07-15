@@ -709,6 +709,87 @@ fn case_dead_relaunch() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Dead-relaunch fix b WITHOUT WSL: a never-hooked ssh tab (TEST-NET
+/// 192.0.2.1, unroutable — the reviewer's timed-out-host stand-in) dies
+/// without ever qualifying for AUTO reconnect (`hooks_were_live` never
+/// rose), exactly the field gap. The manual C2D::RetryReconnect raises
+/// supervision anyway (the click is the consent), and CancelReconnect
+/// inside the 2s pre-attempt window stops the ladder cleanly: flag down,
+/// still dead, zero attempts fired. The full reconnect round-trip lives in
+/// `ssh_reconnect` (WSL-gated); this case pins the manual entry + cancel
+/// on any box with an OpenSSH client.
+fn case_dead_retry_manual() -> anyhow::Result<()> {
+    if std::process::Command::new("ssh.exe").arg("-V").output().is_err() {
+        return Err(skip("no ssh.exe on PATH (Windows OpenSSH client)".into()));
+    }
+    let name = "__probe_dead_retry__";
+    let log0 = daemon_log_len();
+    let mut c = Conn::open()?;
+    let _ = c.first_snapshot()?;
+    c.send(&C2D::CreateTerminal {
+        spec: NewTerminal {
+            name: name.into(),
+            folder: None,
+            kind: TermKind::Shell,
+            program: "ssh.exe".into(),
+            args: vec![
+                "-oConnectTimeout=3".into(),
+                "-oStrictHostKeyChecking=no".into(),
+                "192.0.2.1".into(),
+            ],
+            cwd: std::path::PathBuf::new(),
+            already_launched: false,
+            shell_cfg: None,
+        },
+    })?;
+    // Connect times out (~3s) and the terminal dies never having hooked.
+    let state = c.snapshot_until(45, |s| {
+        s.terminals
+            .iter()
+            .any(|t| t.name == name && t.status == TermStatus::Dead)
+    })?;
+    let t = state.terminals.iter().find(|t| t.name == name).unwrap();
+    let id = t.id;
+    anyhow::ensure!(
+        !t.reconnecting,
+        "a never-hooked ssh death must NOT auto-reconnect (hooks_were_live gate)"
+    );
+    // Manual retry: supervision rises by explicit consent…
+    c.send(&C2D::RetryReconnect { id })?;
+    c.snapshot_until(10, |s| {
+        s.terminals.iter().any(|t| t.id == id && t.reconnecting)
+    })?;
+    // …and Cancel inside the 2s pre-attempt window stops it cleanly.
+    c.send(&C2D::CancelReconnect { id })?;
+    c.snapshot_until(10, |s| {
+        s.terminals.iter().any(|t| t.id == id && !t.reconnecting)
+    })?;
+    // Past the would-be first rung: still dead, no attempt ever fired.
+    std::thread::sleep(Duration::from_millis(3500));
+    let master = master_token()?;
+    let mut ctl = Conn::open_ctl(&master, None)?;
+    if let CtlBody::Listing { terminals, .. } = ctl.ctl(9800, CtlRequest::List, 20)? {
+        let t = terminals.iter().find(|t| t.id == id);
+        anyhow::ensure!(
+            t.is_some_and(|t| t.status == "dead"),
+            "cancelled manual retry must leave the terminal dead: {:?}",
+            t.map(|t| &t.status)
+        );
+    }
+    let log = log_since(log0);
+    anyhow::ensure!(
+        log.contains("manual ssh reconnect requested"),
+        "no manual-retry scheduling line in daemon.log"
+    );
+    anyhow::ensure!(
+        !log.contains("ssh reconnect attempt"),
+        "cancel preceded the first rung — no attempt may fire"
+    );
+    ensure_no_new_panics(log0)?;
+    delete_terminal(&mut c, id);
+    Ok(())
+}
+
 fn case_remnant() -> anyhow::Result<()> {
     let mut c = Conn::open()?;
     let _ = c.first_snapshot()?;
@@ -10415,6 +10496,7 @@ pub fn run(case: Option<&str>) -> anyhow::Result<()> {
         ("basic", case_basic),
         ("restore", case_restore),
         ("dead_relaunch", case_dead_relaunch),
+        ("dead_retry_manual", case_dead_retry_manual),
         ("remnant", case_remnant),
         ("banner", case_banner),
         ("folders", case_folders),
