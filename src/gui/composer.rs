@@ -752,6 +752,18 @@ pub struct ComposerState {
     /// Snapshot, stamped like `asleep`). Drives the `reconnecting…` lane +
     /// the Cancel affordance in the Run slot. Draft kept throughout.
     pub reconnecting: bool,
+    /// What a Restore re-runs, humanized (dead-relaunch fix a): program and
+    /// destination for a program terminal — `ssh 192.168.50.239` — or None
+    /// for a plain shell. Feeds `relaunch_label`'s SessionEnded lane text
+    /// (`Press Enter to relaunch — ssh <host>`). Stamped with `is_ssh` at
+    /// composer creation (static per terminal: derives from program+args).
+    pub relaunch_cmd: Option<String>,
+    /// The terminal card owned the keyboard LAST tick (win focused, no
+    /// overlay/modal/rename, composer editor not armed) — the same
+    /// `grid_focused` signal tick's auto-arm uses, stashed so `show` can
+    /// gate the Dead lane's Enter-to-relaunch on real key ownership (a
+    /// popup's Enter must never relaunch a terminal).
+    pub term_focused: bool,
     /// Prompt latch + settle timestamp (None = not at a prompt).
     at_prompt_since: Option<Instant>,
     /// Bytes were sent to the PTY during this prompt episode (D7).
@@ -874,6 +886,8 @@ impl Default for ComposerState {
             asleep: false,
             is_ssh: false,
             reconnecting: false,
+            relaunch_cmd: None,
+            term_focused: false,
             at_prompt_since: None,
             episode_used: false,
             last_pre: 0,
@@ -1891,6 +1905,10 @@ impl ComposerState {
         grid_focused: bool,
         now: Instant,
     ) -> Option<Instant> {
+        // Dead-relaunch fix a: stash the key-ownership signal for `show`'s
+        // Enter-to-relaunch gate (same frame — central ticks right before
+        // it shows).
+        self.term_focused = grid_focused;
         // Tier-2b: the Ctrl-R overlay lives strictly inside a focused
         // Compose. Any demotion since last frame (alt flip, exit, reset,
         // Esc-blur) closes it and restores the stashed draft — the sweep
@@ -2860,6 +2878,75 @@ pub(crate) fn strip_hidden(
             .is_some_and(|t| now.duration_since(t) >= HIDE_AFTER)
 }
 
+/// Dead-relaunch fix a — the strip-presence gate (pure, table-tested): a
+/// terminal gets the composer strip when it is HOOKED (P3's original gate),
+/// when it is DEAD (a never-hooked dead ssh tab must still get the
+/// SessionEnded `↻ Restore ⏎` affordance — previously it rendered NO strip
+/// at all and the only relaunch control was the dashboard hover-reveal), or
+/// while RECONNECT SUPERVISION is up (a hookless tab's manual Retry must
+/// keep its `reconnecting… / Cancel` lane through the Running-attempt
+/// phases, or Cancel becomes unreachable mid-supervision). A LIVE hookless
+/// terminal stays strip-free — the gate can only flip on real lifecycle
+/// edges (death/relaunch/supervision), never per-frame, so live hookless
+/// tabs cannot storm geometry.
+pub(crate) fn strip_eligible(hooked: bool, dead: bool, reconnecting: bool) -> bool {
+    hooked || dead || reconnecting
+}
+
+/// Dead-relaunch fix a — Enter ownership on a dead terminal (pure): Enter
+/// relaunches ONLY when the lane presents SessionEnded (`dead_lane` already
+/// excludes asleep and reconnecting — those own their Enter/click exactly as
+/// before), the terminal card owns the keyboard, the draft is EMPTY (a
+/// non-empty draft's Enter is NOT consumed — it keeps its ordinary path),
+/// and no overlay is open (a popup's Enter must never relaunch).
+pub(crate) fn dead_enter_restores(
+    dead_lane: bool,
+    term_focused: bool,
+    has_draft: bool,
+    overlay_open: bool,
+) -> bool {
+    dead_lane && term_focused && !has_draft && !overlay_open
+}
+
+/// Dead-relaunch fix a — the SessionEnded lane text: name the gesture AND
+/// what it re-runs. Program terminals get the command (`Press Enter to
+/// relaunch — ssh 192.168.50.239`); plain shells the bare gesture.
+pub(crate) fn relaunch_label(cmd: Option<&str>) -> String {
+    match cmd {
+        Some(c) => format!("Press Enter to relaunch \u{2014} {c}"),
+        None => "Press Enter to relaunch".to_string(),
+    }
+}
+
+/// What a Restore re-runs, humanized, from the persisted spawn identity —
+/// the source for `ComposerState::relaunch_cmd` (pure so the label contract
+/// is unit-tested). Ssh-family terminals name the destination (`ssh <host>`
+/// — program stem + the host arg, per the field brief); Custom commands name
+/// their program stem (an `ssh.exe host` built as Custom still resolves the
+/// host); plain shells (and Claude-kind — its resume identity is not a
+/// command line) get None → the bare "Press Enter to relaunch".
+pub(crate) fn relaunch_desc(
+    kind: &crate::state::TermKind,
+    program: &str,
+    args: &[String],
+) -> Option<String> {
+    use crate::state::{shell_family, ssh_destination, ShellFamily, TermKind};
+    if let ShellFamily::Ssh { host } = shell_family(kind, program, args) {
+        return Some(format!("ssh {host}"));
+    }
+    if !matches!(kind, TermKind::Custom) {
+        return None;
+    }
+    let stem = std::path::Path::new(program)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())?;
+    match (stem.as_str(), ssh_destination(args)) {
+        ("ssh", Some(host)) => Some(format!("ssh {host}")),
+        _ => Some(stem),
+    }
+}
+
 /// What `show` hands back to the app.
 pub struct ComposerOutput {
     /// Bytes to ship to the daemon as terminal input (submission / refresh /
@@ -2887,6 +2974,11 @@ pub struct ComposerOutput {
     /// C2D::CancelReconnect (supervision stops; Dead + Restore affordances
     /// take over).
     pub cancel_reconnect: bool,
+    /// The dead lane's `Retry ▸` was clicked (ssh only, dead-relaunch fix
+    /// b) — the app sends C2D::RetryReconnect (proto-gated): the daemon
+    /// enters the existing bounded reconnect supervision by explicit user
+    /// consent, no hooks_were_live gate.
+    pub retry_reconnect: bool,
     /// C2: the collapsed strip's hover-peek overlay is showing this frame
     /// (render-only — an alpha-faded translucent band floating over the
     /// grid's bottom rows; no geometry, no interaction). Surfaced so tests
@@ -3138,6 +3230,7 @@ pub fn show(
         wake: false,
         restore: false,
         cancel_reconnect: false,
+        retry_reconnect: false,
         strip_peek: false,
     };
     let now = Instant::now();
@@ -3232,7 +3325,11 @@ pub fn show(
         Pos2::new(strip_rect.max.x - 22.0, strip_rect.center().y),
         Vec2::splat(22.0),
     );
-    let run_w = 58.0;
+    // Dead lane: the slot carries `↻ Restore  ⏎` (verb + silent keyboard
+    // accelerator) — wider than every other occupant. Widened only on the
+    // death edge (a real lifecycle change, not per-submit chrome motion);
+    // the right edge stays fixed.
+    let run_w = if dead_lane { 96.0 } else { 58.0 };
     let run_rect = Rect::from_center_size(
         Pos2::new(strip_rect.max.x - 44.0 - run_w / 2.0, strip_rect.center().y),
         Vec2::new(run_w, 24.0),
@@ -3253,6 +3350,22 @@ pub fn show(
         Pos2::new(lane_x, strip_rect.min.y),
         Pos2::new(slot_right, strip_rect.max.y),
     );
+    // Fix b: the Dead lane's SECOND verb — `Retry ▸` for ssh terminals,
+    // right-aligned in the fixed text slot the Compose hints use (one slot,
+    // never two occupants: the dead lane presents no Compose affordance).
+    // Rect computed here so the click hit-test below and the cluster paint
+    // agree pixel-for-pixel.
+    let retry_rect = (dead_lane && state.is_ssh).then(|| {
+        let g = painter.layout_no_wrap(
+            "Retry \u{25b8}".to_string(),
+            FontId::proportional(12.0),
+            super::ACCENT,
+        );
+        Rect::from_min_size(
+            Pos2::new(slot_right - g.size().x, strip_rect.center().y - g.size().y / 2.0),
+            g.size(),
+        )
+    });
 
     let has_draft = !state.draft.trim().is_empty();
     // The post-submit typeahead buffer is engaged: keys keep landing in the
@@ -4160,6 +4273,31 @@ pub fn show(
         }
 
         ComposerMode::Raw(_) => {
+            // Dead-relaunch fix a — Enter relaunches a dead terminal (the
+            // terminal-native gesture: VS Code / iTerm "press Enter to
+            // restart"). Guards live in `dead_enter_restores` (pure):
+            // SessionEnded lane only (asleep/reconnecting keep their Enter
+            // untouched), terminal owns the keyboard, EMPTY draft (a
+            // non-empty draft's Enter is left unconsumed), no overlay.
+            // Repeats collapse into ONE restore (launch() only proceeds
+            // from Dead anyway). Same out.restore → RestartTerminal path
+            // as the mouse verb.
+            if !collapsed
+                && dead_enter_restores(
+                    dead_lane,
+                    state.term_focused,
+                    has_draft,
+                    overlay_open,
+                )
+            {
+                let mut enters = 0u32;
+                while ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
+                    enters += 1;
+                }
+                if enters > 0 {
+                    out.restore = true;
+                }
+            }
             // LEFT lane by the stable-chrome state table + hysteresis
             // (lane_content — pure, table-tested): the lane may change
             // content only on REAL state changes; transients younger than
@@ -4171,13 +4309,14 @@ pub fn show(
                 LaneContent::Editor => unreachable!("mode is Raw"),
                 LaneContent::SessionEnded => {
                     // TEXT_SECONDARY, not FAINT: on a dead ssh tab this line
-                    // plus the Run-slot `Restore ▸` IS the whole lifecycle
+                    // plus the Run-slot `↻ Restore ⏎` IS the whole lifecycle
                     // affordance (Bug 4 — the field screenshot's near-
-                    // invisible label under raw client_loop noise).
+                    // invisible label under raw client_loop noise). The text
+                    // names the gesture and what it re-runs (fix a).
                     painter.text(
                         Pos2::new(lane_x, strip_rect.center().y),
                         Align2::LEFT_CENTER,
-                        "Session ended",
+                        relaunch_label(state.relaunch_cmd.as_deref()),
                         FontId::proportional(12.0),
                         super::TEXT_SECONDARY,
                     );
@@ -4515,15 +4654,31 @@ pub fn show(
                         // attempt keeps running daemon-side; future retries
                         // stop and the ordinary Dead affordances take over).
                         out.cancel_reconnect = true;
-                    } else if dead_lane && run_rect.contains(p) {
-                        // The unmissable dead-tab relaunch (Bug 4).
+                    } else if dead_lane
+                        && retry_rect
+                            .is_some_and(|r| r.expand2(Vec2::new(6.0, 8.0)).contains(p))
+                    {
+                        // Fix b: manual bounded retry (ssh only) — the
+                        // daemon enters the existing 2s/10s/30s supervision
+                        // by explicit consent; Cancel in the Reconnecting
+                        // lane stops it exactly like the auto path.
+                        out.retry_reconnect = true;
+                    } else if dead_lane {
+                        // The unmissable dead-tab relaunch (Bug 4, widened
+                        // by fix a): the WHOLE dead strip is the restore
+                        // target, not just the Run slot — a click on a dead
+                        // terminal means "bring it back" (History above
+                        // already claimed its own rect).
                         out.restore = true;
                     } else if arm_available {
                         out.write = state.activate(backend);
                     }
                 }
             }
-            if arm_available || ((asleep_lane || recon_lane || dead_lane) && over_run) {
+            if arm_available
+                || ((asleep_lane || recon_lane) && over_run)
+                || (dead_lane && !over_hist)
+            {
                 strip_resp.on_hover_cursor(egui::CursorIcon::PointingHand);
             }
         }
@@ -4563,13 +4718,35 @@ pub fn show(
                 if over_run { super::ACCENT_HOVER } else { super::ACCENT },
             );
         } else if dead_lane {
+            // Fix a: verb + silent keyboard accelerator (`↻ Restore  ⏎`),
+            // full ACCENT — on a dead tab this IS the primary action, not
+            // idle chrome. Mouse-first preserved: the ⏎ only names the
+            // Enter path, the whole strip is the click target.
             painter.text(
                 run_rect.center(),
                 Align2::CENTER_CENTER,
-                "Restore \u{25b8}",
+                "\u{21bb} Restore  \u{23ce}",
                 FontId::proportional(12.0),
                 if over_run { super::ACCENT_HOVER } else { super::ACCENT },
             );
+            // Fix b: the second verb — `Retry ▸` (ssh only): keep trying
+            // until the host is back, bounded and cancellable. Quieter than
+            // Restore (0.85 like ❯ Compose): Restore stays the primary.
+            if let Some(rr) = retry_rect {
+                let over =
+                    hover_pos.is_some_and(|p| rr.expand2(Vec2::new(6.0, 8.0)).contains(p));
+                let col = if over {
+                    super::ACCENT_HOVER
+                } else {
+                    super::ACCENT.gamma_multiply(0.85)
+                };
+                let g = painter.layout_no_wrap(
+                    "Retry \u{25b8}".to_string(),
+                    FontId::proportional(12.0),
+                    col,
+                );
+                painter.galley(rr.min, g, col);
+            }
         } else {
         let run_on = compose && has_draft && (can_submit || buffering) && !cmd_multiline;
         let run_col = if !run_on {
@@ -4806,6 +4983,179 @@ mod tests {
             lane_content(&st, false, false, false, now),
             LaneContent::SessionEnded
         );
+    }
+
+    /// Dead-relaunch fix a — the strip-presence gate: hooked exactly as
+    /// before; Dead and reconnecting newly eligible (a never-hooked dead
+    /// ssh tab gets the SessionEnded affordance; a hookless manual-retry
+    /// tab keeps Cancel through the Running-attempt phases); a LIVE
+    /// hookless terminal renders NO strip — the gate only moves on real
+    /// lifecycle edges, so live hookless tabs cannot storm geometry.
+    #[test]
+    fn strip_eligible_gate() {
+        assert!(strip_eligible(true, false, false), "hooked, running");
+        assert!(strip_eligible(true, true, false), "hooked, dead");
+        assert!(
+            strip_eligible(false, true, false),
+            "hookless dead — the field case (timed-out ssh)"
+        );
+        assert!(
+            strip_eligible(false, false, true),
+            "hookless mid-supervision attempt keeps its Cancel lane"
+        );
+        assert!(
+            !strip_eligible(false, false, false),
+            "LIVE hookless: no strip, ever (no strip-storm)"
+        );
+    }
+
+    /// Fix a — Enter ownership on a dead terminal (pure table): relaunch
+    /// only on SessionEnded + keyboard owned + EMPTY draft + no overlay;
+    /// every other row leaves Enter exactly where it was.
+    #[test]
+    fn dead_enter_restores_table() {
+        let d = dead_enter_restores;
+        assert!(d(true, true, false, false), "the field gesture");
+        assert!(
+            !d(false, true, false, false),
+            "asleep/reconnecting/live lanes keep their Enter"
+        );
+        assert!(!d(true, false, false, false), "keyboard owned elsewhere");
+        assert!(!d(true, true, true, false), "non-empty draft: NOT consumed");
+        assert!(!d(true, true, false, true), "overlay owns Enter");
+    }
+
+    /// Fix a — the relaunch-hint strings (the spec's label test): ssh
+    /// names its destination, a plain shell gets the bare gesture, and a
+    /// Custom command names its program stem.
+    #[test]
+    fn relaunch_label_strings() {
+        use crate::state::TermKind;
+        let ssh = relaunch_desc(
+            &TermKind::Shell,
+            "ssh.exe",
+            &["192.168.50.239".to_string()],
+        );
+        assert_eq!(ssh.as_deref(), Some("ssh 192.168.50.239"));
+        assert_eq!(
+            relaunch_label(ssh.as_deref()),
+            "Press Enter to relaunch \u{2014} ssh 192.168.50.239"
+        );
+        // Plain shell: the bare gesture.
+        let sh = relaunch_desc(&TermKind::Shell, "powershell.exe", &["-NoLogo".into()]);
+        assert_eq!(sh, None);
+        assert_eq!(relaunch_label(None), "Press Enter to relaunch");
+        // A hand-built Custom `ssh.exe host` still resolves the destination…
+        let custom_ssh = relaunch_desc(&TermKind::Custom, "ssh.exe", &["h0st".to_string()]);
+        assert_eq!(custom_ssh.as_deref(), Some("ssh h0st"));
+        // …and a generic Custom names its program stem.
+        let cmd = relaunch_desc(
+            &TermKind::Custom,
+            "cmd.exe",
+            &["/c".to_string(), "exit 1".to_string()],
+        );
+        assert_eq!(cmd.as_deref(), Some("cmd"));
+    }
+
+    /// Fix a — REAL egui round-trip (headless `Context::run_ui`, the Bug C
+    /// test pattern) for the Dead lane's Enter-to-relaunch: SessionEnded +
+    /// terminal-owned keyboard + EMPTY draft + Enter ⇒ `out.restore` (the
+    /// same RestartTerminal path as the mouse verb); a non-empty draft's
+    /// Enter is NOT consumed as a restore; overlays and foreign focus stay
+    /// inert; asleep and reconnecting lanes keep their existing ownership
+    /// (Enter never wakes, never cancels); a running terminal never
+    /// restores.
+    #[test]
+    fn dead_enter_relaunches() {
+        let mut b = TermBackend::new(GridSize::default());
+        b.set_stream_pos(0);
+        let recs: Vec<BlockRec> = Vec::new();
+        let ctx = egui::Context::default();
+        let strip = Rect::from_min_max(Pos2::new(0.0, 564.0), Pos2::new(800.0, 600.0));
+        let grid = Rect::from_min_max(Pos2::ZERO, Pos2::new(800.0, 564.0));
+        let enter = egui::Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        let frame = |st: &mut ComposerState,
+                     b: &TermBackend,
+                     running: bool,
+                     overlay: bool,
+                     events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_max(
+                    Pos2::ZERO,
+                    Pos2::new(800.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let mut out = None;
+            let _ = ctx.run_ui(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    out = Some(show(
+                        ui,
+                        strip,
+                        grid,
+                        Uuid::nil(),
+                        st,
+                        b,
+                        &recs,
+                        0, // hookless: the never-hooked dead ssh tab
+                        running,
+                        false,
+                        overlay,
+                        FontId::monospace(13.0),
+                        None,
+                        None,
+                    ));
+                });
+            });
+            out.unwrap()
+        };
+
+        let mut st = ComposerState {
+            mode: ComposerMode::Raw(RawReason::Dead),
+            term_focused: true,
+            ..Default::default()
+        };
+        let o = frame(&mut st, &b, false, false, vec![enter.clone()]);
+        assert!(o.restore, "Dead + focus + empty draft + Enter ⇒ restore");
+        // Non-empty draft: Enter keeps its ordinary path.
+        st.draft = "queued text".into();
+        let o = frame(&mut st, &b, false, false, vec![enter.clone()]);
+        assert!(!o.restore, "a draft's Enter must NOT be consumed as restore");
+        st.draft.clear();
+        // Overlay open: the popup owns Enter.
+        let o = frame(&mut st, &b, false, true, vec![enter.clone()]);
+        assert!(!o.restore, "overlay owns Enter");
+        // Keyboard owned elsewhere this frame.
+        st.term_focused = false;
+        let o = frame(&mut st, &b, false, false, vec![enter.clone()]);
+        assert!(!o.restore, "foreign focus: Enter untouched");
+        st.term_focused = true;
+        // Asleep lane: waking stays the explicit Wake ▸ click (SLEEP inv.5).
+        st.asleep = true;
+        st.mode = ComposerMode::Raw(RawReason::Asleep);
+        let o = frame(&mut st, &b, false, false, vec![enter.clone()]);
+        assert!(!o.restore && !o.wake, "asleep: Enter never wakes");
+        st.asleep = false;
+        // Reconnecting lane: supervision owns the lane (Cancel is a click).
+        st.mode = ComposerMode::Raw(RawReason::Dead);
+        st.reconnecting = true;
+        let o = frame(&mut st, &b, false, false, vec![enter.clone()]);
+        assert!(
+            !o.restore && !o.cancel_reconnect,
+            "reconnecting: Enter neither restores nor cancels"
+        );
+        st.reconnecting = false;
+        // A running terminal never restores on Enter.
+        st.mode = ComposerMode::Raw(RawReason::NoPrompt);
+        let o = frame(&mut st, &b, true, false, vec![enter]);
+        assert!(!o.restore, "running: never fires");
     }
 
     /// C2 — `strip_hidden` truth table (hidden ⇔ the terminal owns the
