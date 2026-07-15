@@ -58,6 +58,20 @@ fn reconnect_qualifies(
     !expected && code != Some(0) && hooks_were_live && is_ssh && !asleep && opt_in
 }
 
+/// The MANUAL retry qualification (dead-relaunch fix b, proto 13): an
+/// explicit `Retry ▸` click skips the auto path's witnesses — deliberate?
+/// exit code? `hooks_were_live`? opt-in? — because the click IS the consent
+/// (a user retrying a password host gets exactly one spawned attempt per
+/// rung, and the RECONNECT_HOOK_WINDOW auth-wall stop still ends
+/// supervision; the AUTO gates stay untouched for the automatic path). It
+/// still requires: family Ssh (relaunch loops make no sense elsewhere —
+/// plain Restore covers those), plainly Dead (never surprise-restart a
+/// running terminal; asleep is the stronger, deliberate intent), and no
+/// supervision already running (idempotent double-click).
+fn manual_retry_allowed(is_ssh: bool, dead: bool, asleep: bool, supervised: bool) -> bool {
+    is_ssh && dead && !asleep && !supervised
+}
+
 impl Core {
     /// SSH auto-reconnect qualification, run on every exit (D13 revisited
     /// with field evidence: two hooked ssh sessions died with exit 255 at
@@ -117,6 +131,54 @@ impl Core {
                 watching: false,
             },
         );
+        self.set_reconnecting_flag(id, true);
+    }
+
+    /// C2D::RetryReconnect (proto 13, dead-relaunch fix b): user-initiated
+    /// entry into the SAME supervision maybe_schedule_reconnect runs — the
+    /// identical 2s/10s/30s ladder, resolved by the fresh session's first
+    /// token-checked `pre`, capped at 3 attempts, cancellable via
+    /// CancelReconnect, and still subject to the RECONNECT_HOOK_WINDOW
+    /// interactive-auth stop (an attempt sitting at a password prompt ends
+    /// the loop; the attempt is left running). The only difference is the
+    /// entry gate: `manual_retry_allowed` (the click is the consent) instead
+    /// of the `reconnect_qualifies` witnesses — which stay untouched for the
+    /// automatic path.
+    pub(super) fn manual_reconnect(&self, id: Uuid) {
+        let (is_ssh, dead, asleep) = {
+            let state = self.state.lock();
+            match state.terminal(id) {
+                Some(t) => (
+                    matches!(
+                        crate::state::shell_family(&t.kind, &t.program, &t.args),
+                        crate::state::ShellFamily::Ssh { .. }
+                    ),
+                    t.status == TermStatus::Dead,
+                    t.asleep,
+                ),
+                None => return,
+            }
+        };
+        {
+            // Check-and-insert under ONE lock: a concurrent auto-schedule
+            // (or a double-click racing itself) must not stack entries.
+            let mut map = self.reconnects.lock();
+            if !manual_retry_allowed(is_ssh, dead, asleep, map.contains_key(&id)) {
+                return;
+            }
+            log::info!(
+                "terminal {id}: manual ssh reconnect requested — first attempt in {:?}",
+                RECONNECT_BACKOFF[0]
+            );
+            map.insert(
+                id,
+                Reconnect {
+                    attempt: 0,
+                    at: Instant::now() + RECONNECT_BACKOFF[0],
+                    watching: false,
+                },
+            );
+        }
         self.set_reconnecting_flag(id, true);
     }
 
@@ -324,5 +386,22 @@ mod tests {
         assert!(!q(false, Some(255), true, false, false, true), "not ssh");
         assert!(!q(false, Some(255), true, true, true, true), "asleep");
         assert!(!q(false, Some(255), true, true, false, false), "opted out");
+    }
+
+    /// Fix b — the manual `Retry ▸` gate: the click replaces the auto
+    /// witnesses (hooks_were_live / exit code / deliberate / opt-in are
+    /// deliberately ABSENT from this signature — a never-hooked timed-out
+    /// host is exactly the case it exists for), but ssh-only, plainly-Dead
+    /// (asleep is the stronger intent), and idempotent under an existing
+    /// supervision.
+    #[test]
+    fn manual_retry_gate() {
+        let m = manual_retry_allowed;
+        // The field case: a never-hooked ssh tab dead on connect timeout.
+        assert!(m(true, true, false, false));
+        assert!(!m(false, true, false, false), "not ssh — Restore covers it");
+        assert!(!m(true, false, false, false), "running/never-launched");
+        assert!(!m(true, true, true, false), "asleep stays asleep");
+        assert!(!m(true, true, false, true), "already supervised (double-click)");
     }
 }

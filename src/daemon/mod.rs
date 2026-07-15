@@ -3469,6 +3469,12 @@ impl Core {
             C2D::CancelReconnect { id } => {
                 self.cancel_reconnect(id);
             }
+            C2D::RetryReconnect { id } => {
+                // Dead-relaunch fix b (proto 13): user-initiated bounded
+                // retry — same supervision, entered by explicit consent
+                // instead of the hooks_were_live auto-gate.
+                self.manual_reconnect(id);
+            }
             C2D::SetAutoReconnect { id, on } => {
                 self.mutate(|s| {
                     if let Some(t) = s.terminal_mut(id) {
@@ -4436,6 +4442,9 @@ pub fn run() -> anyhow::Result<()> {
         port,
         token: token.clone(),
         pid: std::process::id(),
+        // 13 = MANUAL SSH RETRY: C2D::RetryReconnect appended (dead-lane
+        //      `Retry ▸` — user-initiated bounded reconnect supervision,
+        //      no hooks_were_live gate; dead-relaunch fix b);
         // 12 = WIDTH-MISMATCH GARBLE FIX: C2D::Hello2 appended (client
         //      generation in the handshake); the restore resync suppresses
         //      its blind-size Replay push for proto ≥ 12 clients, which
