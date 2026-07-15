@@ -2802,17 +2802,19 @@ impl App {
                         let is_ssh = self.family_is_ssh(id);
                         let fam = self.family_complete(id);
                         let relaunch_cmd = self.relaunch_desc(id);
-                        let (asleep, reconnecting) = self
+                        let (asleep, reconnecting, retry_attempt, retry_next_s) = self
                             .state
                             .terminal(id)
-                            .map(|t| (t.asleep, t.reconnecting))
-                            .unwrap_or((false, false));
+                            .map(|t| (t.asleep, t.reconnecting, t.retry_attempt, t.retry_next_s))
+                            .unwrap_or((false, false, 0, 0));
                         let st = self.composers.entry(id).or_default();
                         st.is_cmd = is_cmd;
                         st.is_ssh = is_ssh;
                         st.fam = fam;
                         st.asleep = asleep;
                         st.reconnecting = reconnecting;
+                        st.retry_attempt = retry_attempt;
+                        st.retry_next_s = retry_next_s;
                         st.relaunch_cmd = relaunch_cmd;
                     }
                 }
@@ -3120,9 +3122,20 @@ impl App {
                 .filter(|t| t.reconnecting)
                 .map(|t| t.id)
                 .collect();
+            // F1: manual-retry progress rides the Snapshot beside the flag.
+            let retry_progress: HashMap<Uuid, (u32, u32)> = self
+                .state
+                .terminals
+                .iter()
+                .filter(|t| t.retry_attempt != 0 || t.retry_next_s != 0)
+                .map(|t| (t.id, (t.retry_attempt, t.retry_next_s)))
+                .collect();
             for (id, st) in self.composers.iter_mut() {
                 st.asleep = asleep_ids.contains(id);
                 st.reconnecting = reconnecting_ids.contains(id);
+                let (a, s) = retry_progress.get(id).copied().unwrap_or((0, 0));
+                st.retry_attempt = a;
+                st.retry_next_s = s;
             }
         }
         self.unread.retain(|id| ids.contains(id));
@@ -3832,17 +3845,19 @@ impl App {
         let is_ssh = self.family_is_ssh(id);
         let fam = self.family_complete(id);
         let relaunch_cmd = self.relaunch_desc(id);
-        let (asleep, reconnecting) = self
+        let (asleep, reconnecting, retry_attempt, retry_next_s) = self
             .state
             .terminal(id)
-            .map(|t| (t.asleep, t.reconnecting))
-            .unwrap_or((false, false));
+            .map(|t| (t.asleep, t.reconnecting, t.retry_attempt, t.retry_next_s))
+            .unwrap_or((false, false, 0, 0));
         let st = self.composers.entry(id).or_default();
         st.is_cmd = is_cmd;
         st.is_ssh = is_ssh;
         st.fam = fam;
         st.asleep = asleep;
         st.reconnecting = reconnecting;
+        st.retry_attempt = retry_attempt;
+        st.retry_next_s = retry_next_s;
         st.relaunch_cmd = relaunch_cmd;
     }
 
@@ -7055,6 +7070,8 @@ mod tests {
             asleep: false,
             reconnecting: false,
             nested_chain: None,
+            retry_attempt: 0,
+            retry_next_s: 0,
         };
         let mut state = SharedState {
             folders: vec![folder(f_b, "B", 2), folder(f_a, "A", 1)],
@@ -7145,6 +7162,8 @@ mod tests {
             asleep: false,
             reconnecting: false,
             nested_chain: None,
+            retry_attempt: 0,
+            retry_next_s: 0,
         };
         let nt = duplicate_spec(&t, &["claude"]);
         match &nt.kind {
@@ -7476,6 +7495,8 @@ mod tests {
             asleep,
             reconnecting: false,
             nested_chain: None,
+            retry_attempt: 0,
+            retry_next_s: 0,
         };
         let sig = |needs_you: bool, quiet_ms: u64, cli_stream: bool| {
             let mut s = ActivityState::new();

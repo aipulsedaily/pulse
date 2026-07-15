@@ -752,6 +752,12 @@ pub struct ComposerState {
     /// Snapshot, stamped like `asleep`). Drives the `reconnecting…` lane +
     /// the Cancel affordance in the Run slot. Draft kept throughout.
     pub reconnecting: bool,
+    /// F1 (ssh-reestablish): the MANUAL retry ladder's progress, stamped
+    /// from every Snapshot beside `reconnecting`. attempts fired so far
+    /// (0 = auto lane — the plain "reconnecting…" label) and seconds until
+    /// the next attempt (0 = in flight). Feed `retry_lane_label`.
+    pub retry_attempt: u32,
+    pub retry_next_s: u32,
     /// What a Restore re-runs, humanized (dead-relaunch fix a): program and
     /// destination for a program terminal — `ssh 192.168.50.239` — or None
     /// for a plain shell. Feeds `relaunch_label`'s SessionEnded lane text
@@ -886,6 +892,8 @@ impl Default for ComposerState {
             asleep: false,
             is_ssh: false,
             reconnecting: false,
+            retry_attempt: 0,
+            retry_next_s: 0,
             relaunch_cmd: None,
             term_focused: false,
             at_prompt_since: None,
@@ -2918,6 +2926,21 @@ pub(crate) fn relaunch_label(cmd: Option<&str>) -> String {
     }
 }
 
+/// F1 (ssh-reestablish) — the Reconnecting lane's text (pure, golden-
+/// tested): the AUTO supervision keeps its plain "reconnecting…"; the
+/// MANUAL, unlimited ladder shows its attempts honestly — `retrying —
+/// attempt 7 · next in 30s` between rungs, `retrying — attempt 7…` while an
+/// attempt is in flight, and the first rung names itself before anything
+/// has fired. Cancel stays in the Run slot through every phase.
+pub(crate) fn retry_lane_label(attempt: u32, next_s: u32) -> String {
+    match (attempt, next_s) {
+        (0, 0) => "reconnecting\u{2026}".to_string(),
+        (0, s) => format!("retrying \u{2014} first attempt in {s}s"),
+        (n, 0) => format!("retrying \u{2014} attempt {n}\u{2026}"),
+        (n, s) => format!("retrying \u{2014} attempt {n} \u{b7} next in {s}s"),
+    }
+}
+
 /// What a Restore re-runs, humanized, from the persisted spawn identity —
 /// the source for `ComposerState::relaunch_cmd` (pure so the label contract
 /// is unit-tested). Ssh-family terminals name the destination (`ssh <host>`
@@ -4325,6 +4348,10 @@ pub fn show(
                     // Daemon-certain state (the supervision flag rides the
                     // Snapshot): spinner + label; Cancel lives in the Run
                     // slot below. 100ms repaints keep the arc turning.
+                    // F1: a MANUAL (unlimited) ladder reports its attempts
+                    // honestly (`retrying — attempt 7 · next in 30s`) via
+                    // the Snapshot-stamped progress; the auto lane keeps
+                    // the plain label.
                     super::toast::spinner(
                         &painter,
                         Pos2::new(lane_x + 6.0, strip_rect.center().y),
@@ -4335,7 +4362,7 @@ pub fn show(
                     painter.text(
                         Pos2::new(lane_x + 18.0, strip_rect.center().y),
                         Align2::LEFT_CENTER,
-                        "reconnecting\u{2026}",
+                        retry_lane_label(state.retry_attempt, state.retry_next_s),
                         FontId::proportional(12.0),
                         super::TEXT_SECONDARY,
                     );
@@ -5055,6 +5082,27 @@ mod tests {
             &["/c".to_string(), "exit 1".to_string()],
         );
         assert_eq!(cmd.as_deref(), Some("cmd"));
+    }
+
+    /// F1 (ssh-reestablish) — the Reconnecting lane's label goldens: the
+    /// auto supervision keeps the historical "reconnecting…"; the manual
+    /// unlimited ladder reports its attempts honestly through every phase
+    /// (pre-first-rung, waiting between rungs, attempt in flight).
+    #[test]
+    fn retry_lane_label_strings() {
+        assert_eq!(retry_lane_label(0, 0), "reconnecting\u{2026}");
+        assert_eq!(retry_lane_label(0, 2), "retrying \u{2014} first attempt in 2s");
+        assert_eq!(
+            retry_lane_label(7, 30),
+            "retrying \u{2014} attempt 7 \u{b7} next in 30s"
+        );
+        assert_eq!(retry_lane_label(7, 0), "retrying \u{2014} attempt 7\u{2026}");
+        // The unlimited ladder's numbers keep rendering plainly (no cap in
+        // the wording — there is none).
+        assert_eq!(
+            retry_lane_label(240, 30),
+            "retrying \u{2014} attempt 240 \u{b7} next in 30s"
+        );
     }
 
     /// Fix a — REAL egui round-trip (headless `Context::run_ui`, the Bug C

@@ -502,6 +502,18 @@ pub enum CtlRequest {
         /// The session id as reported; uuid shape validated daemon-side.
         session_id: String,
     },
+    /// F1 (ssh-reestablish): `tc retry <term>` — user-initiated ssh
+    /// reconnect supervision on a dead ssh terminal (Core::manual_reconnect,
+    /// the exact C2D::RetryReconnect path): 2s/10s/30s backoff, then the 30s
+    /// ceiling FOREVER — unlimited attempts until the host answers, the user
+    /// cancels, or an attempt sits 30s at an interactive auth wall.
+    /// Refusals: not_found | not_ssh | running | asleep | supervised.
+    ///
+    /// APPENDED at the enum's end: bincode encodes variants positionally.
+    Retry {
+        id: Uuid,
+        force_self: bool,
+    },
 }
 
 /// The scope bits a request needs. Token* need FULL (scoped tokens can never
@@ -518,7 +530,7 @@ pub fn required_scope(req: &CtlRequest) -> u32 {
         // pin / inner_cli), the same metadata class MANAGE already guards.
         CreateTerminal { .. } | CreateFolder { .. } | Kill { .. } | Restart { .. }
         | Delete { .. } | Sleep { .. } | Wake { .. } | SleepFolder { .. }
-        | WakeFolder { .. } | ReportCliSession { .. } => SCOPE_MANAGE,
+        | WakeFolder { .. } | ReportCliSession { .. } | Retry { .. } => SCOPE_MANAGE,
         TokenCreate { .. } | TokenRevoke { .. } | TokenList => SCOPE_FULL,
     }
 }
@@ -834,6 +846,11 @@ mod ctl_tests {
                 event: "SessionStart".into(),
                 source: "clear".into(),
                 session_id: Uuid::nil().to_string(),
+            },
+            // F1: retry spawns processes — Kill/Restart's exact class.
+            CtlRequest::Retry {
+                id,
+                force_self: false,
             },
         ];
         for r in &manage {

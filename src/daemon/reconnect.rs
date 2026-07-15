@@ -16,13 +16,19 @@ use super::*;
 /// hooks (interactive auth wall — the attempt is left running, honest).
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Reconnect {
-    /// Attempts already fired (0 = none yet).
-    attempt: u8,
+    /// Attempts already fired (0 = none yet). u32: a MANUAL supervision is
+    /// unlimited — a long outage can run past 255 attempts.
+    attempt: u32,
     /// Waiting: when the next attempt fires. Watching: when the in-flight
     /// attempt was spawned (hook-arrival deadline base).
     at: Instant,
     /// An attempt is currently in flight (spawned, hooks not yet seen).
     watching: bool,
+    /// USER-INITIATED supervision (`Retry ▸` / `tc retry`, ssh-reestablish
+    /// F1): the ladder never exhausts — backoff grows to the 30s ceiling and
+    /// attempts continue until success, Cancel, or the auth-wall stop. The
+    /// automatic (`hooks_were_live`) path keeps its 3-attempt cap.
+    manual: bool,
 }
 
 /// SSH reconnect backoff table (seconds after death/failure). Tests pin it.
@@ -31,15 +37,38 @@ const RECONNECT_BACKOFF: [Duration; 3] = [
     Duration::from_secs(10),
     Duration::from_secs(30),
 ];
+/// F1: the manual ladder's backoff ceiling — every rung past the table
+/// repeats at this pace, forever, until success or Cancel.
+const MANUAL_BACKOFF_CEILING: Duration = Duration::from_secs(30);
 /// How long a spawned reconnect attempt may run without its hooks arming
 /// before supervision stops (the attempt itself is LEFT RUNNING — it may be
 /// sitting at an interactive auth prompt, which is a usable terminal).
 const RECONNECT_HOOK_WINDOW: Duration = Duration::from_secs(30);
 
 /// Delay before the next attempt after `attempts_done` failures; None =
-/// exhausted (give up to Dead + the ordinary Restore affordances).
-fn reconnect_backoff_after(attempts_done: u8) -> Option<Duration> {
-    RECONNECT_BACKOFF.get(attempts_done as usize).copied()
+/// exhausted (give up to Dead + the ordinary Restore affordances). A MANUAL
+/// supervision (F1: the user said "keep trying until my server is back")
+/// never exhausts: past the table it repeats at the 30s ceiling, unlimited —
+/// success, Cancel, or the per-attempt auth-wall stop are the only exits.
+/// Probe staging (`TC_RETRY_BACKOFF_MS`, TC_DATA_DIR-isolated builds only —
+/// the TC_SSH_VIA_WSL guard class) flattens every rung to a constant so the
+/// unlimited ladder is provable in seconds, never against installed daemons.
+fn reconnect_backoff_after(attempts_done: u32, manual: bool) -> Option<Duration> {
+    if let Ok(ms) = std::env::var("TC_RETRY_BACKOFF_MS") {
+        if crate::state::data_dir_overridden() {
+            if let Ok(ms) = ms.parse::<u64>() {
+                let flat = Duration::from_millis(ms.clamp(50, 60_000));
+                return (manual || (attempts_done as usize) < RECONNECT_BACKOFF.len())
+                    .then_some(flat);
+            }
+        }
+    }
+    let table = RECONNECT_BACKOFF.get(attempts_done as usize).copied();
+    if manual {
+        Some(table.unwrap_or(MANUAL_BACKOFF_CEILING))
+    } else {
+        table
+    }
 }
 
 /// The pure ssh auto-reconnect qualification (maybe_schedule_reconnect owns
@@ -98,7 +127,7 @@ impl Core {
         let prior = self.reconnects.lock().get(&id).copied();
         if let Some(rc) = prior {
             if rc.watching {
-                self.advance_reconnect(id, rc.attempt);
+                self.advance_reconnect(id, rc.attempt, rc.manual);
             }
             return;
         }
@@ -127,24 +156,28 @@ impl Core {
             id,
             Reconnect {
                 attempt: 0,
-                at: Instant::now() + RECONNECT_BACKOFF[0],
+                at: Instant::now() + reconnect_backoff_after(0, false).unwrap_or(RECONNECT_BACKOFF[0]),
                 watching: false,
+                manual: false,
             },
         );
         self.set_reconnecting_flag(id, true);
     }
 
-    /// C2D::RetryReconnect (proto 13, dead-relaunch fix b): user-initiated
-    /// entry into the SAME supervision maybe_schedule_reconnect runs — the
-    /// identical 2s/10s/30s ladder, resolved by the fresh session's first
-    /// token-checked `pre`, capped at 3 attempts, cancellable via
-    /// CancelReconnect, and still subject to the RECONNECT_HOOK_WINDOW
-    /// interactive-auth stop (an attempt sitting at a password prompt ends
-    /// the loop; the attempt is left running). The only difference is the
-    /// entry gate: `manual_retry_allowed` (the click is the consent) instead
-    /// of the `reconnect_qualifies` witnesses — which stay untouched for the
-    /// automatic path.
-    pub(super) fn manual_reconnect(&self, id: Uuid) {
+    /// C2D::RetryReconnect / ctl `retry` (proto 13, dead-relaunch fix b +
+    /// ssh-reestablish F1): user-initiated entry into the same supervision
+    /// maybe_schedule_reconnect runs — the identical 2s/10s/30s ladder,
+    /// resolved by the fresh session's first token-checked `pre`,
+    /// cancellable via CancelReconnect, and still subject to the
+    /// RECONNECT_HOOK_WINDOW interactive-auth stop (an attempt sitting at a
+    /// password prompt ends the loop; the attempt is left running). Two
+    /// differences from the automatic path: the entry gate is
+    /// `manual_retry_allowed` (the click IS the consent) instead of the
+    /// `reconnect_qualifies` witnesses — which stay untouched — and the
+    /// ladder is UNLIMITED past the table (30s ceiling) instead of capped at
+    /// 3: the user said "keep trying until my server is back". Returns the
+    /// typed refusal for the ctl surface; the C2D path drops it.
+    pub(super) fn manual_reconnect(&self, id: Uuid) -> Result<(), (&'static str, String)> {
         let (is_ssh, dead, asleep) = {
             let state = self.state.lock();
             match state.terminal(id) {
@@ -156,7 +189,7 @@ impl Core {
                     t.status == TermStatus::Dead,
                     t.asleep,
                 ),
-                None => return,
+                None => return Err(("not_found", format!("no terminal {id}"))),
             }
         };
         {
@@ -164,29 +197,47 @@ impl Core {
             // (or a double-click racing itself) must not stack entries.
             let mut map = self.reconnects.lock();
             if !manual_retry_allowed(is_ssh, dead, asleep, map.contains_key(&id)) {
-                return;
+                return Err(if !is_ssh {
+                    ("not_ssh", "retry is for ssh terminals; use restart".into())
+                } else if asleep {
+                    ("asleep", "terminal is asleep; wake it instead".into())
+                } else if !dead {
+                    ("running", "terminal is not dead".into())
+                } else {
+                    ("supervised", "a reconnect supervision is already running".into())
+                });
             }
+            let first = reconnect_backoff_after(0, true).unwrap_or(RECONNECT_BACKOFF[0]);
             log::info!(
-                "terminal {id}: manual ssh reconnect requested — first attempt in {:?}",
-                RECONNECT_BACKOFF[0]
+                "terminal {id}: manual ssh reconnect requested — first attempt in {first:?}, unlimited attempts until success or cancel"
             );
             map.insert(
                 id,
                 Reconnect {
                     attempt: 0,
-                    at: Instant::now() + RECONNECT_BACKOFF[0],
+                    at: Instant::now() + first,
                     watching: false,
+                    manual: true,
                 },
             );
         }
         self.set_reconnecting_flag(id, true);
+        self.set_retry_progress(
+            id,
+            0,
+            reconnect_backoff_after(0, true)
+                .unwrap_or(RECONNECT_BACKOFF[0])
+                .as_secs() as u32,
+        );
+        Ok(())
     }
 
     /// After `attempts_done` failed attempts: schedule the next backoff step
     /// or give up (terminal stays Dead; the ordinary Restore affordances and
-    /// boot-restore semantics apply from here).
-    pub(super) fn advance_reconnect(&self, id: Uuid, attempts_done: u8) {
-        let Some(delay) = reconnect_backoff_after(attempts_done) else {
+    /// boot-restore semantics apply from here). A manual ladder never gives
+    /// up — `reconnect_backoff_after` returns the 30s ceiling forever.
+    pub(super) fn advance_reconnect(&self, id: Uuid, attempts_done: u32, manual: bool) {
+        let Some(delay) = reconnect_backoff_after(attempts_done, manual) else {
             log::info!(
                 "terminal {id}: ssh reconnect gave up after {attempts_done} attempts"
             );
@@ -201,8 +252,13 @@ impl Core {
                 attempt: attempts_done,
                 at: Instant::now() + delay,
                 watching: false,
+                manual,
             },
         );
+        if manual {
+            // Honest lane: `retrying — attempt N · next in Ss`.
+            self.set_retry_progress(id, attempts_done, delay.as_secs() as u32);
+        }
     }
 
     /// The backoff engine, riding the 250ms flush tick. Fires due attempts
@@ -262,23 +318,35 @@ impl Core {
                             attempt: rc.attempt,
                             at: now,
                             watching: true,
+                            manual: rc.manual,
                         },
                     );
                 }
                 Some((TermStatus::Dead, _)) => {
                     let attempt = rc.attempt + 1;
-                    log::info!(
-                        "terminal {id}: ssh reconnect attempt {attempt}/{}",
-                        RECONNECT_BACKOFF.len()
-                    );
+                    if rc.manual {
+                        log::info!(
+                            "terminal {id}: ssh reconnect attempt {attempt} (manual, unlimited)"
+                        );
+                    } else {
+                        log::info!(
+                            "terminal {id}: ssh reconnect attempt {attempt}/{}",
+                            RECONNECT_BACKOFF.len()
+                        );
+                    }
                     self.reconnects.lock().insert(
                         id,
                         Reconnect {
                             attempt,
                             at: now,
                             watching: true,
+                            manual: rc.manual,
                         },
                     );
+                    if rc.manual {
+                        // In flight: `retrying — attempt N…` (next_s = 0).
+                        self.set_retry_progress(id, attempt, 0);
+                    }
                     // This pump rides the 250ms journal-fsync tick, and the
                     // launch may run a remote CLI-resume probe (a blocking
                     // sftp leg, 10-25s against an unreachable host — exactly
@@ -300,7 +368,7 @@ impl Core {
     /// launch does revive the terminal, the pre hook resolves supervision
     /// before this retry fires; if it was manually restored but hookless,
     /// the pump's Running arm re-adopts it.
-    pub(super) fn requeue_reconnect(&self, id: Uuid, attempt: u8) {
+    pub(super) fn requeue_reconnect(&self, id: Uuid, attempt: u32) {
         let mut map = self.reconnects.lock();
         if let Some(rc) = map.get_mut(&id) {
             if rc.watching && rc.attempt == attempt {
@@ -308,7 +376,8 @@ impl Core {
                 rc.watching = false;
                 rc.attempt = attempts_done;
                 rc.at = Instant::now()
-                    + reconnect_backoff_after(attempts_done).unwrap_or(RECONNECT_BACKOFF[0]);
+                    + reconnect_backoff_after(attempts_done, rc.manual)
+                        .unwrap_or(RECONNECT_BACKOFF[0]);
                 log::info!(
                     "terminal {id}: reconnect attempt {attempt} coalesced away — re-queued"
                 );
@@ -330,24 +399,66 @@ impl Core {
         }
     }
 
+    /// Is the current supervision (if any) the manual, unlimited ladder?
+    /// (probe_aware_launch's synchronous-failure accounting needs it — the
+    /// Reconnect fields are private to this module.)
+    pub(super) fn reconnect_is_manual(&self, id: Uuid) -> bool {
+        self.reconnects.lock().get(&id).map(|r| r.manual).unwrap_or(false)
+    }
+
     /// C2D::CancelReconnect / internal teardown: stop supervising. An
-    /// in-flight attempt keeps running (it is a real ssh process).
-    pub(super) fn cancel_reconnect(&self, id: Uuid) {
+    /// in-flight attempt keeps running (it is a real ssh process). Returns
+    /// whether a supervision existed (the ctl Kill path replies Done for a
+    /// dead-but-supervised target instead of the misleading `dead` refusal).
+    pub(super) fn cancel_reconnect(&self, id: Uuid) -> bool {
         if self.reconnects.lock().remove(&id).is_some() {
             log::info!("terminal {id}: ssh reconnect cancelled");
             self.set_reconnecting_flag(id, false);
+            true
+        } else {
+            false
         }
     }
 
     /// Flip the Snapshot-visible reconnecting flag, saving + broadcasting
-    /// only on change.
+    /// only on change. Dropping the flag also zeroes the manual-retry
+    /// progress fields — the SINGLE clear point for every supervision exit
+    /// (success, cancel, give-up, auth-wall stop, sleep, delete).
     pub(super) fn set_reconnecting_flag(&self, id: Uuid, on: bool) {
         let changed = {
             let mut state = self.state.lock();
             match state.terminal_mut(id) {
-                Some(t) if t.reconnecting != on => {
+                Some(t)
+                    if t.reconnecting != on
+                        || (!on && (t.retry_attempt != 0 || t.retry_next_s != 0)) =>
+                {
                     t.reconnecting = on;
+                    if !on {
+                        t.retry_attempt = 0;
+                        t.retry_next_s = 0;
+                    }
                     state.save_logged("reconnecting flag");
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            self.broadcast_snapshot();
+        }
+    }
+
+    /// F1: stamp the manual ladder's Snapshot-visible progress (`retrying —
+    /// attempt N · next in Ss`). Change-gated like the flag; only the manual
+    /// path calls it, so the auto lane keeps its plain "reconnecting…".
+    pub(super) fn set_retry_progress(&self, id: Uuid, attempt: u32, next_s: u32) {
+        let changed = {
+            let mut state = self.state.lock();
+            match state.terminal_mut(id) {
+                Some(t) if t.retry_attempt != attempt || t.retry_next_s != next_s => {
+                    t.retry_attempt = attempt;
+                    t.retry_next_s = next_s;
+                    state.save_logged("retry progress");
                     true
                 }
                 _ => false,
@@ -363,15 +474,40 @@ impl Core {
 mod tests {
     use super::*;
 
-    /// SSH auto-reconnect: the backoff table (2s/10s/30s then give up) and
-    /// the qualification truth table. The state machine's transitions ride
-    /// these two pure functions; the live path is probe `ssh_reconnect`.
+    /// SSH auto-reconnect: the backoff table (2s/10s/30s then give up for
+    /// the AUTO lane; 30s-ceiling UNLIMITED for the MANUAL lane — F1, the
+    /// user's "keep retrying until my server is back") and the qualification
+    /// truth table. The state machine's transitions ride these pure
+    /// functions; the live paths are probes `ssh_reconnect` and
+    /// `dead_retry_manual`.
     #[test]
     fn reconnect_backoff_and_qualification() {
-        assert_eq!(reconnect_backoff_after(0), Some(Duration::from_secs(2)));
-        assert_eq!(reconnect_backoff_after(1), Some(Duration::from_secs(10)));
-        assert_eq!(reconnect_backoff_after(2), Some(Duration::from_secs(30)));
-        assert_eq!(reconnect_backoff_after(3), None, "3 attempts then give up");
+        assert_eq!(reconnect_backoff_after(0, false), Some(Duration::from_secs(2)));
+        assert_eq!(reconnect_backoff_after(1, false), Some(Duration::from_secs(10)));
+        assert_eq!(reconnect_backoff_after(2, false), Some(Duration::from_secs(30)));
+        assert_eq!(
+            reconnect_backoff_after(3, false),
+            None,
+            "auto: 3 attempts then give up"
+        );
+
+        // F1 — the manual ladder shares the table's ramp, then NEVER gives
+        // up: every rung past it is the 30s ceiling.
+        assert_eq!(reconnect_backoff_after(0, true), Some(Duration::from_secs(2)));
+        assert_eq!(reconnect_backoff_after(1, true), Some(Duration::from_secs(10)));
+        assert_eq!(reconnect_backoff_after(2, true), Some(Duration::from_secs(30)));
+        assert_eq!(
+            reconnect_backoff_after(3, true),
+            Some(Duration::from_secs(30)),
+            "manual: ceiling, not give-up"
+        );
+        for n in [4u32, 7, 100, 10_000] {
+            assert_eq!(
+                reconnect_backoff_after(n, true),
+                Some(Duration::from_secs(30)),
+                "manual attempt {n} keeps the 30s ceiling — unlimited"
+            );
+        }
 
         let q = reconnect_qualifies;
         // The field case: unexpected 255 on a hooked ssh session.

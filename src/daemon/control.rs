@@ -204,7 +204,7 @@ impl Core {
                     self.ctl_err(client, req_id, "not_found", format!("no terminal {id}"));
                     return;
                 }
-                self.cancel_reconnect(id);
+                let cancelled = self.cancel_reconnect(id);
                 // Killer cloned under the sessions lock, TerminateProcess
                 // outside it (the C2D::Input if-let-temporary class).
                 let killer = self.sessions.lock().get(&id).map(|s| s.killer.clone_killer());
@@ -214,6 +214,9 @@ impl Core {
                         let _ = k.kill();
                         self.ctl_reply(client, req_id, CtlBody::Done);
                     }
+                    // F1: a dead-but-SUPERVISED target really was killed —
+                    // the retry ladder stopped. Done, not the `dead` lie.
+                    None if cancelled => self.ctl_reply(client, req_id, CtlBody::Done),
                     None => self.ctl_err(client, req_id, "dead", "terminal is not running".into()),
                 }
             }
@@ -234,6 +237,15 @@ impl Core {
                         self.launch_from_conn(id);
                         self.ctl_reply(client, req_id, CtlBody::Done);
                     }
+                }
+            }
+            CtlRequest::Retry { id, force_self: _ } => {
+                // F1 (ssh-reestablish): the C2D::RetryReconnect path with a
+                // typed reply — unlimited manual supervision until success
+                // or `tc kill` / the GUI's Cancel.
+                match self.manual_reconnect(id) {
+                    Ok(()) => self.ctl_reply(client, req_id, CtlBody::Done),
+                    Err((code, msg)) => self.ctl_err(client, req_id, code, msg),
                 }
             }
             CtlRequest::Delete { id, force_self: _ } => {

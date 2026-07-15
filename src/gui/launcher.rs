@@ -1785,6 +1785,8 @@ mod tests {
             asleep: false,
             reconnecting: false,
             nested_chain: None,
+            retry_attempt: 0,
+            retry_next_s: 0,
         }
     }
 

@@ -19,6 +19,8 @@ pub mod perf;
 pub mod procinfo;
 mod reconnect;
 use reconnect::Reconnect;
+mod reestablish;
+use reestablish::Reestablish;
 mod remote_probe;
 pub mod serialize;
 mod session;
@@ -526,6 +528,13 @@ pub struct Core {
     /// See `maybe_schedule_reconnect` for the qualification rules and
     /// `pump_reconnects` (250ms flush tick) for the backoff engine.
     reconnects: Mutex<HashMap<Uuid, Reconnect>>,
+    /// F2 nested-chain auto re-establish supervisions (LEAF lock): terminal
+    /// → step state. Armed by launch() for a hooked spawn carrying a
+    /// nested-shell breadcrumb (opt-out: ShellCfg.auto_reestablish); the
+    /// first token-checked `pre` types the first recorded chain command,
+    /// `pump_reestablish` (250ms flush tick) gates each further step on
+    /// output quiescence and ABORTS on any credential-prompt tail line.
+    reestablish: Mutex<HashMap<Uuid, Reestablish>>,
     /// Remote CLI-resume probe bookkeeping (LEAF locks inside): the §4.6
     /// auth-dead cache + the 30s listing cooldown. Arc so probe worker
     /// threads (M0 snapshot legs) borrow no Core.
@@ -997,6 +1006,12 @@ impl Core {
         // (the common return-to-prompt can be a cwd-refresh pre with no open
         // block).
         if is_pre {
+            // F2: the settled hooked prompt is the chain re-establish
+            // trigger (AwaitPrompt → type step 0) — and, mid-chain, an OUTER
+            // prompt returning means the nested step collapsed (abort).
+            // Runs BEFORE the breadcrumb clear below: the steps were stashed
+            // at launch, but the abort semantics read the entry's phase.
+            self.reestablish_on_pre(id);
             self.clear_nested_chain(id, "hooked prompt returned");
         }
         let Some((epoch, recs, snap)) = outcome else { return };
@@ -1159,6 +1174,9 @@ impl Core {
             }
         }
         self.maybe_schedule_reconnect(id, code, expected, hooks_were_live);
+        // F2: a dying session ends any in-flight chain re-establish (the
+        // relaunch re-arms from the persisted breadcrumb when one survives).
+        self.cancel_reestablish(id, "session exited");
         // Flush this terminal's journal so the tail survives a crash. No
         // in-stream "process exited" marker: the sidebar status dot and the
         // Restore affordance already say it, and any seam text would survive
@@ -1250,7 +1268,7 @@ impl Core {
     /// ever will (a spawned-but-dying attempt is advanced by
     /// maybe_schedule_reconnect when it exits). That accounting must run
     /// with the launch, wherever the launch runs.
-    fn probe_aware_launch(self: &Arc<Self>, id: Uuid, reconnect_attempt: Option<u8>) {
+    fn probe_aware_launch(self: &Arc<Self>, id: Uuid, reconnect_attempt: Option<u32>) {
         let run = move |core: &Arc<Self>| {
             core.launch(id);
             if let Some(attempt) = reconnect_attempt {
@@ -1261,7 +1279,8 @@ impl Core {
                         .is_none_or(|t| t.status == TermStatus::Dead)
                 };
                 if still_dead {
-                    core.advance_reconnect(id, attempt);
+                    let manual = core.reconnect_is_manual(id);
+                    core.advance_reconnect(id, attempt, manual);
                 }
             }
         };
@@ -1542,6 +1561,23 @@ impl Core {
         // spawn. Keyed on the persisted breadcrumb: a bare chain without an
         // attributed identity still notices (variant C); a nested identity
         // without its chain (not producible) would stay quiet.
+        //
+        // F2 (ssh-reestablish): when this spawn is HOOKED and the terminal
+        // opted in (default ON), the recorded chain commands are auto-typed
+        // once the hooked prompt settles — the preface then says so (the
+        // "auto" variants) and keeps the inner-CLI resume hint (the CLI is
+        // never auto-resumed across the boundary, I1 unchanged). The
+        // credential-abort/quiescence gates live in reestablish.rs.
+        let reestablish_steps: Vec<String> = meta
+            .nested_chain
+            .as_ref()
+            .map(|c| c.cmds.clone())
+            .unwrap_or_default();
+        let auto_reestablish = reestablish::reestablish_should_arm(
+            !reestablish_steps.is_empty(),
+            hooked,
+            meta.shell_cfg.as_ref().is_none_or(|c| c.auto_reestablish),
+        );
         let nested_notice: Option<String> = meta.nested_chain.as_ref().map(|chain| {
             log::info!(
                 "terminal {id}: nested-shell breadcrumb present — shell-only restore (no auto-resume across a privilege boundary)"
@@ -1549,6 +1585,7 @@ impl Core {
             tracker::nested_restore_notice(
                 chain,
                 meta.inner_cli.as_ref().filter(|c| c.nested),
+                auto_reestablish,
             )
         });
 
@@ -1808,10 +1845,16 @@ impl Core {
                     // like the ambiguous line below (mutually exclusive with
                     // it by composition: a nested identity never reaches the
                     // ambiguous arm), never the mirror/PTY stream, never
-                    // keystrokes.
+                    // keystrokes (the F2 auto-typing lane is gated + armed
+                    // separately below and types only the recorded chain).
                     if let Some(s) = self.sessions.lock().get(&id) {
                         s.preface.lock().push_info_line(text);
                     }
+                }
+                if auto_reestablish {
+                    // F2: arm the chain re-establish — the first token-
+                    // checked `pre` (hooked prompt settled) types step 0.
+                    self.arm_reestablish(id, reestablish_steps.clone());
                 }
                 if let Some(adapter) = &ambiguous_adapter {
                     // A CLI session was running here but its identity was
@@ -2709,6 +2752,8 @@ impl Core {
                 asleep: false,
                 reconnecting: false,
                 nested_chain: None,
+            retry_attempt: 0,
+            retry_next_s: 0,
             });
             if let Err(e) = state.save() {
                 drop(state);
@@ -2726,6 +2771,7 @@ impl Core {
     /// longer resurrect the journal). Shared legacy/controller.
     fn delete_terminal_inner(&self, id: Uuid) {
         self.reconnects.lock().remove(&id);
+        self.reestablish.lock().remove(&id);
         self.mutate(|s| s.terminals.retain(|t| t.id != id));
         // F1: every parked waiter for this id (ALL kinds — Exit included)
         // fails "deleted" NOW. on_exit early-returns for a deleted id, so
@@ -3315,6 +3361,11 @@ impl Core {
                 client.attached.lock().remove(&id);
             }
             C2D::Input { id, bytes } => {
+                // F2: the user typing takes the shell back — any in-flight
+                // nested-chain re-establish stops instantly (our own step
+                // writes go through the session writer directly, never this
+                // arm, so the automation can't cancel itself).
+                self.cancel_reestablish(id, "user input");
                 // Clone the writer Arc out and write OUTSIDE the sessions
                 // mutex (SubmitCommand's pattern): a full ConPTY input pipe
                 // (app stopped reading stdin) blocks write_all indefinitely,
@@ -3470,10 +3521,13 @@ impl Core {
                 self.cancel_reconnect(id);
             }
             C2D::RetryReconnect { id } => {
-                // Dead-relaunch fix b (proto 13): user-initiated bounded
-                // retry — same supervision, entered by explicit consent
-                // instead of the hooks_were_live auto-gate.
-                self.manual_reconnect(id);
+                // Dead-relaunch fix b (proto 13) + ssh-reestablish F1:
+                // user-initiated retry — same supervision, entered by
+                // explicit consent instead of the hooks_were_live auto-gate,
+                // UNLIMITED attempts (30s ceiling) until success or Cancel.
+                // The typed refusal is for the ctl surface; a stale GUI
+                // click's refusal is simply inert (idempotent by gate).
+                let _ = self.manual_reconnect(id);
             }
             C2D::SetAutoReconnect { id, on } => {
                 self.mutate(|s| {
@@ -3496,6 +3550,9 @@ impl Core {
     /// output) lands inside it; the next token-checked `pre` closes it via
     /// the existing on_pre path (exit None — honest, D7).
     fn submit_command(&self, client: &Arc<ClientConn>, id: Uuid, cmd: String, write: bool) {
+        // F2: a composer submission is the user driving the shell — any
+        // in-flight nested-chain re-establish stops.
+        self.cancel_reestablish(id, "user input");
         if let Err(msg) = validate_submit_command(&cmd) {
             log::warn!("SubmitCommand for {id} refused: {msg}");
             if let Some(f) = frame_bytes(&D2C::Error {
@@ -4496,6 +4553,7 @@ pub fn run() -> anyhow::Result<()> {
         spawn_times: Mutex::new(HashMap::new()),
         expected_exits: Mutex::new(HashSet::new()),
         reconnects: Mutex::new(HashMap::new()),
+        reestablish: Mutex::new(HashMap::new()),
         probe_rt: Arc::new(remote_probe::Runtime::new()),
         probing: Mutex::new(HashSet::new()),
         hook_homes: Mutex::new(HashMap::new()),
@@ -4588,6 +4646,9 @@ pub fn run() -> anyhow::Result<()> {
                 // SSH auto-reconnect backoff engine (no-op while the map is
                 // empty — one lock probe per tick).
                 flush_core.pump_reconnects();
+                // F2 nested-chain re-establish step gating (same no-op
+                // fast path: one lock probe while the map is empty).
+                flush_core.pump_reestablish();
                 // pw5-F3: coalesced state.json save for relabel-class
                 // changes (live_cwd folds, tracker verdicts). Serialize AND
                 // write stay under the state mutex — totally ordered with
@@ -4901,6 +4962,8 @@ mod sync_tests {
             asleep: false,
             reconnecting: false,
             nested_chain: None,
+            retry_attempt: 0,
+            retry_next_s: 0,
         };
         assert!(should_boot_restore(&t), "awake auto_restore terminal restores");
         t.asleep = true;

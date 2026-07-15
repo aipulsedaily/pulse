@@ -187,6 +187,8 @@ const USAGE: &str = r#"pulse-ctl — Pulse controller CLI (JSON out)
               | output <pattern> [--regex] [--from <off>]) [--timeout <secs=30>]
   tc kill     <term> [--force-self]
   tc restart  <term> [--force-self]
+  tc retry    <term>                             (dead ssh: keep reconnecting
+              with backoff, unlimited, until the host answers; stop via kill)
   tc sleep    (<term> [--force] [--force-self] | --folder <name> [--force])
   tc wake     (<term> | --folder <name>)
   tc delete   <term> --yes [--force-self]
@@ -283,6 +285,12 @@ pub enum Cmd {
         force_self: bool,
     },
     Restart {
+        term: String,
+        force_self: bool,
+    },
+    /// F1 (ssh-reestablish): unlimited manual reconnect supervision on a
+    /// dead ssh terminal.
+    Retry {
         term: String,
         force_self: bool,
     },
@@ -599,17 +607,17 @@ pub fn parse_args(args: &[String]) -> Result<Cmd, CliErr> {
                 timeout_secs,
             })
         }
-        "kill" | "restart" => {
+        "kill" | "restart" | "retry" => {
             let term = rest
                 .first()
                 .filter(|a| !a.starts_with("--"))
                 .ok_or_else(|| usage(format!("{verb} needs <term>")))?
                 .to_string();
             let force_self = has_flag("--force-self");
-            Ok(if verb == "kill" {
-                Cmd::Kill { term, force_self }
-            } else {
-                Cmd::Restart { term, force_self }
+            Ok(match verb {
+                "kill" => Cmd::Kill { term, force_self },
+                "restart" => Cmd::Restart { term, force_self },
+                _ => Cmd::Retry { term, force_self },
             })
         }
         "sleep" | "wake" => {
@@ -1400,6 +1408,20 @@ fn execute(cmd: Cmd) -> Result<(), CliErr> {
             let id = resolve_term(&mut conn, &term)?;
             self_check(&conn, id, force_self)?;
             match conn.call(CtlRequest::Restart { id, force_self })? {
+                CtlBody::Done => {
+                    print_json(&serde_json::json!({"v":1,"ok":true}));
+                    Ok(())
+                }
+                body => Err(body_err(body)),
+            }
+        }
+        Cmd::Retry { term, force_self } => {
+            // F1: keep-retrying supervision (ssh, dead) — unlimited backoff
+            // to a 30s ceiling until the host answers; stop via the GUI's
+            // Cancel or `tc kill`.
+            let mut conn = connect()?;
+            let id = resolve_term(&mut conn, &term)?;
+            match conn.call(CtlRequest::Retry { id, force_self })? {
                 CtlBody::Done => {
                     print_json(&serde_json::json!({"v":1,"ok":true}));
                     Ok(())
