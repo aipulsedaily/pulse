@@ -612,6 +612,103 @@ fn case_restore() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Dead-relaunch (fix a wiring, daemon side): a Custom terminal that DIES on
+/// its own (`exit 1` — the reviewer's timed-out-ssh stand-in, no WSL needed)
+/// refuses input while Dead with the typed `dead` code, never raises
+/// reconnect supervision (not ssh), and RestartTerminal — the one verb
+/// behind Enter / body-click / `↻ Restore` — re-runs the SAME command in
+/// the SAME terminal id with the journal preserved (the second lifetime's
+/// output lands below the first's).
+fn case_dead_relaunch() -> anyhow::Result<()> {
+    let name = "__probe_dead_relaunch__";
+    let mut c = Conn::open()?;
+    let _ = c.first_snapshot()?;
+    c.send(&C2D::CreateTerminal {
+        spec: NewTerminal {
+            name: name.into(),
+            folder: None,
+            kind: TermKind::Custom,
+            program: "powershell.exe".into(),
+            args: vec![
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-Command".into(),
+                "Write-Output DEAD_RELAUNCH_XYZZY; exit 1".into(),
+            ],
+            cwd: "C:\\".into(),
+            already_launched: false,
+            shell_cfg: None,
+        },
+    })?;
+    // The command exits 1 on its own — wait straight for Dead (the Running
+    // window is sub-second, but every broadcast still queues on this conn).
+    let state = c.snapshot_until(20, |s| {
+        s.terminals
+            .iter()
+            .any(|t| t.name == name && t.status == TermStatus::Dead)
+    })?;
+    let t = state.terminals.iter().find(|t| t.name == name).unwrap();
+    let id = t.id;
+    anyhow::ensure!(
+        !t.reconnecting,
+        "a dead non-ssh Custom must never raise reconnect supervision"
+    );
+
+    // TEST 1 — input is REFUSED while Dead (the controller path carries the
+    // typed refusal; the GUI's C2D::Input to a dead session is a silent
+    // drop by design — no session writer exists).
+    let master = master_token()?;
+    let mut ctl = Conn::open_ctl(&master, None)?;
+    match ctl.ctl(
+        9700,
+        CtlRequest::SendRaw {
+            id,
+            bytes: b"echo hi\r".to_vec(),
+            force_self: false,
+        },
+        15,
+    )? {
+        CtlBody::Err { code, .. } => {
+            anyhow::ensure!(code == "dead", "want the `dead` refusal, got `{code}`")
+        }
+        other => anyhow::bail!("dead input must refuse, got {other:?}"),
+    }
+
+    // TEST 2 — RestartTerminal: the same id flips Dead → Running (the
+    // Running broadcast queues on this conn even though the command dies
+    // again in under a second)…
+    c.send(&C2D::RestartTerminal { id })?;
+    c.snapshot_until(15, |s| {
+        s.terminals
+            .iter()
+            .any(|t| t.id == id && t.status == TermStatus::Running)
+    })?;
+    // …re-dies (it always exits 1 — same as a still-down ssh host)…
+    c.snapshot_until(20, |s| {
+        s.terminals
+            .iter()
+            .any(|t| t.id == id && t.status == TermStatus::Dead)
+    })?;
+    // Let the exit drain land in the journal (case_restore's settle wait).
+    std::thread::sleep(Duration::from_millis(1500));
+    // …and the journal is PRESERVED across the relaunch: both lifetimes'
+    // markers in one scrollback, same terminal identity. Read via the
+    // journal-truth ReadTail (a dead-terminal Replay is a screen-sized
+    // reconstruction — the first lifetime's marker can scroll out of that
+    // window while sitting safely in the journal).
+    let tail = match ctl.ctl(9701, CtlRequest::ReadTail { id, lines: 300 }, 15)? {
+        CtlBody::Tail { lines, .. } => lines.join("\n"),
+        other => anyhow::bail!("ReadTail failed: {other:?}"),
+    };
+    let hits = tail.matches("DEAD_RELAUNCH_XYZZY").count();
+    anyhow::ensure!(
+        hits >= 2,
+        "relaunch must append below the preserved journal (want 2+ markers, got {hits}); tail:\n{tail}"
+    );
+    delete_terminal(&mut c, id);
+    Ok(())
+}
+
 fn case_remnant() -> anyhow::Result<()> {
     let mut c = Conn::open()?;
     let _ = c.first_snapshot()?;
@@ -7267,6 +7364,48 @@ fn case_ssh_reconnect() -> anyhow::Result<()> {
             t.map(|t| &t.status)
         );
     }
+    rid += 1;
+
+    // ── Dead-relaunch fix b: MANUAL bounded retry (C2D::RetryReconnect,
+    // proto 13). The tab was DELIBERATELY killed, so the auto path
+    // correctly refused supervision — `Retry ▸` is the user overriding
+    // that by explicit consent (no hooks_were_live gate on the manual
+    // entry). Round 1: enter supervision, cancel inside the 2s
+    // pre-attempt window, verify a clean stop (flag down, still dead
+    // after the would-be first rung).
+    c.send(&C2D::RetryReconnect { id })?;
+    c.snapshot_until(10, |s| {
+        s.terminals.iter().any(|t| t.id == id && t.reconnecting)
+    })?;
+    c.send(&C2D::CancelReconnect { id })?;
+    c.snapshot_until(10, |s| {
+        s.terminals.iter().any(|t| t.id == id && !t.reconnecting)
+    })?;
+    std::thread::sleep(Duration::from_millis(3500));
+    rid += 1;
+    if let CtlBody::Listing { terminals, .. } = ctl.ctl(rid, CtlRequest::List, 20)? {
+        let t = terminals.iter().find(|t| t.id == id);
+        anyhow::ensure!(
+            t.is_some_and(|t| t.status == "dead"),
+            "cancelled manual retry must stop the ladder cleanly: {:?}",
+            t.map(|t| &t.status)
+        );
+    }
+    // Round 2: retry again and let it run — the WSL stand-in host is
+    // alive, so the first attempt reconnects and the fresh link's
+    // token-checked pre resolves supervision (flag drops on its own).
+    let log1 = daemon_log_len();
+    c.send(&C2D::RetryReconnect { id })?;
+    c.snapshot_until(60, |s| {
+        s.terminals
+            .iter()
+            .any(|t| t.id == id && t.status == TermStatus::Running && !t.reconnecting)
+    })?;
+    await_hooked_prompt(&mut ctl, &mut rid, id, 90)?;
+    anyhow::ensure!(
+        log_since(log1).contains("manual ssh reconnect requested"),
+        "no manual-retry scheduling line in daemon.log"
+    );
 
     ensure_no_new_panics(log0)?;
     delete_terminal(&mut c, id);
@@ -10275,6 +10414,7 @@ pub fn run(case: Option<&str>) -> anyhow::Result<()> {
     let cases: Vec<ProbeCase> = vec![
         ("basic", case_basic),
         ("restore", case_restore),
+        ("dead_relaunch", case_dead_relaunch),
         ("remnant", case_remnant),
         ("banner", case_banner),
         ("folders", case_folders),
