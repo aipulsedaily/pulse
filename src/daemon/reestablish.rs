@@ -43,6 +43,12 @@ enum Phase {
     /// Armed at spawn; waiting for the outer shell's first token-checked
     /// `pre` (hooked prompt settled) before typing step 0.
     AwaitPrompt,
+    /// The prompt witness landed; the step types on the next pump tick
+    /// after `at`. The `pre` hook fires from PROMPT_COMMAND BEFORE PS1
+    /// paints — typing instantly makes the echo land on a bare line above
+    /// the prompt (field-observed); one short beat lets the prompt render
+    /// so the typed command reads exactly like the user typing it.
+    PendingSend { step: usize, at: Instant },
     /// A step was typed; watching the journal for quiescence.
     Watch {
         sent: Instant,
@@ -50,6 +56,10 @@ enum Phase {
         last_change: Instant,
     },
 }
+
+/// How long after the prompt witness before the step is typed (one pump
+/// tick's grace for the prompt paint).
+const SEND_GRACE: Duration = Duration::from_millis(250);
 
 /// What the watcher should do with a settled/unsettled step — pure, so the
 /// step gating and password-abort are table-testable without a PTY.
@@ -163,29 +173,32 @@ impl Core {
     /// nested world collapsed (e.g. `sudo` refused); abort the remainder
     /// instead of typing chain commands at the outer prompt.
     pub(super) fn reestablish_on_pre(&self, id: Uuid) {
-        let action = {
-            let mut map = self.reestablish.lock();
-            match map.get_mut(&id) {
-                Some(entry) => match entry.phase {
-                    Phase::AwaitPrompt => {
-                        // Phase moves to Watch inside send_reestablish_step
-                        // (it needs the post-write journal length); mark the
-                        // send outside the lock.
-                        Some(entry.idx)
-                    }
-                    Phase::Watch { .. } => {
-                        map.remove(&id);
-                        log::info!(
-                            "terminal {id}: nested chain re-establish stopped — outer prompt returned mid-chain (the nested step did not hold)"
-                        );
-                        None
-                    }
-                },
-                None => None,
+        let mut map = self.reestablish.lock();
+        if let Some(entry) = map.get_mut(&id) {
+            match entry.phase {
+                Phase::AwaitPrompt => {
+                    // Type on the next pump tick (SEND_GRACE) so the prompt
+                    // finishes painting under the echo.
+                    entry.phase = Phase::PendingSend {
+                        step: entry.idx,
+                        at: Instant::now() + SEND_GRACE,
+                    };
+                }
+                // A second pre while the send is still pending (e.g. an
+                // extra prompt refresh) just re-bases the grace beat.
+                Phase::PendingSend { step, .. } => {
+                    entry.phase = Phase::PendingSend {
+                        step,
+                        at: Instant::now() + SEND_GRACE,
+                    };
+                }
+                Phase::Watch { .. } => {
+                    map.remove(&id);
+                    log::info!(
+                        "terminal {id}: nested chain re-establish stopped — outer prompt returned mid-chain (the nested step did not hold)"
+                    );
+                }
             }
-        };
-        if let Some(idx) = action {
-            self.send_reestablish_step(id, idx);
         }
     }
 
@@ -237,23 +250,37 @@ impl Core {
     /// `pump_reconnects`. Watches quiescence, aborts on credential prompts /
     /// timeouts / dead sessions, and types the next step when settled.
     pub(super) fn pump_reestablish(self: &Arc<Self>) {
-        let watching: Vec<(Uuid, Instant, u64, Instant, bool)> = {
+        /// A Watch-phase row: (id, sent, last_len, last_change, has_more).
+        type WatchRow = (Uuid, Instant, u64, Instant, bool);
+        let now = Instant::now();
+        let (due_sends, watching): (Vec<(Uuid, usize)>, Vec<WatchRow>) = {
             let map = self.reestablish.lock();
             if map.is_empty() {
                 return;
             }
-            map.iter()
+            let sends = map
+                .iter()
+                .filter_map(|(id, e)| match e.phase {
+                    Phase::PendingSend { step, at } if now >= at => Some((*id, step)),
+                    _ => None,
+                })
+                .collect();
+            let watches = map
+                .iter()
                 .filter_map(|(id, e)| match e.phase {
                     Phase::Watch {
                         sent,
                         last_len,
                         last_change,
                     } => Some((*id, sent, last_len, last_change, e.idx + 1 < e.steps.len())),
-                    Phase::AwaitPrompt => None,
+                    _ => None,
                 })
-                .collect()
+                .collect();
+            (sends, watches)
         };
-        let now = Instant::now();
+        for (id, step) in due_sends {
+            self.send_reestablish_step(id, step);
+        }
         for (id, sent, last_len, last_change, has_more) in watching {
             // A dead/asleep terminal ends the chain (its own relaunch path
             // re-arms from the persisted breadcrumb if one survives).
