@@ -270,6 +270,16 @@ pub struct ShellCfg {
     /// streams must not grow motd bytes uninvited). Restores ignore it.
     #[serde(default)]
     pub wsl_motd: bool,
+    /// F2 (ssh-reestablish): after a relaunch/reconnect of a terminal that
+    /// carried a nested-shell breadcrumb (`sudo su`…), auto-type the
+    /// recorded chain commands once the hooked prompt settles — each step
+    /// gated on output quiescence and ABORTED the instant a credential
+    /// prompt appears (credentials are never typed; the honest preface
+    /// covers the rest). Default ON (the user's ask); the opt-out. Appended
+    /// with serde-default (fields are append-only-with-serde-default
+    /// forever).
+    #[serde(default = "default_true")]
+    pub auto_reestablish: bool,
 }
 
 impl Default for ShellCfg {
@@ -279,6 +289,7 @@ impl Default for ShellCfg {
             remote_hooks: true,
             auto_reconnect: true,
             wsl_motd: false,
+            auto_reestablish: true,
         }
     }
 }
@@ -450,6 +461,21 @@ pub struct TerminalMeta {
     /// frames, no proto bump).
     #[serde(default)]
     pub nested_chain: Option<NestedChain>,
+    /// F1 persistent-retry surfacing (ssh-reestablish): attempts already
+    /// FIRED by the current MANUAL reconnect supervision (0 = auto lane or
+    /// none — the lane then shows the plain "reconnecting…"). Presentation-
+    /// only, rides the Snapshot like `reconnecting`; runtime truth lives in
+    /// Core::reconnects. Force-reset by `SharedState::load()`. APPENDED
+    /// after `nested_chain` (bincode Snapshot field order is wire order;
+    /// same-exe rule; no proto bump).
+    #[serde(default)]
+    pub retry_attempt: u32,
+    /// Seconds until the manual supervision's next attempt fires (0 = an
+    /// attempt is in flight right now, or no manual supervision). Static per
+    /// rung — honest "next in Ns", not a live countdown. Same lifecycle and
+    /// wire rules as `retry_attempt`, appended after it.
+    #[serde(default)]
+    pub retry_next_s: u32,
 }
 
 /// Derived presentation of (status, asleep) — NEVER persisted, NEVER on the
@@ -712,6 +738,8 @@ impl SharedState {
                     for t in &mut s.terminals {
                         t.status = TermStatus::Dead;
                         t.reconnecting = false;
+                        t.retry_attempt = 0;
+                        t.retry_next_s = 0;
                     }
                     (s, true)
                 }
@@ -941,6 +969,8 @@ mod shell_family_tests {
             asleep: false,
             reconnecting: false,
             nested_chain: None,
+            retry_attempt: 0,
+            retry_next_s: 0,
         };
         // WSL, pre-first-hook: the `--cd ~` truth.
         assert_eq!(meta.display_cwd(), "~");
@@ -1014,6 +1044,8 @@ mod shell_family_tests {
             asleep: false,
             reconnecting: false,
             nested_chain: None,
+            retry_attempt: 0,
+            retry_next_s: 0,
         };
         meta.nested_chain = Some(NestedChain {
             cmds: vec!["sudo su".into(), "su - deploy".into()],
@@ -1094,6 +1126,8 @@ mod shell_family_tests {
             asleep: false,
             reconnecting: false,
             nested_chain: None,
+            retry_attempt: 0,
+            retry_next_s: 0,
         };
         // Never launched: --session-id regardless of disk state.
         let (_, args) = meta.launch_command();

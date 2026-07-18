@@ -20,7 +20,7 @@ pub const MAX_FRAME: u32 = 32 * 1024 * 1024;
 /// This build's protocol generation — the single source for `DaemonInfo::
 /// proto` and `C2D::Hello2::proto`. History lives at the `proto:` field in
 /// `daemon::run` (src\daemon\mod.rs).
-pub const PROTO: u32 = 12;
+pub const PROTO: u32 = 13;
 
 /// Client -> Daemon
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,6 +190,24 @@ pub enum C2D {
     /// APPENDED at the enum's end (the C2D tail; proto 11 → 12): bincode
     /// encodes variants positionally.
     Hello2 { token: String, proto: u32 },
+
+    /// MANUAL SSH RETRY (proto 13, dead-relaunch fix b): user-initiated
+    /// bounded reconnect for a Dead ssh terminal — the Dead lane's
+    /// `Retry ▸`. Enters the EXISTING reconnect.rs supervision (2s/10s/30s
+    /// backoff, capped at 3 attempts, cancellable via CancelReconnect)
+    /// WITHOUT the `hooks_were_live` auto-qualification: the automatic
+    /// path keeps that gate untouched (auth-wall hosts must never
+    /// blind-retry AUTOMATICALLY), while an explicit user click is its own
+    /// consent — and the 30s-no-hooks interactive-auth stop still applies
+    /// to every attempt, so a manual loop can never hammer a password
+    /// prompt either. No-op for non-ssh / asleep / non-Dead /
+    /// already-supervised terminals. The GUI gates the send on the daemon
+    /// generation (an older daemon drops the connection on an undecodable
+    /// C2D variant — the color-tag/sleep skew pattern).
+    ///
+    /// APPENDED at the enum's end (the C2D tail; proto 12 → 13): bincode
+    /// encodes variants positionally.
+    RetryReconnect { id: Uuid },
 }
 
 /// One session's dimensions as written by `C2D::DebugDump`. The three pairs
@@ -484,6 +502,18 @@ pub enum CtlRequest {
         /// The session id as reported; uuid shape validated daemon-side.
         session_id: String,
     },
+    /// F1 (ssh-reestablish): `tc retry <term>` — user-initiated ssh
+    /// reconnect supervision on a dead ssh terminal (Core::manual_reconnect,
+    /// the exact C2D::RetryReconnect path): 2s/10s/30s backoff, then the 30s
+    /// ceiling FOREVER — unlimited attempts until the host answers, the user
+    /// cancels, or an attempt sits 30s at an interactive auth wall.
+    /// Refusals: not_found | not_ssh | running | asleep | supervised.
+    ///
+    /// APPENDED at the enum's end: bincode encodes variants positionally.
+    Retry {
+        id: Uuid,
+        force_self: bool,
+    },
 }
 
 /// The scope bits a request needs. Token* need FULL (scoped tokens can never
@@ -500,7 +530,7 @@ pub fn required_scope(req: &CtlRequest) -> u32 {
         // pin / inner_cli), the same metadata class MANAGE already guards.
         CreateTerminal { .. } | CreateFolder { .. } | Kill { .. } | Restart { .. }
         | Delete { .. } | Sleep { .. } | Wake { .. } | SleepFolder { .. }
-        | WakeFolder { .. } | ReportCliSession { .. } => SCOPE_MANAGE,
+        | WakeFolder { .. } | ReportCliSession { .. } | Retry { .. } => SCOPE_MANAGE,
         TokenCreate { .. } | TokenRevoke { .. } | TokenList => SCOPE_FULL,
     }
 }
@@ -816,6 +846,11 @@ mod ctl_tests {
                 event: "SessionStart".into(),
                 source: "clear".into(),
                 session_id: Uuid::nil().to_string(),
+            },
+            // F1: retry spawns processes — Kill/Restart's exact class.
+            CtlRequest::Retry {
+                id,
+                force_self: false,
             },
         ];
         for r in &manage {

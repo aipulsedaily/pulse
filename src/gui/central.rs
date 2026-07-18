@@ -195,6 +195,17 @@ impl App {
         }
 
         let hooked = self.hooked(id);
+        // Dead-relaunch fix a: the strip gate widens from `hooked` to
+        // `hooked || Dead || reconnecting` (composer::strip_eligible — one
+        // pure predicate, same everywhere: this card split, the strip
+        // itself, layout_for's geometry) so a NEVER-HOOKED dead ssh tab
+        // still gets the SessionEnded `↻ Restore ⏎` affordance. The
+        // hookless-eligible tab needs its composer/blocks mirrors minted
+        // here (the Blocks-sync creation path only runs for hooked spawns).
+        let strip_on = self.strip_eligible(id);
+        if strip_on && !hooked {
+            self.ensure_strip_mirrors(id);
+        }
         let running =
             self.state.terminal(id).map(|t| t.status) == Some(TermStatus::Running);
         let overlay_open = self.modal.is_some()
@@ -209,9 +220,11 @@ impl App {
 
         // Composer signal pump for the selected terminal (P3 §2.4): gate
         // eval + settle/hold wakeup (the sanctioned self-scheduled repaints).
+        // Runs for every strip-eligible terminal (fix a): a hookless dead
+        // tab needs the tick so its mode derives Raw(Dead) → SessionEnded.
         let mut comp_active = false;
         let now = Instant::now();
-        if hooked {
+        if strip_on {
             // Pending prompt-end upgrade (v0.1.1 quiescence capture): must
             // resolve BEFORE the tick/gate read it; an idle terminal needs
             // the scheduled wakeup (no output frame will arrive to resolve
@@ -336,7 +349,7 @@ impl App {
         // the same `strip_hidden` question `layout_for` answered for the
         // commit/heal resizes above (single source; computed here, before
         // the long-lived search borrow below).
-        let strip_collapsed = hooked && self.strip_collapsed(id);
+        let strip_collapsed = strip_on && self.strip_collapsed(id);
         let (sre, curm) = match &mut self.search {
             Some(s) => (
                 s.regex.as_mut(),
@@ -421,7 +434,7 @@ impl App {
         // never disagree; the ±rows resize rode the debounced commit /
         // corrective-heal machinery above).
         let full = ui.available_rect_before_wrap();
-        let grid_area = if hooked && !strip_collapsed {
+        let grid_area = if strip_on && !strip_collapsed {
             Rect::from_min_max(
                 full.min,
                 Pos2::new(full.max.x, full.max.y - composer::STRIP_H),
@@ -437,7 +450,7 @@ impl App {
                 })
             });
             if let Some(backend) = self.terms.get_mut(&id) {
-                let (resp, out) = if hooked {
+                let (resp, out) = if strip_on {
                     let mut child = ui.new_child(
                         UiBuilder::new().max_rect(grid_area).layout(*ui.layout()),
                     );
@@ -542,6 +555,20 @@ impl App {
             self.send_input(id, write);
         }
         if grid_clicked {
+            // Dead-relaunch fix a: a PLAIN primary click anywhere on a dead
+            // terminal's body relaunches it — the same RestartTerminal the
+            // strip's ↻ Restore sends. Plainly-dead only: asleep keeps its
+            // explicit Wake, reconnecting keeps its supervision (their
+            // click ownership is untouched), and a modifier click stays
+            // with its own gesture (Ctrl+click = link open; drag-select
+            // never reports clicked()). Never fires on a running terminal.
+            let dead_plain = self.state.terminal(id).is_some_and(|t| {
+                t.status == TermStatus::Dead && !t.asleep && !t.reconnecting
+            });
+            let plain_mods = ui.ctx().input(|i| i.modifiers.is_none());
+            if dead_plain && plain_mods {
+                self.send(C2D::RestartTerminal { id });
+            }
             // A click on the covered prompt row is a click on OUR prompt —
             // focus the editor. Any OTHER pointer interaction with the grid
             // (click, drag-select, wheel) leaves the composer exactly as it
@@ -704,13 +731,14 @@ impl App {
             }
         }
 
-        // Composer strip (P3 §6.3). Runs for hooked terminals in EVERY
-        // state (alt-screen, Dead, busy). C2: while collapsed the band's
-        // rect overlaps the grid's bottom rows — composer::show then paints
-        // at most the hover-peek overlay there and registers no interaction
-        // (the pixels belong to the grid); every other state keeps the real
-        // reserved band.
-        if hooked {
+        // Composer strip (P3 §6.3). Runs for every strip-eligible terminal
+        // — hooked in EVERY state (alt-screen, Dead, busy), plus hookless
+        // Dead/reconnecting tabs (fix a: the relaunch affordance). C2: while
+        // collapsed the band's rect overlaps the grid's bottom rows —
+        // composer::show then paints at most the hover-peek overlay there
+        // and registers no interaction (the pixels belong to the grid);
+        // every other state keeps the real reserved band.
+        if strip_on {
             let strip_rect = Rect::from_min_max(
                 Pos2::new(full.min.x, full.max.y - composer::STRIP_H),
                 full.max,
@@ -734,6 +762,7 @@ impl App {
             let mut wake_clicked = false;
             let mut restore_clicked = false;
             let mut cancel_reconnect_clicked = false;
+            let mut retry_reconnect_clicked = false;
             self.history_btn_rect = None;
             if let (Some(st), Some(backend), Some(bl)) = (
                 self.composers.get_mut(&id),
@@ -763,6 +792,7 @@ impl App {
                 wake_clicked = out.wake;
                 restore_clicked = out.restore;
                 cancel_reconnect_clicked = out.cancel_reconnect;
+                retry_reconnect_clicked = out.retry_reconnect;
                 self.history_btn_rect = out.history_btn;
             }
             if wake_clicked || restore_clicked {
@@ -772,6 +802,10 @@ impl App {
             }
             if cancel_reconnect_clicked && self.reconnect_supported() {
                 self.send(C2D::CancelReconnect { id });
+            }
+            if retry_reconnect_clicked && self.manual_retry_supported() {
+                // Fix b: user-initiated bounded reconnect (proto 13).
+                self.send(C2D::RetryReconnect { id });
             }
             if toggle_history {
                 if self.history.is_some() {
@@ -1164,12 +1198,15 @@ impl App {
             );
         }
 
-        // Dead card: hover reveals a ↻ Restore ghost text-button
-        // bottom-right (§6.2) — text that brightens, no box. An asleep card
-        // (status Dead + flag) words it as the wake it is; the wire verb is
-        // the same RestartTerminal either way (S3).
+        // Dead card: a ↻ Restore text-button bottom-right (§6.2) — text
+        // that brightens, no box. ALWAYS visible on a plainly-dead card
+        // (dead-relaunch fix a: a dead card is signal, not idle chrome —
+        // doctrine rule 3 "failure … stays"); an asleep card (status Dead +
+        // flag) is deliberate shelving, so its `↻ Wake` keeps the quiet
+        // hover-reveal. The wire verb is the same RestartTerminal either
+        // way (S3).
         let mut over_restore = false;
-        if dead && hover_t > 0.02 {
+        if dead && (!asleep || hover_t > 0.02) {
             let galley = painter.layout_no_wrap(
                 if asleep { "\u{21BB} Wake" } else { "\u{21BB} Restore" }.to_string(),
                 FontId::proportional(12.0),
@@ -1187,7 +1224,12 @@ impl App {
                 .pointer_latest_pos()
                 .is_some_and(|p| rr.expand(6.0).contains(p));
             let col = if over_restore { ACCENT_HOVER } else { ACCENT };
-            let col = col.gamma_multiply((hover_t * 1.2).min(1.0));
+            // Dead: full strength always; asleep keeps the hover fade.
+            let col = if asleep {
+                col.gamma_multiply((hover_t * 1.2).min(1.0))
+            } else {
+                col
+            };
             painter.galley(rr.min, galley, col);
         }
 

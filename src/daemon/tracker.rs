@@ -539,7 +539,13 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// commands are relayed as display text with control bytes stripped (no
 /// terminal-sequence smuggling into the preface), joined and truncated
 /// char-safe at 100 chars.
-pub fn nested_restore_notice(chain: &NestedChain, cli: Option<&InnerCli>) -> String {
+///
+/// F2 (`auto` = the launch armed the chain re-establish): the line says the
+/// chain is being re-typed automatically instead of asking for it — but the
+/// inner-CLI half keeps the manual resume hint verbatim (the CLI is never
+/// auto-resumed across the boundary; I1 unchanged). The pre-F2 wording is
+/// preserved byte-exact for `auto = false` (opt-out / hookless spawns).
+pub fn nested_restore_notice(chain: &NestedChain, cli: Option<&InnerCli>, auto: bool) -> String {
     let joined = chain
         .cmds
         .iter()
@@ -558,15 +564,33 @@ pub fn nested_restore_notice(chain: &NestedChain, cli: Option<&InnerCli>) -> Str
     });
     let Some((a, t)) = identity else {
         // Variant C.
-        return format!(
-            "── this terminal had a nested shell ({c}); anything running inside it was not restored — re-establish it manually ──"
-        );
+        return if auto {
+            format!(
+                "── re-establishing this terminal's nested shell ({c}) automatically; anything that ran inside it was not restored ──"
+            )
+        } else {
+            format!(
+                "── this terminal had a nested shell ({c}); anything running inside it was not restored — re-establish it manually ──"
+            )
+        };
     };
     let quoted_cd = chain
         .cli_cwd
         .as_ref()
         .map(|p| super::bootstrap::sh_single_quote(&p.to_string_lossy()))
         .filter(|q| q.chars().count() <= 120);
+    if auto {
+        return match quoted_cd {
+            // Auto variant A: the chain types itself; the resume stays manual.
+            Some(q) => format!(
+                "── re-establishing this terminal's nested shell ({c}) automatically; its {a} session was not auto-resumed — resume: cd {q}; {a} --resume {t} ──"
+            ),
+            // Auto variant B.
+            None => format!(
+                "── re-establishing this terminal's nested shell ({c}) automatically; its {a} session was not auto-resumed — resume: {a} --resume {t} (run it from the conversation's directory) ──"
+            ),
+        };
+    }
     match quoted_cd {
         // Variant A.
         Some(q) => format!(
@@ -1217,6 +1241,47 @@ mod tests {
         }
     }
 
+    /// The pre-F2 (manual) wording — `auto = false` keeps every golden below
+    /// byte-exact.
+    fn nested_restore_notice_f(
+        chain: &crate::state::NestedChain,
+        cli: Option<&InnerCli>,
+    ) -> String {
+        nested_restore_notice(chain, cli, false)
+    }
+
+    /// F2 goldens — the `auto = true` variants: the chain announces itself
+    /// as auto-typed; the inner-CLI resume hint stays manual and verbatim
+    /// (I1 unchanged); every escaping choke point is shared with the manual
+    /// variants (one composition function).
+    #[test]
+    fn nested_restore_notice_auto_golden() {
+        let cli = nested_cli("claude", Some("xyz"));
+        // Auto variant A.
+        assert_eq!(
+            nested_restore_notice(&chain(&["sudo su"], Some("/")), Some(&cli), true),
+            "── re-establishing this terminal's nested shell (sudo su) automatically; its claude session was not auto-resumed — resume: cd '/'; claude --resume xyz ──"
+        );
+        // Auto variant B.
+        assert_eq!(
+            nested_restore_notice(&chain(&["sudo su"], None), Some(&cli), true),
+            "── re-establishing this terminal's nested shell (sudo su) automatically; its claude session was not auto-resumed — resume: claude --resume xyz (run it from the conversation's directory) ──"
+        );
+        // Auto variant C.
+        assert_eq!(
+            nested_restore_notice(&chain(&["sudo su"], None), None, true),
+            "── re-establishing this terminal's nested shell (sudo su) automatically; anything that ran inside it was not restored ──"
+        );
+        // The unsafe-token choke point degrades to auto-C — never a mangled
+        // command, exactly like the manual lane.
+        let evil = nested_cli("claude", Some("x; rm -rf /"));
+        let n = nested_restore_notice(&chain(&["sudo su"], Some("/")), Some(&evil), true);
+        assert!(
+            n.contains("anything that ran inside it was not restored") && !n.contains("rm -rf"),
+            "unsafe token must degrade to auto variant C: {n}"
+        );
+    }
+
     /// F1 spec §4.3 goldens — byte-exact variants A/B/C, the escaping choke
     /// points, and the truncation degradations.
     #[test]
@@ -1224,54 +1289,54 @@ mod tests {
         // Variant A — the user's exact scenario from the investigation.
         let cli = nested_cli("claude", Some("xyz"));
         assert_eq!(
-            nested_restore_notice(&chain(&["sudo su"], Some("/")), Some(&cli)),
+            nested_restore_notice_f(&chain(&["sudo su"], Some("/")), Some(&cli)),
             "── this terminal had a nested shell (sudo su); its claude session was not auto-resumed — re-establish: sudo su; cd '/'; claude --resume xyz ──"
         );
         // A with a quote-bearing witnessed cwd: sh_single_quote escaping.
         assert_eq!(
-            nested_restore_notice(&chain(&["sudo su"], Some("/a'b")), Some(&cli)),
+            nested_restore_notice_f(&chain(&["sudo su"], Some("/a'b")), Some(&cli)),
             "── this terminal had a nested shell (sudo su); its claude session was not auto-resumed — re-establish: sudo su; cd '/a'\\''b'; claude --resume xyz ──"
         );
         // Variant B — identity but no beacon-witnessed cwd.
         assert_eq!(
-            nested_restore_notice(&chain(&["sudo su"], None), Some(&cli)),
+            nested_restore_notice_f(&chain(&["sudo su"], None), Some(&cli)),
             "── this terminal had a nested shell (sudo su); its claude session was not auto-resumed — re-establish: sudo su; claude --resume xyz (run it from the conversation's directory) ──"
         );
         // B via cd-truncation: a >120-char quoted path drops the cd.
         let long = format!("/{}", "x".repeat(130));
-        let n = nested_restore_notice(&chain(&["sudo su"], Some(&long)), Some(&cli));
+        let n = nested_restore_notice_f(&chain(&["sudo su"], Some(&long)), Some(&cli));
         assert!(n.ends_with("claude --resume xyz (run it from the conversation's directory) ──"));
         assert!(!n.contains("cd '"), "over-long witnessed cwd must drop the cd: {n}");
         // Variant C — no identity at all.
         assert_eq!(
-            nested_restore_notice(&chain(&["sudo su"], None), None),
+            nested_restore_notice_f(&chain(&["sudo su"], None), None),
             "── this terminal had a nested shell (sudo su); anything running inside it was not restored — re-establish it manually ──"
         );
         // C — identity without a token.
         assert_eq!(
-            nested_restore_notice(&chain(&["sudo su"], Some("/")), Some(&nested_cli("claude", None))),
+            nested_restore_notice_f(&chain(&["sudo su"], Some("/")), Some(&nested_cli("claude", None))),
             "── this terminal had a nested shell (sudo su); anything running inside it was not restored — re-establish it manually ──"
         );
         // C — an UNSAFE token never prints (r3-S1 choke point).
         let evil = nested_cli("claude", Some("x; rm -rf /"));
-        let n = nested_restore_notice(&chain(&["sudo su"], Some("/")), Some(&evil));
+        let n = nested_restore_notice_f(&chain(&["sudo su"], Some("/")), Some(&evil));
         assert!(
             n.contains("re-establish it manually") && !n.contains("rm -rf"),
             "unsafe token must degrade to variant C: {n}"
         );
         // Multi-hop chain joins in order; control bytes are stripped.
         assert_eq!(
-            nested_restore_notice(&chain(&["sudo su", "su - \x1b[31mdeploy"], None), None),
+            nested_restore_notice_f(&chain(&["sudo su", "su - \x1b[31mdeploy"], None), None),
             "── this terminal had a nested shell (sudo su; su - [31mdeploy); anything running inside it was not restored — re-establish it manually ──"
         );
         // Empty chain reads "nested shell"; 100-char chain truncation is
         // char-safe and marked.
         assert_eq!(
-            nested_restore_notice(&chain(&[], None), None),
+            nested_restore_notice_f(&chain(&[], None), None),
             "── this terminal had a nested shell (nested shell); anything running inside it was not restored — re-establish it manually ──"
         );
         let huge = "sudo su -- very long command ".repeat(10);
-        let n = nested_restore_notice(&chain(&[&huge], None), None);
+        let n = nested_restore_notice_f(&chain(&[&huge], None), None);
         assert!(n.contains('…'), "over-long chain must truncate: {n}");
         assert!(n.chars().count() < 250);
     }

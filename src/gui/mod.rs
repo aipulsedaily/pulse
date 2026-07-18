@@ -1916,6 +1916,14 @@ impl App {
         self.ipc.as_ref().is_some_and(|c| c.proto >= 10)
     }
 
+    /// Dead-relaunch fix b: the connected daemon understands proto-13
+    /// C2D::RetryReconnect (same skew-window pattern as sleep/reconnect —
+    /// an older daemon drops the connection on the unknown variant, so the
+    /// send is gated; the `Retry ▸` click is simply inert under skew).
+    fn manual_retry_supported(&self) -> bool {
+        self.ipc.as_ref().is_some_and(|c| c.proto >= 13)
+    }
+
     /// The presented lifecycle state of a terminal (SLEEP S1).
     fn presented(&self, id: Uuid) -> PresentedStatus {
         self.state
@@ -2793,17 +2801,21 @@ impl App {
                         let is_cmd = self.family_is_cmd(id);
                         let is_ssh = self.family_is_ssh(id);
                         let fam = self.family_complete(id);
-                        let (asleep, reconnecting) = self
+                        let relaunch_cmd = self.relaunch_desc(id);
+                        let (asleep, reconnecting, retry_attempt, retry_next_s) = self
                             .state
                             .terminal(id)
-                            .map(|t| (t.asleep, t.reconnecting))
-                            .unwrap_or((false, false));
+                            .map(|t| (t.asleep, t.reconnecting, t.retry_attempt, t.retry_next_s))
+                            .unwrap_or((false, false, 0, 0));
                         let st = self.composers.entry(id).or_default();
                         st.is_cmd = is_cmd;
                         st.is_ssh = is_ssh;
                         st.fam = fam;
                         st.asleep = asleep;
                         st.reconnecting = reconnecting;
+                        st.retry_attempt = retry_attempt;
+                        st.retry_next_s = retry_next_s;
+                        st.relaunch_cmd = relaunch_cmd;
                     }
                 }
                 D2C::StreamPos { id, off } => {
@@ -3110,9 +3122,20 @@ impl App {
                 .filter(|t| t.reconnecting)
                 .map(|t| t.id)
                 .collect();
+            // F1: manual-retry progress rides the Snapshot beside the flag.
+            let retry_progress: HashMap<Uuid, (u32, u32)> = self
+                .state
+                .terminals
+                .iter()
+                .filter(|t| t.retry_attempt != 0 || t.retry_next_s != 0)
+                .map(|t| (t.id, (t.retry_attempt, t.retry_next_s)))
+                .collect();
             for (id, st) in self.composers.iter_mut() {
                 st.asleep = asleep_ids.contains(id);
                 st.reconnecting = reconnecting_ids.contains(id);
+                let (a, s) = retry_progress.get(id).copied().unwrap_or((0, 0));
+                st.retry_attempt = a;
+                st.retry_next_s = s;
             }
         }
         self.unread.retain(|id| ids.contains(id));
@@ -3793,6 +3816,60 @@ impl App {
             || self.state.terminal(id).is_some_and(|t| t.hooked)
     }
 
+    /// Dead-relaunch fix a: the strip-presence gate, widened from `hooked`
+    /// to `hooked || Dead || reconnecting` (composer::strip_eligible — the
+    /// pure predicate) so a never-hooked dead terminal still presents the
+    /// SessionEnded relaunch affordance, and a hookless manual-retry tab
+    /// keeps its Cancel through the Running-attempt phases. Consulted by
+    /// central's card split, the strip render, and `layout_for` — one
+    /// question, one answer, paint and PTY size can never disagree.
+    fn strip_eligible(&self, id: Uuid) -> bool {
+        let (dead, reconnecting) = self
+            .state
+            .terminal(id)
+            .map(|t| (t.status == TermStatus::Dead, t.reconnecting))
+            .unwrap_or((false, false));
+        composer::strip_eligible(self.hooked(id), dead, reconnecting)
+    }
+
+    /// Fix a: mint the composer/blocks mirrors for a strip-eligible tab that
+    /// never hooked (the Blocks-sync creation path at `D2C::Blocks` only
+    /// runs for hooked spawns). Idempotent; stamps the same static family
+    /// verdicts that path stamps, plus the relaunch label source.
+    fn ensure_strip_mirrors(&mut self, id: Uuid) {
+        self.blocks.entry(id).or_default();
+        if self.composers.contains_key(&id) {
+            return;
+        }
+        let is_cmd = self.family_is_cmd(id);
+        let is_ssh = self.family_is_ssh(id);
+        let fam = self.family_complete(id);
+        let relaunch_cmd = self.relaunch_desc(id);
+        let (asleep, reconnecting, retry_attempt, retry_next_s) = self
+            .state
+            .terminal(id)
+            .map(|t| (t.asleep, t.reconnecting, t.retry_attempt, t.retry_next_s))
+            .unwrap_or((false, false, 0, 0));
+        let st = self.composers.entry(id).or_default();
+        st.is_cmd = is_cmd;
+        st.is_ssh = is_ssh;
+        st.fam = fam;
+        st.asleep = asleep;
+        st.reconnecting = reconnecting;
+        st.retry_attempt = retry_attempt;
+        st.retry_next_s = retry_next_s;
+        st.relaunch_cmd = relaunch_cmd;
+    }
+
+    /// Fix a: what this terminal's Restore re-runs, humanized — the
+    /// SessionEnded lane's `Press Enter to relaunch — ssh <host>` source
+    /// (composer::relaunch_desc over the persisted spawn identity).
+    fn relaunch_desc(&self, id: Uuid) -> Option<String> {
+        self.state
+            .terminal(id)
+            .and_then(|t| composer::relaunch_desc(&t.kind, &t.program, &t.args))
+    }
+
     /// Per-terminal grid geometry (P3 §7): hooked terminals reserve a
     /// strip at the card's bottom edge; hookless terminals keep the full
     /// card. Each terminal owns a stable geometry — tab switches change
@@ -3808,7 +3885,7 @@ impl App {
     /// collapse and one −rows at the instant return. The HIDE_AFTER
     /// hysteresis inside the predicate is the flap debounce.
     fn layout_for(&self, id: Uuid, base: Vec2) -> Vec2 {
-        if self.hooked(id) && !self.strip_collapsed(id) {
+        if self.strip_eligible(id) && !self.strip_collapsed(id) {
             Vec2::new(base.x, (base.y - composer::STRIP_H).max(0.0))
         } else {
             base
@@ -6993,6 +7070,8 @@ mod tests {
             asleep: false,
             reconnecting: false,
             nested_chain: None,
+            retry_attempt: 0,
+            retry_next_s: 0,
         };
         let mut state = SharedState {
             folders: vec![folder(f_b, "B", 2), folder(f_a, "A", 1)],
@@ -7083,6 +7162,8 @@ mod tests {
             asleep: false,
             reconnecting: false,
             nested_chain: None,
+            retry_attempt: 0,
+            retry_next_s: 0,
         };
         let nt = duplicate_spec(&t, &["claude"]);
         match &nt.kind {
@@ -7414,6 +7495,8 @@ mod tests {
             asleep,
             reconnecting: false,
             nested_chain: None,
+            retry_attempt: 0,
+            retry_next_s: 0,
         };
         let sig = |needs_you: bool, quiet_ms: u64, cli_stream: bool| {
             let mut s = ActivityState::new();
