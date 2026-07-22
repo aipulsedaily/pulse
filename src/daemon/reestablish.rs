@@ -31,11 +31,22 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone)]
 pub(super) struct Reestablish {
     /// The recorded chain commands, opener first (`NestedChain.cmds`,
-    /// stashed at launch — the breadcrumb itself retires on the first pre).
+    /// stashed at launch; the breadcrumb itself now SURVIVES the armed
+    /// spawn's trigger pre — see `reestablish_on_pre` — and retires on the
+    /// first pre this engine does not consume).
     steps: Vec<String>,
     /// Next step to type (steps[idx]).
     idx: usize,
     phase: Phase,
+    /// Nested-cli-resume: the composed FINAL step (`cd '<cli_cwd>' &&
+    /// <adapter> --resume <sid>`, `tracker::nested_resume_step`) — typed
+    /// ONLY at the Done edge of the LAST chain step, i.e. strictly inside
+    /// the fully re-established nested shell (spec-I1 resolved by that
+    /// ordering). None = hint-only sequence (incomplete breadcrumb).
+    resume: Option<String>,
+    /// The manual-resume fallback line pushed to the preface when the
+    /// sequence stops before `resume` ran (`nested_resume_abort_hint`).
+    hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -132,22 +143,58 @@ pub(crate) fn credential_prompt_line(line: &str) -> bool {
 /// The launch-time arm gate (pure): a breadcrumb exists, this spawn is
 /// HOOKED (without hooks there is no prompt-settled witness — the honest
 /// preface alone carries it, exactly as before F2), and the per-terminal
-/// opt-out (default ON) says yes.
+/// opt-out (default ON) says yes. One switch (`ShellCfg.auto_reestablish`)
+/// gates the WHOLE sequence — chain re-type and, when the breadcrumb is
+/// complete, the final inner-CLI resume step.
 pub(crate) fn reestablish_should_arm(chain_present: bool, hooked: bool, opt_in: bool) -> bool {
     chain_present && hooked && opt_in
+}
+
+/// Pure consumption rule for a token-checked outer-prompt `pre`
+/// (nested-cli-resume, hypothesis-c fix — unit-tested): the armed/pending
+/// phases CONSUME it (it is the trigger / a re-base of the send grace), and
+/// the caller must then SKIP the breadcrumb clear — the auto-typed chain is
+/// about to recreate exactly the world the breadcrumb records; clearing on
+/// this pre is what destroyed the resume identity (sid + cli_cwd) every
+/// reconnect cycle. A Watch-phase pre is NOT consumed: the outer prompt
+/// returning mid-chain means the nested step collapsed — the chain aborts
+/// and the ordinary clear runs.
+fn pre_consumes(phase: &Phase) -> bool {
+    matches!(phase, Phase::AwaitPrompt | Phase::PendingSend { .. })
+}
+
+/// Pure resume-step gate (nested-cli-resume): the ONLY watch action that
+/// may type the final resume step is `Done` — a partial chain (`Next`),
+/// any abort, or an unsettled step must never reach it. The Done arm in
+/// `pump_reestablish` additionally asserts the last chain step settled.
+pub(crate) fn resume_may_type(action: WatchAction) -> bool {
+    matches!(action, WatchAction::Done)
 }
 
 impl Core {
     /// Arm at spawn success (launch() calls this after the session is in the
     /// map). Replaces any stale entry — the newest spawn owns the chain.
-    pub(super) fn arm_reestablish(&self, id: Uuid, steps: Vec<String>) {
+    /// `resume` is the composed final inner-CLI resume step (+ its manual
+    /// fallback hint) when the breadcrumb is complete — see
+    /// `tracker::nested_resume_step`.
+    pub(super) fn arm_reestablish(
+        &self,
+        id: Uuid,
+        steps: Vec<String>,
+        resume: Option<(String, String)>,
+    ) {
         if steps.is_empty() {
             return;
         }
+        let (resume, hint) = match resume {
+            Some((step, hint)) => (Some(step), Some(hint)),
+            None => (None, None),
+        };
         log::info!(
-            "terminal {id}: nested chain re-establish armed ({} step(s): {}) — waiting for the hooked prompt",
+            "terminal {id}: nested chain re-establish armed ({} step(s): {}{}) — waiting for the hooked prompt",
             steps.len(),
-            steps.join("; ")
+            steps.join("; "),
+            if resume.is_some() { "; then the inner-CLI resume" } else { "" }
         );
         self.reestablish.lock().insert(
             id,
@@ -155,15 +202,34 @@ impl Core {
                 steps,
                 idx: 0,
                 phase: Phase::AwaitPrompt,
+                resume,
+                hint,
             },
         );
     }
 
     /// Drop any supervision. `why` is logged only when an entry existed
-    /// (delete/exit teardown calls this unconditionally and silently).
+    /// (delete/exit teardown calls this unconditionally and silently). A
+    /// sequence that still owed an inner-CLI resume leaves the manual hint
+    /// in the preface (nested-cli-resume: skipped/aborted ⇒ the hint prints,
+    /// exactly as the notice used to carry it).
     pub(super) fn cancel_reestablish(&self, id: Uuid, why: &str) {
-        if self.reestablish.lock().remove(&id).is_some() {
+        let entry = self.reestablish.lock().remove(&id);
+        if let Some(e) = entry {
             log::info!("terminal {id}: nested chain re-establish stopped — {why}");
+            self.push_resume_hint(id, &e);
+        }
+    }
+
+    /// The un-run resume step's manual fallback: push the hint as a preface
+    /// info line (visible on the next attach/replay — live clients already
+    /// have the same command inline in the seam notice) and log it. No-op
+    /// for hint-less sequences and dead sessions.
+    fn push_resume_hint(&self, id: Uuid, e: &Reestablish) {
+        let Some(hint) = &e.hint else { return };
+        if let Some(s) = self.sessions.lock().get(&id) {
+            s.preface.lock().push_info_line(hint);
+            log::info!("terminal {id}: inner-CLI resume skipped — {hint}");
         }
     }
 
@@ -172,10 +238,23 @@ impl Core {
     /// returned while a nested step was supposedly holding the shell — the
     /// nested world collapsed (e.g. `sudo` refused); abort the remainder
     /// instead of typing chain commands at the outer prompt.
-    pub(super) fn reestablish_on_pre(&self, id: Uuid) {
-        let mut map = self.reestablish.lock();
-        if let Some(entry) = map.get_mut(&id) {
-            match entry.phase {
+    ///
+    /// Returns whether this engine CONSUMED the pre as its trigger/re-base
+    /// (AwaitPrompt/PendingSend). The caller keys the breadcrumb clear on
+    /// it (nested-cli-resume, hypothesis c): the armed spawn's trigger pre
+    /// must NOT retire the chain — the auto-typed commands are about to
+    /// recreate exactly the world it records, and retiring it here
+    /// destroyed the resume identity (sid + cli_cwd) every reconnect
+    /// cycle. Retirement belongs to the abort paths and to the next pre
+    /// this engine does not consume (the nested world really ended).
+    pub(super) fn reestablish_on_pre(&self, id: Uuid) -> bool {
+        let (consumed, aborted) = {
+            let mut map = self.reestablish.lock();
+            let Some(entry) = map.get_mut(&id) else {
+                return false;
+            };
+            let consumed = pre_consumes(&entry.phase);
+            let aborted = match entry.phase {
                 Phase::AwaitPrompt => {
                     // Type on the next pump tick (SEND_GRACE) so the prompt
                     // finishes painting under the echo.
@@ -183,6 +262,7 @@ impl Core {
                         step: entry.idx,
                         at: Instant::now() + SEND_GRACE,
                     };
+                    None
                 }
                 // A second pre while the send is still pending (e.g. an
                 // extra prompt refresh) just re-bases the grace beat.
@@ -191,20 +271,37 @@ impl Core {
                         step,
                         at: Instant::now() + SEND_GRACE,
                     };
+                    None
                 }
-                Phase::Watch { .. } => {
-                    map.remove(&id);
-                    log::info!(
-                        "terminal {id}: nested chain re-establish stopped — outer prompt returned mid-chain (the nested step did not hold)"
-                    );
-                }
-            }
+                Phase::Watch { .. } => map.remove(&id),
+            };
+            (consumed, aborted)
+        };
+        if let Some(e) = aborted {
+            log::info!(
+                "terminal {id}: nested chain re-establish stopped — outer prompt returned mid-chain (the nested step did not hold)"
+            );
+            self.push_resume_hint(id, &e);
         }
+        consumed
     }
 
-    /// Type steps[idx] + Enter into the PTY (the C2D::Input write path —
-    /// writer cloned out, write outside the sessions lock), then move the
-    /// entry to Watch with the CURRENT journal length as the quiescence base.
+    /// Type one command line + Enter into the PTY (the C2D::Input write
+    /// path — writer cloned out, write outside the sessions lock). Returns
+    /// false when the session is gone.
+    fn type_reestablish_line(&self, id: Uuid, cmd: &str) -> bool {
+        let writer = self.sessions.lock().get(&id).map(|s| s.writer.clone());
+        let Some(w) = writer else { return false };
+        use std::io::Write;
+        let mut w = w.lock();
+        let _ = w.write_all(cmd.as_bytes());
+        let _ = w.write_all(b"\r");
+        let _ = w.flush();
+        true
+    }
+
+    /// Type steps[idx], then move the entry to Watch with the CURRENT
+    /// journal length as the quiescence base.
     fn send_reestablish_step(&self, id: Uuid, idx: usize) {
         let cmd = match self.reestablish.lock().get(&id) {
             Some(e) => match e.steps.get(idx) {
@@ -213,23 +310,15 @@ impl Core {
             },
             None => return,
         };
-        let writer = self.sessions.lock().get(&id).map(|s| s.writer.clone());
-        let Some(w) = writer else {
-            self.cancel_reestablish(id, "session gone before the step could be typed");
-            return;
-        };
         let total = self.reestablish.lock().get(&id).map(|e| e.steps.len()).unwrap_or(0);
         log::info!(
             "terminal {id}: nested chain re-establish — typing step {}/{}: {cmd}",
             idx + 1,
             total
         );
-        {
-            use std::io::Write;
-            let mut w = w.lock();
-            let _ = w.write_all(cmd.as_bytes());
-            let _ = w.write_all(b"\r");
-            let _ = w.flush();
+        if !self.type_reestablish_line(id, &cmd) {
+            self.cancel_reestablish(id, "session gone before the step could be typed");
+            return;
         }
         let len = self
             .journal(id)
@@ -341,15 +430,46 @@ impl Core {
                     }
                 }
                 WatchAction::Done => {
-                    let n = self
-                        .reestablish
-                        .lock()
-                        .remove(&id)
-                        .map(|e| e.steps.len())
-                        .unwrap_or(0);
-                    log::info!(
-                        "terminal {id}: nested chain re-established ({n} step(s) typed)"
+                    // Nested-cli-resume: the ONLY place the resume step may
+                    // type. Reaching Done means every recorded chain command
+                    // was typed AND settled cleanly (no credential prompt,
+                    // no timeout, no outer-prompt collapse, no user
+                    // takeover) — so the shell accepting the next line IS
+                    // the fully re-established nested shell. That ordering
+                    // resolves the original spec-I1 concern (an auto-resume
+                    // fired at the OUTER prompt would run as the ssh login
+                    // user against the wrong session store): the command
+                    // executes strictly inside the nested context or not at
+                    // all.
+                    let Some(e) = self.reestablish.lock().remove(&id) else {
+                        continue;
+                    };
+                    debug_assert_eq!(
+                        e.idx + 1,
+                        e.steps.len(),
+                        "Done edge requires the LAST chain step to have settled"
                     );
+                    let n = e.steps.len();
+                    match &e.resume {
+                        Some(cmd) if resume_may_type(action) && self.type_reestablish_line(id, cmd) => {
+                            log::info!(
+                                "terminal {id}: nested chain re-established ({n} step(s) typed); resuming the inner CLI: {cmd}"
+                            );
+                        }
+                        Some(_) => {
+                            // Session died between the settle and the type —
+                            // leave the manual hint, exactly like an abort.
+                            log::info!(
+                                "terminal {id}: nested chain re-established ({n} step(s) typed) but the session is gone — inner-CLI resume skipped"
+                            );
+                            self.push_resume_hint(id, &e);
+                        }
+                        None => {
+                            log::info!(
+                                "terminal {id}: nested chain re-established ({n} step(s) typed)"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -468,5 +588,55 @@ mod tests {
         assert!(!reestablish_should_arm(false, true, true), "no breadcrumb");
         assert!(!reestablish_should_arm(true, false, true), "hookless spawn");
         assert!(!reestablish_should_arm(true, true, false), "opted out");
+    }
+
+    /// Nested-cli-resume (hypothesis-c fix) — breadcrumb persistence across
+    /// a re-establish cycle: the armed spawn's trigger pre (and any re-base
+    /// pre while the send is pending) is CONSUMED, so on_block_event skips
+    /// the breadcrumb clear and the resume identity (sid + cli_cwd)
+    /// survives the cycle. A Watch-phase pre (chain collapsed) is NOT
+    /// consumed — the ordinary retirement runs, exactly as before.
+    #[test]
+    fn pre_consumption_table() {
+        let now = Instant::now();
+        assert!(pre_consumes(&Phase::AwaitPrompt), "trigger pre must not clear the chain");
+        assert!(
+            pre_consumes(&Phase::PendingSend { step: 0, at: now }),
+            "re-base pre must not clear the chain"
+        );
+        assert!(
+            !pre_consumes(&Phase::Watch {
+                sent: now,
+                last_len: 0,
+                last_change: now,
+            }),
+            "an outer prompt mid-chain aborts AND retires the chain"
+        );
+    }
+
+    /// Nested-cli-resume — the resume step types on the Done edge ONLY:
+    /// a partial chain (Next), an unsettled step (Wait), a credential
+    /// abort, or a timeout must never reach it. (The keystroke-cancel leg
+    /// removes the supervision entry entirely — C2D::Input/SubmitCommand →
+    /// `cancel_reestablish("user input")` — so no action is ever computed
+    /// for it; the abort paths above pin the remaining matrix.)
+    #[test]
+    fn resume_step_gating_matrix() {
+        assert!(resume_may_type(WatchAction::Done));
+        assert!(!resume_may_type(WatchAction::Next), "partial chain must never resume");
+        assert!(!resume_may_type(WatchAction::Wait), "unsettled step must never resume");
+        assert!(
+            !resume_may_type(WatchAction::AbortCredential),
+            "credential abort applies to the resume step too"
+        );
+        assert!(!resume_may_type(WatchAction::AbortTimeout));
+        // And the composed matrix stays coherent with the watcher: a
+        // settled credential tail on the LAST step aborts instead of
+        // resuming (the resume would otherwise type into a password
+        // prompt).
+        let ms = Duration::from_millis;
+        let last_step_settled_credential = watch_action(ms(1000), ms(700), true, false);
+        assert_eq!(last_step_settled_credential, WatchAction::AbortCredential);
+        assert!(!resume_may_type(last_step_settled_credential));
     }
 }

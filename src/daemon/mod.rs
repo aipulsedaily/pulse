@@ -496,7 +496,9 @@ pub struct Core {
     /// gives pwsh). Runtime-only: a daemon restart drops it, which is
     /// correct — a dangling open block at restore means the CLI was still
     /// running, so the resume wrapper fires and re-announces itself through
-    /// a fresh exec hook.
+    /// a fresh exec hook. on_exit drops the entry for the same reason
+    /// (nested-cli-resume: a dead spawn's key must not divert the nested
+    /// beacon lane in `on_beacon`).
     cli_blocks: Mutex<HashMap<Uuid, (u32, u64)>>,
     /// F1 nested-shell episodes LIVE in the current spawn (LEAF lock):
     /// terminals whose last hook-fed exec classified as a nested shell
@@ -1009,10 +1011,21 @@ impl Core {
             // F2: the settled hooked prompt is the chain re-establish
             // trigger (AwaitPrompt → type step 0) — and, mid-chain, an OUTER
             // prompt returning means the nested step collapsed (abort).
-            // Runs BEFORE the breadcrumb clear below: the steps were stashed
-            // at launch, but the abort semantics read the entry's phase.
-            self.reestablish_on_pre(id);
-            self.clear_nested_chain(id, "hooked prompt returned");
+            //
+            // Nested-cli-resume (hypothesis-c fix): a pre the engine
+            // CONSUMED (trigger / send re-base) must NOT retire the
+            // breadcrumb — the auto-typed chain is about to recreate
+            // exactly the world it records, and clearing here destroyed
+            // the resume identity (sid + cli_cwd) every reconnect cycle
+            // (the post-v0.1.12 tracking gap). Retirement now belongs to
+            // the chain's abort paths and to the first pre the engine does
+            // not consume — the nested world really ending. Un-armed
+            // spawns (opt-out / hookless / no chain) keep the pre-F2
+            // one-shot retirement byte-identical.
+            let consumed = self.reestablish_on_pre(id);
+            if !consumed {
+                self.clear_nested_chain(id, "hooked prompt returned");
+            }
         }
         let Some((epoch, recs, snap)) = outcome else { return };
         self.clear_cli_block_on_close(id, &recs);
@@ -1213,6 +1226,18 @@ impl Core {
                 self.resolve_block_close(id, &closed);
             }
         }
+        // Nested-cli-resume (hypothesis-b hardening): the CLI-block key dies
+        // with its session. The record it pointed at just dangling-closed
+        // (or will be flushed by the next launch's rotation), so the key can
+        // never match a future close — but while it lingered it made
+        // `on_beacon` treat every beacon as ordinary-lane traffic, silently
+        // eating the NESTED lane's SessionStart after a reconnect (the
+        // ordinary lane refuses to CREATE cli state). `inner_cli` is
+        // deliberately kept: the restore path still composes the resume
+        // wrapper from it, and a resumed CLI re-announces through a fresh
+        // exec hook that re-inserts its own key (the documented contract on
+        // the `cli_blocks` field).
+        self.cli_blocks.lock().remove(&id);
         // P5: Exit waiters resolve; every other waiter for this id fails
         // "exited" (its condition can no longer occur); subscribers get the
         // event alongside the legacy broadcast.
@@ -1578,6 +1603,27 @@ impl Core {
             hooked,
             meta.shell_cfg.as_ref().is_none_or(|c| c.auto_reestablish),
         );
+        // Nested-cli-resume: the final auto-typed resume step — composed
+        // ONLY from a complete breadcrumb (nested identity + safe concrete
+        // token + beacon-witnessed cli_cwd; never a guess) and armed ONLY
+        // when the chain re-establish itself arms (one opt-out switch for
+        // the whole sequence). The engine types it strictly after the
+        // chain's last command confirmed (reestablish.rs Done edge — inside
+        // the re-established nested shell, resolving the spec-I1
+        // wrong-session-store concern); the launch-time restore arms above
+        // keep refusing nested identities (`cli_wants_resume`) unchanged.
+        let nested_resume: Option<(String, String)> = if auto_reestablish {
+            meta.nested_chain
+                .as_ref()
+                .and_then(|chain| {
+                    let cli = meta.inner_cli.as_ref().filter(|c| c.nested)?;
+                    let step = tracker::nested_resume_step(chain, Some(cli))?;
+                    let hint = tracker::nested_resume_abort_hint(&cli.adapter, &step);
+                    Some((step, hint))
+                })
+        } else {
+            None
+        };
         let nested_notice: Option<String> = meta.nested_chain.as_ref().map(|chain| {
             log::info!(
                 "terminal {id}: nested-shell breadcrumb present — shell-only restore (no auto-resume across a privilege boundary)"
@@ -1586,6 +1632,7 @@ impl Core {
                 chain,
                 meta.inner_cli.as_ref().filter(|c| c.nested),
                 auto_reestablish,
+                nested_resume.as_ref().map(|(step, _)| step.as_str()),
             )
         });
 
@@ -1853,8 +1900,10 @@ impl Core {
                 }
                 if auto_reestablish {
                     // F2: arm the chain re-establish — the first token-
-                    // checked `pre` (hooked prompt settled) types step 0.
-                    self.arm_reestablish(id, reestablish_steps.clone());
+                    // checked `pre` (hooked prompt settled) types step 0;
+                    // a complete breadcrumb also carries the final
+                    // inner-CLI resume step (nested-cli-resume).
+                    self.arm_reestablish(id, reestablish_steps.clone(), nested_resume.clone());
                 }
                 if let Some(adapter) = &ambiguous_adapter {
                     // A CLI session was running here but its identity was
@@ -2207,12 +2256,16 @@ impl Core {
     }
 
     /// F1 spec §2.3: a hook-fed exec classified as a nested shell — open a
-    /// fresh breadcrumb, REPLACING any prior chain (the newest witnessed
-    /// opener is the current truth; a user re-entering `sudo su` after a
-    /// restore IS the re-establish). Inserts the runtime episode marker that
-    /// gates beacon acceptance and D2 appends. Claude-kind terminals are
-    /// skipped (their pin lifecycle owns them). `entered_cwd` is the outer
-    /// shell's hook-tracked cwd at entry.
+    /// breadcrumb via `tracker::reopen_nested_chain`: the SAME opener
+    /// re-witnessed (typically the F2 engine's own auto-typed step 1, or
+    /// the user re-entering their chain) PRESERVES the recorded chain —
+    /// deeper hops and the beacon-witnessed `cli_cwd` survive the cycle
+    /// (nested-cli-resume, hypothesis-c fix; the old unconditional REPLACE
+    /// re-recorded a bare chain every re-establish) — while a DIFFERENT
+    /// opener still replaces it (the newest witnessed chain wins). Inserts
+    /// the runtime episode marker that gates beacon acceptance and D2
+    /// appends. Claude-kind terminals are skipped (their pin lifecycle owns
+    /// them). `entered_cwd` is the outer shell's hook-tracked cwd at entry.
     fn open_nested_chain(&self, id: Uuid, cmd: &str, entered_cwd: &std::path::Path) {
         {
             let state = self.state.lock();
@@ -2225,19 +2278,14 @@ impl Core {
         let changed = {
             let mut state = self.state.lock();
             let Some(t) = state.terminal_mut(id) else { return };
-            let chain = crate::state::NestedChain {
-                cmds: vec![cmd.trim().to_string()],
-                entered_cwd: entered_cwd.to_path_buf(),
-                cli_cwd: None,
-                opened_ms: now_ms(),
-            };
-            if t.nested_chain.as_ref() != Some(&chain) {
-                t.nested_chain = Some(chain);
+            let prior = t.nested_chain.take();
+            let chain = tracker::reopen_nested_chain(prior.clone(), cmd, entered_cwd, now_ms());
+            let changed = prior.as_ref() != Some(&chain);
+            t.nested_chain = Some(chain);
+            if changed {
                 state.save_logged("nested chain open");
-                true
-            } else {
-                false
             }
+            changed
         };
         if changed {
             self.broadcast_snapshot();
@@ -4481,7 +4529,12 @@ pub fn run() -> anyhow::Result<()> {
         .append(true)
         .open(daemon_log_path())?;
     let _ = simplelog::WriteLogger::init(
-        simplelog::LevelFilter::Info,
+        // Diagnosis builds (TC_DATA_DIR sandboxes only) can raise verbosity.
+        if std::env::var("TC_LOG_DEBUG").is_ok() && crate::state::data_dir_overridden() {
+            simplelog::LevelFilter::Debug
+        } else {
+            simplelog::LevelFilter::Info
+        },
         simplelog::Config::default(),
         log_file,
     );

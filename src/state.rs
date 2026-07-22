@@ -275,9 +275,12 @@ pub struct ShellCfg {
     /// recorded chain commands once the hooked prompt settles — each step
     /// gated on output quiescence and ABORTED the instant a credential
     /// prompt appears (credentials are never typed; the honest preface
-    /// covers the rest). Default ON (the user's ask); the opt-out. Appended
-    /// with serde-default (fields are append-only-with-serde-default
-    /// forever).
+    /// covers the rest). Nested-cli-resume: the SAME switch gates the whole
+    /// sequence — when the breadcrumb is complete (beacon-witnessed session
+    /// id + cli_cwd), the final step auto-types `cd '<cli_cwd>' && <cli>
+    /// --resume <sid>` inside the re-established nested shell. Default ON
+    /// (the user's ask); the opt-out. Appended with serde-default (fields
+    /// are append-only-with-serde-default forever).
     #[serde(default = "default_true")]
     pub auto_reestablish: bool,
 }

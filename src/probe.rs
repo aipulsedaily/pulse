@@ -191,6 +191,15 @@
 //!                 no resume block, identity retired only by the restored
 //!                 prompt's own pre (needs ssh_cli_env staging +
 //!                 passwordless sudo; SKIPs without)
+//!   ssh_nested_reestablish  nested-cli-resume regression: a link death
+//!                 mid-nested-claude, then auto-reconnect + auto-`sudo su`
+//!                 must PRESERVE the breadcrumb (sid + cli_cwd survive the
+//!                 seam — the post-v0.1.12 tracking gap), auto-type the
+//!                 final `cd '<cli_cwd>' && claude --resume <sid>` inside
+//!                 the re-established nested shell, and re-accept the
+//!                 relaunched claude's beacon (needs ssh_cli_env staging +
+//!                 passwordless sudo + a free /usr/local/bin/claude slot;
+//!                 SKIPs without)
 //!   codex_beacon  the codex mirror of claude_beacon's WSL beacon lane +
 //!                 anti-spoof (SKIPs without a WSL distro)
 //!   cwd_broadcast a `cd` folds into live_cwd and broadcasts one Snapshot so
@@ -7136,6 +7145,18 @@ fn case_wsl_restore() -> anyhow::Result<()> {
 /// remote command, or the TC_SSH_VIA_WSL transport stand-in) and wait until
 /// Running.
 fn create_ssh_terminal(c: &mut Conn, name: &str, args: &[&str]) -> anyhow::Result<Uuid> {
+    create_ssh_terminal_cfg(c, name, args, None)
+}
+
+/// `create_ssh_terminal` with an explicit ShellCfg — the nested F1 legs pin
+/// the MANUAL (hint-only) lane by opting out of auto_reestablish; every
+/// other case keeps the serde default (auto ON).
+fn create_ssh_terminal_cfg(
+    c: &mut Conn,
+    name: &str,
+    args: &[&str],
+    shell_cfg: Option<crate::state::ShellCfg>,
+) -> anyhow::Result<Uuid> {
     c.send(&C2D::CreateTerminal {
         spec: NewTerminal {
             name: name.into(),
@@ -7145,7 +7166,7 @@ fn create_ssh_terminal(c: &mut Conn, name: &str, args: &[&str]) -> anyhow::Resul
             args: args.iter().map(|s| s.to_string()).collect(),
             cwd: std::path::PathBuf::new(),
             already_launched: false,
-            shell_cfg: None,
+            shell_cfg,
         },
     })?;
     let state = c.snapshot_until(15, |s| {
@@ -7859,7 +7880,21 @@ fn ssh_cli_setup(
     host: &str,
     cwd: &str,
 ) -> anyhow::Result<Uuid> {
-    let id = create_ssh_terminal(c, name, &[host])?;
+    ssh_cli_setup_cfg(c, ctl, rid, name, host, cwd, None)
+}
+
+/// `ssh_cli_setup` with an explicit ShellCfg (see `create_ssh_terminal_cfg`).
+#[allow(clippy::too_many_arguments)]
+fn ssh_cli_setup_cfg(
+    c: &mut Conn,
+    ctl: &mut Conn,
+    rid: &mut u64,
+    name: &str,
+    host: &str,
+    cwd: &str,
+    shell_cfg: Option<crate::state::ShellCfg>,
+) -> anyhow::Result<Uuid> {
+    let id = create_ssh_terminal_cfg(c, name, &[host], shell_cfg)?;
     c.send(&C2D::Attach { id, cols: 120, rows: 30 })?;
     await_hooked_prompt(ctl, rid, id, 90)?;
     // Marker split with '' so the COMMAND ECHO (which the ConPTY reorder can
@@ -10121,8 +10156,28 @@ fn ssh_nested_claude_body(host: &str, sid: Uuid) -> anyhow::Result<()> {
         })
     };
 
+    // Both legs pin the F1 MANUAL (hint-only) lane: auto_reestablish OFF,
+    // so the restore prints the manual preface variants and the first
+    // hooked pre retires the breadcrumb (the pre-F2 one-shot contract,
+    // byte-identical). The AUTO lane — chain re-type + breadcrumb
+    // persistence + the final inner-CLI resume — is `ssh_nested_reestablish`.
+    let manual_cfg = || {
+        Some(crate::state::ShellCfg {
+            auto_reestablish: false,
+            ..Default::default()
+        })
+    };
+
     // ── A) beacon-less nested episode → honest shell-only sleep/wake. ──
-    let id = ssh_cli_setup(&mut c, &mut ctl, &mut rid, "__probe_nested_a__", host, cwd)?;
+    let id = ssh_cli_setup_cfg(
+        &mut c,
+        &mut ctl,
+        &mut rid,
+        "__probe_nested_a__",
+        host,
+        cwd,
+        manual_cfg(),
+    )?;
     c.send(&C2D::Input { id, bytes: b"sudo su\r".to_vec() })?;
     chain_open(id, 30).map_err(|e| e.context("breadcrumb never opened (leg A)"))?;
     let st: SharedState = serde_json::from_slice(&std::fs::read(state_path())?)?;
@@ -10209,7 +10264,15 @@ fn ssh_nested_claude_body(host: &str, sid: Uuid) -> anyhow::Result<()> {
 
     // ── B) v2-beacon episode → daemon restart → variant-A preface, no
     //       resume, identity survives into the restored session. ──
-    let idb = ssh_cli_setup(&mut c, &mut ctl, &mut rid, "__probe_nested_b__", host, cwd)?;
+    let idb = ssh_cli_setup_cfg(
+        &mut c,
+        &mut ctl,
+        &mut rid,
+        "__probe_nested_b__",
+        host,
+        cwd,
+        manual_cfg(),
+    )?;
     c.send(&C2D::Input { id: idb, bytes: b"sudo su\r".to_vec() })?;
     chain_open(idb, 30).map_err(|e| e.context("breadcrumb never opened (leg B)"))?;
     c.send(&C2D::Input { id: idb, bytes: b"cd /\r".to_vec() })?;
@@ -10327,6 +10390,238 @@ fn ssh_nested_claude_body(host: &str, sid: Uuid) -> anyhow::Result<()> {
     })?;
     delete_terminal(&mut c2, idb);
     ensure_no_new_panics(log0)?;
+    Ok(())
+}
+
+/// NESTED-CLI-RESUME regression probe (`ssh_nested_reestablish`): the
+/// post-v0.1.12 tracking gap, end-to-end over the WSL stand-in. Flow:
+/// `ssh → sudo su → cd / → claude` (v2 beacon ⇒ nested identity + witnessed
+/// cli_cwd), then the transport is killed from OUTSIDE (link death, exit
+/// 137) and the auto-reconnect + auto-re-establish run with the DEFAULT
+/// config (auto ON). Asserts:
+///   - JOB 1 (breadcrumb persistence): the armed relaunch's trigger pre
+///     does NOT retire the breadcrumb — the log shows the composed resume
+///     step (`cd '/' && claude --resume <sid>`), which can only exist if
+///     sid + cli_cwd SURVIVED the seam; the state still carries both; and
+///     no retirement line precedes the re-establish.
+///   - JOB 1 (attribution): the relaunched claude's beacon is ACCEPTED
+///     during the re-opened episode (a second "tagged nested" accept).
+///   - JOB 2 (auto-resume): the fake claude's argv log proves it was
+///     re-launched AS ROOT, in `/`, with `--resume <sid>` — typed by the
+///     engine strictly after the chain settled; and the seam notice reads
+///     the full-sequence wording.
+///
+/// Needs ssh_cli_env staging + passwordless sudo; additionally stages a
+/// root-resolvable `claude` at /usr/local/bin (GUARDED: skips when one
+/// already exists there — never clobbers a real install; removed
+/// unconditionally, content-checked, in cleanup).
+fn case_ssh_nested_reestablish() -> anyhow::Result<()> {
+    let host = ssh_cli_env()?;
+    ensure_isolated_daemon("ssh_nested_reestablish")?;
+    let sudo_ok = run_wsl_sh("sudo -n true >/dev/null 2>&1 && echo OK || echo NO")?;
+    if !sudo_ok.contains("OK") {
+        return Err(skip(
+            "passwordless sudo unavailable in the default distro".into(),
+        ));
+    }
+    let existing = run_wsl_sh("[ -e /usr/local/bin/claude ] && echo EXISTS || echo FREE")?;
+    if existing.contains("EXISTS") {
+        return Err(skip(
+            "/usr/local/bin/claude already exists in the default distro — refusing to clobber".into(),
+        ));
+    }
+    let sid = Uuid::new_v4();
+    let sid2 = Uuid::new_v4();
+    // The fake nested claude: logs argv (probe marker tc-nested-probe2),
+    // emits the v2 beacon with its REAL cwd hex, holds the foreground. A
+    // `--resume` launch beacons a FORKED session id (sid2) — real claude
+    // forks on resume, and the changed identity makes the post-seam accept
+    // observable (a same-sid re-accept is change-gated and logs nothing).
+    let stage = format!(
+        "mkdir -p /tmp/tc-nested-probe2\n\
+         cat > /tmp/tc-nested-probe2/claude <<'EOF'\n\
+         #!/bin/sh\n\
+         # tc-nested-probe2 fake claude\n\
+         printf 'user=%s cwd=%s argv=[%s]\\n' \"$(id -un)\" \"$PWD\" \"$*\" >> /tmp/tc-nested-probe2/argv.log 2>/dev/null || true\n\
+         chmod 666 /tmp/tc-nested-probe2/argv.log 2>/dev/null || true\n\
+         if [ \"$1\" = \"--resume\" ]; then sid={sid2}; else sid={sid}; fi\n\
+         cwdhex=$(printf '%s' \"$PWD\" | od -An -v -tx1 | tr -d ' \\n')\n\
+         {{ printf '\\033]7717;tcbeacon;claude;SessionStart;startup;%s;%s\\007' \"$sid\" \"$cwdhex\" > /dev/tty; }} 2>/dev/null || true\n\
+         sleep 300\n\
+         EOF\n\
+         chmod 755 /tmp/tc-nested-probe2/claude\n\
+         sudo -n cp /tmp/tc-nested-probe2/claude /usr/local/bin/claude\n\
+         sudo -n chmod 755 /usr/local/bin/claude\n"
+    );
+    run_wsl_sh(&stage)?;
+    let result = ssh_nested_reestablish_body(&host, sid, sid2);
+    // ALWAYS clean, pass or fail: reap the root-owned fake, remove the
+    // staging, and remove /usr/local/bin/claude ONLY if it is ours
+    // (content-checked marker).
+    let _ = run_wsl_sh(
+        "sudo -n pkill -f tc-nested-probe2 2>/dev/null; \
+         grep -q tc-nested-probe2 /usr/local/bin/claude 2>/dev/null && sudo -n rm -f /usr/local/bin/claude; \
+         rm -rf /tmp/tc-nested-probe2; exit 0",
+    );
+    result
+}
+
+/// The ssh_nested_reestablish case body — every early return routes through
+/// the wrapper's unconditional cleanup above. `sid` = the fresh-launch
+/// session, `sid2` = the forked id the `--resume` relaunch beacons.
+fn ssh_nested_reestablish_body(host: &str, sid: Uuid, sid2: Uuid) -> anyhow::Result<()> {
+    let master = master_token()?;
+    let log0 = daemon_log_len();
+    let mut c = Conn::open()?;
+    let _ = c.first_snapshot()?;
+    let mut ctl = Conn::open_ctl(&master, None)?;
+    let mut rid = 5800u64;
+    let cwd = "/tmp/tcprobe-home/nested-re";
+    let sid_s = sid.to_string();
+
+    // Default cfg: auto_reestablish ON — the lane under test.
+    let id = ssh_cli_setup(&mut c, &mut ctl, &mut rid, "__probe_nested_re__", host, cwd)?;
+    // The OUTER shell's pid — the from-outside link-kill target.
+    let body = ctl_run_retry(
+        &mut ctl,
+        &mut rid,
+        id,
+        "echo TC''OUTERPID $$",
+        Some(RunWait { timeout_ms: 30_000, tail_bytes: 4096 }),
+        60,
+    )?;
+    let outer_pid: u32 = match &body {
+        CtlBody::RunDone { output, .. } => output
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("TCOUTERPID ")?.trim().parse().ok())
+            .ok_or_else(|| anyhow::anyhow!("outer pid marker not found in: {output:?}"))?,
+        other => anyhow::bail!("pid probe failed: {other:?}"),
+    };
+
+    // Build the chain + identity: sudo su → cd / → fake claude (v2 beacon).
+    c.send(&C2D::Input { id, bytes: b"sudo su\r".to_vec() })?;
+    ssh_cli_poll_state(30, |s| {
+        s.terminals.iter().any(|t| {
+            t.id == id
+                && t.nested_chain
+                    .as_ref()
+                    .is_some_and(|n| n.cmds == ["sudo su"])
+        })
+    })
+    .map_err(|e| e.context("breadcrumb never opened"))?;
+    c.send(&C2D::Input { id, bytes: b"cd /\r".to_vec() })?;
+    std::thread::sleep(Duration::from_millis(400));
+    c.send(&C2D::Input { id, bytes: b"claude\r".to_vec() })?;
+    ssh_cli_poll_state(60, |s| {
+        s.terminals.iter().any(|t| {
+            t.id == id
+                && t.inner_cli.as_ref().is_some_and(|cli| {
+                    cli.adapter == "claude"
+                        && cli.nested
+                        && cli.resume_token.as_deref() == Some(sid_s.as_str())
+                })
+                && t.nested_chain
+                    .as_ref()
+                    .is_some_and(|n| n.cli_cwd.as_deref() == Some(std::path::Path::new("/")))
+        })
+    })
+    .map_err(|e| e.context("nested beacon never minted the identity + cli_cwd"))?;
+
+    // Link death from OUTSIDE (the field seam): kill the outer stand-in
+    // shell as root — its whole session (sudo/su/claude) dies with the pty.
+    let seam0 = daemon_log_len();
+    run_wsl_sh(&format!("sudo -n kill -9 {outer_pid} 2>/dev/null; exit 0"))?;
+    c.snapshot_until(30, |s| {
+        s.terminals.iter().any(|t| t.id == id && t.reconnecting)
+    })
+    .map_err(|e| e.context("auto-reconnect never scheduled"))?;
+    c.snapshot_until(90, |s| {
+        s.terminals
+            .iter()
+            .any(|t| t.id == id && t.status == TermStatus::Running && !t.reconnecting)
+    })
+    .map_err(|e| e.context("reconnect never resolved"))?;
+
+    // JOB 2: the engine re-types the chain, then the composed resume step —
+    // its very existence in the log proves the breadcrumb (sid + cli_cwd)
+    // SURVIVED the seam into the relaunch (JOB 1), because it is composed
+    // at launch from the persisted meta, before any fresh beacon.
+    let resume_line = format!("resuming the inner CLI: cd '/' && claude --resume {sid}");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if log_since(seam0).contains(&resume_line) {
+            break;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "resume step never typed; log tail: {}",
+            log_since(seam0).chars().rev().take(2000).collect::<String>().chars().rev().collect::<String>()
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let slog = log_since(seam0);
+    // JOB 1: the armed relaunch must NOT have retired the breadcrumb before
+    // re-establishing it (the old first-pre clear — the tracking gap).
+    let retire = slog.find("nested-shell breadcrumb retired");
+    let reest = slog
+        .find("nested chain re-established")
+        .ok_or_else(|| anyhow::anyhow!("no re-establish completion line"))?;
+    anyhow::ensure!(
+        retire.is_none_or(|r| r > reest),
+        "the trigger pre retired the breadcrumb (tracking gap regressed)"
+    );
+    // JOB 2 ground truth: the fake claude really ran — as root, in /, with
+    // --resume <sid> (the argv log is written by the process itself).
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let argv = run_wsl_sh("cat /tmp/tc-nested-probe2/argv.log 2>/dev/null; exit 0")?;
+        if argv
+            .lines()
+            .any(|l| l.contains("user=root") && l.contains("cwd=/ ") && l.contains(&format!("--resume {sid}")))
+        {
+            break;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "resumed claude argv proof never appeared: {argv:?}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // JOB 1 attribution: the relaunched claude's beacon was ACCEPTED during
+    // the re-opened episode (not diverted to the ordinary lane, not
+    // dropped) — the forked sid makes the accept loggable and the identity
+    // hand-off observable.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !log_since(seam0).contains(&format!("tcbeacon claude session {sid2} tagged nested")) {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "the re-established episode never accepted the forked-session beacon"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    // State: breadcrumb + the FORKED identity present after the full cycle
+    // (the next seam would resume sid2 — the live conversation).
+    let sid2_s = sid2.to_string();
+    ssh_cli_poll_state(30, |s| {
+        s.terminals.iter().any(|t| {
+            t.id == id
+                && t.inner_cli.as_ref().is_some_and(|cli| {
+                    cli.nested && cli.resume_token.as_deref() == Some(sid2_s.as_str())
+                })
+                && t.nested_chain
+                    .as_ref()
+                    .is_some_and(|n| n.cli_cwd.as_deref() == Some(std::path::Path::new("/")))
+        })
+    })
+    .map_err(|e| e.context("breadcrumb/forked identity missing after the cycle"))?;
+    // The seam notice reads the full-sequence wording (attach replay).
+    c.send(&C2D::Attach { id, cols: 120, rows: 30 })?;
+    c.await_output(id, 30, |l| {
+        l.contains("and resuming its claude session automatically")
+    })
+    .map_err(|e| e.context("full-sequence seam notice never rendered"))?;
+    ensure_no_new_panics(log0)?;
+    delete_terminal(&mut c, id);
     Ok(())
 }
 
@@ -10591,6 +10886,7 @@ pub fn run(case: Option<&str>) -> anyhow::Result<()> {
         ("ssh_cli_authdead", case_ssh_cli_authdead),
         ("claude_beacon", case_claude_beacon),
         ("ssh_nested_claude", case_ssh_nested_claude),
+        ("ssh_nested_reestablish", case_ssh_nested_reestablish),
         ("codex_beacon", case_codex_beacon),
         ("cwd_broadcast", case_cwd_broadcast),
         ("history_parity", case_history_parity),
