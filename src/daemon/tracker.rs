@@ -542,10 +542,23 @@ fn truncate_chars(s: &str, max: usize) -> String {
 ///
 /// F2 (`auto` = the launch armed the chain re-establish): the line says the
 /// chain is being re-typed automatically instead of asking for it — but the
-/// inner-CLI half keeps the manual resume hint verbatim (the CLI is never
-/// auto-resumed across the boundary; I1 unchanged). The pre-F2 wording is
-/// preserved byte-exact for `auto = false` (opt-out / hookless spawns).
-pub fn nested_restore_notice(chain: &NestedChain, cli: Option<&InnerCli>, auto: bool) -> String {
+/// inner-CLI half keeps the manual resume hint verbatim. The pre-F2 wording
+/// is preserved byte-exact for `auto = false` (opt-out / hookless spawns).
+///
+/// F3 (nested-cli-resume): `auto_resume_step` is the composed final step
+/// (`nested_resume_step`) when the FULL sequence — chain re-type + inner-CLI
+/// resume — will actually run. Only then does the line promise the resume;
+/// the exact command stays inline so an aborted sequence (credential prompt,
+/// timeout, user keystroke) still leaves the copy-pasteable hint on screen —
+/// preface lines cannot be appended mid-session for already-attached
+/// clients, so the promise and the fallback ride the same line. Every other
+/// case keeps the honest manual wording byte-exact.
+pub fn nested_restore_notice(
+    chain: &NestedChain,
+    cli: Option<&InnerCli>,
+    auto: bool,
+    auto_resume_step: Option<&str>,
+) -> String {
     let joined = chain
         .cmds
         .iter()
@@ -580,6 +593,14 @@ pub fn nested_restore_notice(chain: &NestedChain, cli: Option<&InnerCli>, auto: 
         .map(|p| super::bootstrap::sh_single_quote(&p.to_string_lossy()))
         .filter(|q| q.chars().count() <= 120);
     if auto {
+        if let Some(step) = auto_resume_step {
+            // F3 full-sequence variant: the chain types itself AND the
+            // inner CLI resumes as the final step (nested-cli-resume). The
+            // exact command doubles as the abort fallback (doc above).
+            return format!(
+                "── re-establishing this terminal's nested shell ({c}) and resuming its {a} session automatically — if it stops: {step} ──"
+            );
+        }
         return match quoted_cd {
             // Auto variant A: the chain types itself; the resume stays manual.
             Some(q) => format!(
@@ -600,6 +621,72 @@ pub fn nested_restore_notice(chain: &NestedChain, cli: Option<&InnerCli>, auto: 
         None => format!(
             "── this terminal had a nested shell ({c}); its {a} session was not auto-resumed — re-establish: {c}; {a} --resume {t} (run it from the conversation's directory) ──"
         ),
+    }
+}
+
+/// Nested-cli-resume: the final auto-typed re-establish step —
+/// `cd '<cli_cwd>' && <adapter resume>` — composed ONLY from a COMPLETE
+/// breadcrumb: a nested-tagged identity whose concrete session token passes
+/// the r3-S1 charset gate (via `restore_trailing`, the same choke point
+/// every restore shares) AND a beacon-witnessed `chain.cli_cwd`
+/// (single-quoted; the only writer of that field is the v2 beacon). Either
+/// half missing ⇒ None — never guess a session, never guess a directory.
+/// The step is TYPED by the re-establish engine strictly after the chain's
+/// last command confirmed (reestablish.rs Done edge), so it always executes
+/// INSIDE the re-established nested shell — the original spec-I1 concern
+/// (resuming against the login user's session store) is resolved by that
+/// ordering, not by refusing the resume. The launch-time restore arms keep
+/// refusing nested identities (`cli_wants_resume`) for exactly that reason.
+pub fn nested_resume_step(chain: &NestedChain, cli: Option<&InnerCli>) -> Option<String> {
+    let cli = cli?;
+    if !cli.nested {
+        return None; // the non-nested lane has its own restore trailing
+    }
+    let token = cli.resume_token.as_deref()?;
+    let resume = restore_trailing(&cli.adapter, Some(token))?;
+    let cwd = chain.cli_cwd.as_ref()?;
+    let q = super::bootstrap::sh_single_quote(&cwd.to_string_lossy());
+    Some(format!("cd {q} && {resume}"))
+}
+
+/// Nested-cli-resume: the hint pushed when an armed FULL sequence stops
+/// before its resume step ran (credential prompt / timeout / user keystroke
+/// / collapsed chain) — the resume command the notice used to carry, as a
+/// standalone preface line. Golden-tested.
+pub fn nested_resume_abort_hint(adapter: &str, step: &str) -> String {
+    format!("── {adapter} session was not auto-resumed — resume: {step} ──")
+}
+
+/// Nested-cli-resume (regression fix, hypothesis c): how a hook-witnessed
+/// nested-shell opener updates the breadcrumb. Pre-fix the daemon REPLACED
+/// the chain unconditionally, which destroyed `cli_cwd` (and truncated
+/// multi-hop chains to their opener) every re-establish cycle — the
+/// auto-typed `sudo su` re-recorded a bare chain and the resume identity
+/// was gone. Rule: re-witnessing the SAME opener (typically our own
+/// auto-typed step 1, or the user re-entering their chain) PRESERVES the
+/// recorded chain — deeper hops and the beacon-witnessed `cli_cwd` are
+/// still the truth of the world being rebuilt — refreshing only
+/// `entered_cwd`/`opened_ms`. A DIFFERENT opener replaces it (the newest
+/// witnessed chain wins, exactly as before).
+pub fn reopen_nested_chain(
+    prior: Option<NestedChain>,
+    cmd: &str,
+    entered_cwd: &Path,
+    now_ms: u64,
+) -> NestedChain {
+    let cmd = cmd.trim();
+    match prior {
+        Some(mut chain) if chain.cmds.first().is_some_and(|c| c == cmd) => {
+            chain.entered_cwd = entered_cwd.to_path_buf();
+            chain.opened_ms = now_ms;
+            chain
+        }
+        _ => NestedChain {
+            cmds: vec![cmd.to_string()],
+            entered_cwd: entered_cwd.to_path_buf(),
+            cli_cwd: None,
+            opened_ms: now_ms,
+        },
     }
 }
 
@@ -1247,7 +1334,7 @@ mod tests {
         chain: &crate::state::NestedChain,
         cli: Option<&InnerCli>,
     ) -> String {
-        nested_restore_notice(chain, cli, false)
+        nested_restore_notice(chain, cli, false, None)
     }
 
     /// F2 goldens — the `auto = true` variants: the chain announces itself
@@ -1259,27 +1346,125 @@ mod tests {
         let cli = nested_cli("claude", Some("xyz"));
         // Auto variant A.
         assert_eq!(
-            nested_restore_notice(&chain(&["sudo su"], Some("/")), Some(&cli), true),
+            nested_restore_notice(&chain(&["sudo su"], Some("/")), Some(&cli), true, None),
             "── re-establishing this terminal's nested shell (sudo su) automatically; its claude session was not auto-resumed — resume: cd '/'; claude --resume xyz ──"
         );
         // Auto variant B.
         assert_eq!(
-            nested_restore_notice(&chain(&["sudo su"], None), Some(&cli), true),
+            nested_restore_notice(&chain(&["sudo su"], None), Some(&cli), true, None),
             "── re-establishing this terminal's nested shell (sudo su) automatically; its claude session was not auto-resumed — resume: claude --resume xyz (run it from the conversation's directory) ──"
         );
         // Auto variant C.
         assert_eq!(
-            nested_restore_notice(&chain(&["sudo su"], None), None, true),
+            nested_restore_notice(&chain(&["sudo su"], None), None, true, None),
             "── re-establishing this terminal's nested shell (sudo su) automatically; anything that ran inside it was not restored ──"
         );
         // The unsafe-token choke point degrades to auto-C — never a mangled
         // command, exactly like the manual lane.
         let evil = nested_cli("claude", Some("x; rm -rf /"));
-        let n = nested_restore_notice(&chain(&["sudo su"], Some("/")), Some(&evil), true);
+        let n = nested_restore_notice(&chain(&["sudo su"], Some("/")), Some(&evil), true, None);
         assert!(
             n.contains("anything that ran inside it was not restored") && !n.contains("rm -rf"),
             "unsafe token must degrade to auto variant C: {n}"
         );
+    }
+
+    /// Nested-cli-resume — the FULL-sequence notice: promised only when the
+    /// composed resume step rides along, exact command inline (it doubles as
+    /// the abort fallback), and the abort hint golden.
+    #[test]
+    fn nested_resume_notice_and_hint_golden() {
+        let cli = nested_cli("claude", Some("xyz"));
+        let ch = chain(&["sudo su"], Some("/"));
+        let step = nested_resume_step(&ch, Some(&cli)).unwrap();
+        assert_eq!(step, "cd '/' && claude --resume xyz");
+        assert_eq!(
+            nested_restore_notice(&ch, Some(&cli), true, Some(&step)),
+            "── re-establishing this terminal's nested shell (sudo su) and resuming its claude session automatically — if it stops: cd '/' && claude --resume xyz ──"
+        );
+        assert_eq!(
+            nested_resume_abort_hint("claude", &step),
+            "── claude session was not auto-resumed — resume: cd '/' && claude --resume xyz ──"
+        );
+        // auto=false never promises a resume even when a step exists (the
+        // manual notice is the honest wording for a hookless/opted-out spawn).
+        assert_eq!(
+            nested_restore_notice(&ch, Some(&cli), false, Some(&step)),
+            "── this terminal had a nested shell (sudo su); its claude session was not auto-resumed — re-establish: sudo su; cd '/'; claude --resume xyz ──"
+        );
+    }
+
+    /// Nested-cli-resume — the resume-step gating matrix: a COMPLETE
+    /// breadcrumb (nested identity + safe concrete token + beacon-witnessed
+    /// cwd) or nothing. Missing/unsafe halves must never compose a guess.
+    #[test]
+    fn nested_resume_step_gating_matrix() {
+        let full = chain(&["sudo su"], Some("/srv/app"));
+        let no_cwd = chain(&["sudo su"], None);
+        let cli = nested_cli("claude", Some("abc-123"));
+        // Complete breadcrumb ⇒ the exact typed step (quoted cwd, && join).
+        assert_eq!(
+            nested_resume_step(&full, Some(&cli)).as_deref(),
+            Some("cd '/srv/app' && claude --resume abc-123")
+        );
+        // Missing cwd ⇒ None (never guess the directory).
+        assert_eq!(nested_resume_step(&no_cwd, Some(&cli)), None);
+        // Missing identity / missing token ⇒ None (never guess the session).
+        assert_eq!(nested_resume_step(&full, None), None);
+        assert_eq!(nested_resume_step(&full, Some(&nested_cli("claude", None))), None);
+        // Unsafe token ⇒ None via the shared r3-S1 choke point.
+        assert_eq!(
+            nested_resume_step(&full, Some(&nested_cli("claude", Some("x; rm -rf /")))),
+            None
+        );
+        // A NON-nested identity never rides this lane (it has its own
+        // restore trailing at the OUTER shell).
+        let mut outer = nested_cli("claude", Some("abc-123"));
+        outer.nested = false;
+        assert_eq!(nested_resume_step(&full, Some(&outer)), None);
+        // Unknown adapter ⇒ None (registry gate).
+        assert_eq!(
+            nested_resume_step(&full, Some(&nested_cli("frobnicator", Some("abc")))),
+            None
+        );
+        // Quote-bearing cwd is escaped, never spliced raw.
+        let quoted = chain(&["sudo su"], Some("/a'b"));
+        assert_eq!(
+            nested_resume_step(&quoted, Some(&cli)).as_deref(),
+            Some("cd '/a'\\''b' && claude --resume abc-123")
+        );
+    }
+
+    /// Nested-cli-resume regression (hypothesis c): re-witnessing the SAME
+    /// opener preserves the recorded chain — deeper hops AND the
+    /// beacon-witnessed cli_cwd survive a re-establish cycle; a different
+    /// opener still replaces (newest witnessed chain wins); no prior chain
+    /// mints a fresh one.
+    #[test]
+    fn reopen_nested_chain_preserves_breadcrumb() {
+        let p = std::path::Path::new("/home/tester");
+        // Fresh open.
+        let fresh = reopen_nested_chain(None, "sudo su", p, 10);
+        assert_eq!(fresh.cmds, s(&["sudo su"]));
+        assert_eq!(fresh.cli_cwd, None);
+        assert_eq!(fresh.opened_ms, 10);
+        // Same opener (the auto-typed step 1): hops + cli_cwd preserved,
+        // entered_cwd/opened_ms refreshed.
+        let prior = crate::state::NestedChain {
+            cmds: s(&["sudo su", "su - deploy"]),
+            entered_cwd: PathBuf::from("/old"),
+            cli_cwd: Some(PathBuf::from("/srv/app")),
+            opened_ms: 1,
+        };
+        let kept = reopen_nested_chain(Some(prior.clone()), "  sudo su ", p, 20);
+        assert_eq!(kept.cmds, s(&["sudo su", "su - deploy"]), "hops must survive");
+        assert_eq!(kept.cli_cwd, Some(PathBuf::from("/srv/app")), "cli_cwd must survive");
+        assert_eq!(kept.entered_cwd, p);
+        assert_eq!(kept.opened_ms, 20);
+        // A different opener replaces — the user built a NEW chain.
+        let replaced = reopen_nested_chain(Some(prior), "su - other", p, 30);
+        assert_eq!(replaced.cmds, s(&["su - other"]));
+        assert_eq!(replaced.cli_cwd, None);
     }
 
     /// F1 spec §4.3 goldens — byte-exact variants A/B/C, the escaping choke
