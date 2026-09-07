@@ -19,6 +19,8 @@ pub mod perf;
 pub mod procinfo;
 mod reconnect;
 use reconnect::Reconnect;
+mod nesthook;
+use nesthook::{NestHook, NestState};
 mod reestablish;
 use reestablish::Reestablish;
 mod remote_probe;
@@ -537,6 +539,13 @@ pub struct Core {
     /// `pump_reestablish` (250ms flush tick) gates each further step on
     /// output quiescence and ABORTS on any credential-prompt tail line.
     reestablish: Mutex<HashMap<Uuid, Reestablish>>,
+    /// nested-shell-hooks: in-flight hook injections (LEAF lock): terminal →
+    /// phase state. Armed by `open_nested_chain` the moment a nested-shell
+    /// episode is WITNESSED in an already-hooked terminal, driven by
+    /// `pump_nesthook` (250ms flush tick). See `nesthook` for the whole
+    /// contract — why the nested shell needs its own token, why the payload
+    /// is written in two phases, and every honest abort.
+    nesthooks: Mutex<HashMap<Uuid, NestHook>>,
     /// Remote CLI-resume probe bookkeeping (LEAF locks inside): the §4.6
     /// auth-dead cache + the 30s listing cooldown. Arc so probe worker
     /// threads (M0 snapshot legs) borrow no Core.
@@ -858,6 +867,7 @@ impl Core {
         }
         let now = now_ms();
         let is_pre = matches!(ev.verb, blocks::HookVerb::Pre { .. });
+        let is_init = matches!(ev.verb, blocks::HookVerb::Init { .. });
         // P6a §7.2: the exec hook's command line, captured for the hook-based
         // inner-CLI fold below (WSL/remote process trees are invisible to the
         // Win32 tracker — the hooks are the only truthful witness).
@@ -902,15 +912,36 @@ impl Core {
             blocks::HookVerb::Pre { .. } => pre_cwd_fill.clone(),
             _ => None,
         };
+        // nested-shell-hooks: which shell emitted this hook (filled under
+        // the blocks lock by `classify_token`; the early returns above all
+        // happen before any use of it).
+        let scope: blocks::HookScope;
         // (epoch, changed recs, store snapshot to persist) — built under the
         // leaf blocks lock, acted on after it is released.
         let outcome = {
             let mut map = self.blocks.lock();
             let Some(store) = map.get_mut(&id) else { return };
-            // accept_token also marks the bootstrap live (P5 hooks_live).
-            if !store.accept_token(&ev.token) {
-                log::warn!("terminal {id}: block hook with wrong token rejected");
-                return;
+            // classify_token also marks the bootstrap live (P5 hooks_live).
+            // nested-shell-hooks: it additionally NAMES the shell that spoke
+            // — the outer login shell Pulse spawned, or a nested shell it
+            // witnessed being opened and injected hooks into. Both are
+            // accepted; only the outer one may retire the nested world.
+            match store.classify_token(&ev.token) {
+                Some(sc) => scope = sc,
+                None => {
+                    log::warn!("terminal {id}: block hook with wrong token rejected");
+                    return;
+                }
+            }
+            // A shell speaking proves every world INSIDE it is gone: drop
+            // the deeper nested tokens so a dead shell's token can never
+            // accept a hook again (`exit` out of `su - deploy`).
+            let dropped = store.pop_nested_below(scope.depth());
+            if dropped > 0 {
+                log::debug!(
+                    "terminal {id}: {dropped} nested hook token(s) retired (depth {} spoke)",
+                    scope.depth()
+                );
             }
             match ev.verb {
                 blocks::HookVerb::Init { pid, shell, home, user } => {
@@ -976,6 +1007,14 @@ impl Core {
         if let Some(home) = init_home {
             self.hook_homes.lock().insert(id, home);
         }
+        // nested-shell-hooks: the injected shell's OWN init is the proof the
+        // hooks took — it flips the injection to Hooked, which is what the
+        // parked inner-CLI resume waits on.
+        if is_init {
+            if let blocks::HookScope::Nested { depth } = scope {
+                self.nesthook_on_init(id, depth);
+            }
+        }
         // P5 Prompt waiters resolve on EVERY token-checked `pre` — including
         // a cwd-refresh pre with no open block (the first-prompt case), which
         // yields no record outcome at all. Runs with the blocks lock released.
@@ -1022,15 +1061,24 @@ impl Core {
             // not consume — the nested world really ending. Un-armed
             // spawns (opt-out / hookless / no chain) keep the pre-F2
             // one-shot retirement byte-identical.
-            let consumed = self.reestablish_on_pre(id);
-            if !consumed {
-                self.clear_nested_chain(id, "hooked prompt returned");
+            // nested-shell-hooks: BOTH rules below are true only for the
+            // OUTER shell. A nested `pre` is the injected shell's own prompt
+            // — the nested world is very much alive, and the F2 chain
+            // trigger must never fire on it. Instead it is the settled
+            // HOOKED nested prompt the parked inner-CLI resume waits for.
+            if scope.is_outer() {
+                let consumed = self.reestablish_on_pre(id);
+                if !consumed {
+                    self.clear_nested_chain(id, "hooked prompt returned");
+                }
+            } else {
+                self.reestablish_on_nested_pre(id);
             }
         }
         let Some((epoch, recs, snap)) = outcome else { return };
         self.clear_cli_block_on_close(id, &recs);
         if let Some(cmd) = &exec_cmd {
-            self.track_hook_exec(id, epoch, abs_off, cmd, hook_cwd);
+            self.track_hook_exec(id, epoch, abs_off, cmd, hook_cwd, scope);
         }
         if let Some(s) = snap {
             s.save(id);
@@ -1190,6 +1238,7 @@ impl Core {
         // F2: a dying session ends any in-flight chain re-establish (the
         // relaunch re-arms from the persisted breadcrumb when one survives).
         self.cancel_reestablish(id, "session exited");
+        self.cancel_nesthook(id, "session exited");
         // Flush this terminal's journal so the tail survives a crash. No
         // in-stream "process exited" marker: the sidebar status dot and the
         // Restore affordance already say it, and any seam text would survive
@@ -1625,9 +1674,20 @@ impl Core {
             None
         };
         let nested_notice: Option<String> = meta.nested_chain.as_ref().map(|chain| {
-            log::info!(
-                "terminal {id}: nested-shell breadcrumb present — shell-only restore (no auto-resume across a privilege boundary)"
-            );
+            // Say what was actually DECIDED (the pre-fix line claimed
+            // "shell-only restore" unconditionally — even on the very
+            // restores that were about to auto-resume the inner CLI).
+            match (&nested_resume, auto_reestablish) {
+                (Some((step, _)), _) => log::info!(
+                    "terminal {id}: nested-shell breadcrumb present — re-establishing the chain, then resuming the inner CLI ({step})"
+                ),
+                (None, true) => log::info!(
+                    "terminal {id}: nested-shell breadcrumb present — re-establishing the chain; shell-only (no complete inner-CLI identity to resume)"
+                ),
+                (None, false) => log::info!(
+                    "terminal {id}: nested-shell breadcrumb present — shell-only restore (auto re-establish is off for this terminal)"
+                ),
+            }
             tracker::nested_restore_notice(
                 chain,
                 meta.inner_cli.as_ref().filter(|c| c.nested),
@@ -2291,6 +2351,10 @@ impl Core {
             self.broadcast_snapshot();
         }
         log::info!("terminal {id}: nested-shell episode opened ({})", cmd.trim());
+        // nested-shell-hooks: the witnessed opener is the ONE trigger for
+        // hook injection — user-typed or auto-typed by the F2 engine, the
+        // same exec hook witnesses both.
+        self.arm_nesthook(id, cmd);
     }
 
     /// F1 spec §2.4: a D2 synthetic submission landed while a nested episode
@@ -2330,6 +2394,10 @@ impl Core {
     /// Snapshot; a terminal with nothing nested pays a marker probe only.
     fn clear_nested_chain(&self, id: Uuid, why: &str) {
         let had_marker = self.nested_open.lock().remove(&id);
+        // nested-shell-hooks: the nested world is gone, so its injection
+        // bookkeeping is too (the tokens themselves were already retired by
+        // `pop_nested_below` when the outer shell spoke).
+        self.nesthooks.lock().remove(&id);
         let changed = {
             let mut state = self.state.lock();
             let Some(t) = state.terminal_mut(id) else { return };
@@ -2457,7 +2525,22 @@ impl Core {
             log::debug!("terminal {id}: tcbeacon before hooks_live dropped");
             return;
         }
-        if self.cli_blocks.lock().contains_key(&id) {
+        // nested-shell-hooks: with the nested shell hooked, a CLI launched
+        // INSIDE it opens a real cli_block — so "an open CLI block" no
+        // longer implies the OUTER world. Route by the identity that block
+        // actually established: a nested-tagged one keeps the nested lane
+        // (which is the only lane allowed to write `cli_cwd` and to mint
+        // from a beacon), everything else keeps the pre-nested behavior
+        // byte-for-byte.
+        let nested_identity = self
+            .state
+            .lock()
+            .terminal(id)
+            .and_then(|t| t.inner_cli.as_ref().map(|c| c.nested))
+            .unwrap_or(false);
+        if self.cli_blocks.lock().contains_key(&id)
+            && !(nested_identity && self.nested_open.lock().contains(&id))
+        {
             // Ordinary lane, byte-identical to pre-F1 (anti-hijack priority:
             // an open CLI block always outranks the nested lane). The
             // deliberate exclusion stands: this lane does NOT consume the v2
@@ -2708,6 +2791,7 @@ impl Core {
         start_off: u64,
         cmd: &str,
         hook_cwd: Option<std::path::PathBuf>,
+        scope: blocks::HookScope,
     ) {
         let (cwd, is_ssh, program, args) = {
             let state = self.state.lock();
@@ -2729,7 +2813,7 @@ impl Core {
                 t.args.clone(),
             )
         };
-        let Some(inner) = tracker::analyze_cmdline(cmd, &cwd) else {
+        let Some(inner) = tracker::analyze_cmdline_with_cd(cmd, &cwd) else {
             // F1 spec §2.3: a nested-shell entry (`sudo su`, `su - x`, plain
             // `bash`…) is the one hook-fed exec whose EPISODE the hooks
             // cannot witness — open the breadcrumb instead of a CLI track
@@ -2739,7 +2823,18 @@ impl Core {
             // trust class. Any stale pre-restore chain was already retired
             // by the pre that rendered the prompt this was typed at.
             if tracker::nested_shell_cmd(cmd) {
-                self.open_nested_chain(id, cmd, &cwd);
+                // nested-shell-hooks: a DEEPER hop witnessed by the nested
+                // shell's own hooks (`su - deploy` typed inside `sudo su`)
+                // EXTENDS the recorded chain — it must never replace it with
+                // a bare one-link breadcrumb. Pre-nested-hooks this hop was
+                // invisible to the hooks and only the composer's synthetic
+                // lane could record it; now it arrives as a real exec.
+                if scope.is_outer() {
+                    self.open_nested_chain(id, cmd, &cwd);
+                } else {
+                    self.append_nested_chain(id, cmd);
+                    self.arm_nesthook(id, cmd);
+                }
             }
             return;
         };
@@ -2767,7 +2862,81 @@ impl Core {
         if is_ssh {
             remote_probe::spawn_snapshot_leg(self, id, &inner, program, args, (epoch, start_off));
         }
+        // nested-shell-hooks: an exec witnessed by an INJECTED shell's own
+        // hooks is a CLI running inside the nested world — tag the identity
+        // `nested` (spec I1: it may only ever feed the nested re-establish
+        // lane, never an outer auto-resume) and record the shell's own
+        // hook-reported cwd as the breadcrumb's `cli_cwd`.
+        //
+        // That last line is what unblocks v0.1.13 in the field: `cli_cwd`
+        // used to have exactly ONE writer, the remote v2 beacon, which
+        // cannot report for a remote ROOT user whose ~/.claude has no
+        // consent-installed hook script — so every live ssh terminal carried
+        // `cli_cwd: null` and the auto-resume gate could never arm. The exec
+        // hook is a strictly better witness than the beacon anyway: it is
+        // the shell's own $PWD at the moment the CLI started, not a
+        // self-report. Still never a GUESS — no exec, no cwd.
+        if !scope.is_outer() {
+            self.record_nested_cli(id, inner);
+            return;
+        }
         self.set_inner_cli(id, Some(inner));
+    }
+
+    /// nested-shell-hooks: fold an exec-witnessed inner CLI from inside an
+    /// injected nested shell into the terminal — a nested-tagged identity
+    /// plus the breadcrumb's `cli_cwd`. The resume token rides only when the
+    /// argv NAMED one (`claude --resume <uuid>` — the re-established
+    /// terminal's own resume step, and any resume the user typed): a bare
+    /// `claude` stays token-less and Ambiguous, so the restore preface stays
+    /// honest instead of guessing a session id.
+    fn record_nested_cli(&self, id: Uuid, inner: crate::state::InnerCli) {
+        let mut cli = inner;
+        cli.nested = true;
+        let changed = {
+            let mut state = self.state.lock();
+            let Some(t) = state.terminal_mut(id) else { return };
+            if matches!(t.kind, TermKind::Claude { .. }) {
+                return;
+            }
+            let mut changed = false;
+            if let Some(chain) = t.nested_chain.as_mut() {
+                if chain.cli_cwd.as_ref() != Some(&cli.cwd) {
+                    chain.cli_cwd = Some(cli.cwd.clone());
+                    changed = true;
+                }
+            }
+            // A beacon-refined Explicit token must not be clobbered by a
+            // later re-witness of the SAME adapter that carries none (the
+            // `keep_explicit` rule, applied to the nested lane).
+            if let Some(cur) = &t.inner_cli {
+                if cur.nested
+                    && cur.adapter == cli.adapter
+                    && cur.confidence == CliConfidence::Explicit
+                    && cli.confidence != CliConfidence::Explicit
+                {
+                    cli.resume_token = cur.resume_token.clone();
+                    cli.confidence = CliConfidence::Explicit;
+                }
+            }
+            if t.inner_cli.as_ref() != Some(&cli) {
+                t.inner_cli = Some(cli.clone());
+                changed = true;
+            }
+            if changed {
+                state.save_logged("nested inner_cli (exec hook)");
+            }
+            changed
+        };
+        if changed {
+            log::info!(
+                "terminal {id}: nested {} attributed from the injected shell's exec hook (session {:?}, cwd {:?})",
+                cli.adapter,
+                cli.resume_token,
+                cli.cwd
+            );
+            self.broadcast_snapshot();
+        }
     }
 
     /// Create + launch a terminal, returning its id. Shared by the legacy
@@ -2820,6 +2989,7 @@ impl Core {
     fn delete_terminal_inner(&self, id: Uuid) {
         self.reconnects.lock().remove(&id);
         self.reestablish.lock().remove(&id);
+        self.nesthooks.lock().remove(&id);
         self.mutate(|s| s.terminals.retain(|t| t.id != id));
         // F1: every parked waiter for this id (ALL kinds — Exit included)
         // fails "deleted" NOW. on_exit early-returns for a deleted id, so
@@ -3414,6 +3584,12 @@ impl Core {
                 // writes go through the session writer directly, never this
                 // arm, so the automation can't cancel itself).
                 self.cancel_reestablish(id, "user input");
+                // nested-shell-hooks: a SUBMITTED line (ends in Enter)
+                // keeps the injection waiting for the next settled prompt;
+                // half-typed bytes hand the shell straight back. Phase 2
+                // always FINISHES (the shell is parked in our `read`).
+                let submitted = bytes.last().is_some_and(|b| *b == b'\r' || *b == b'\n');
+                self.nesthook_on_input(id, submitted);
                 // Clone the writer Arc out and write OUTSIDE the sessions
                 // mutex (SubmitCommand's pattern): a full ConPTY input pipe
                 // (app stopped reading stdin) blocks write_all indefinitely,
@@ -3601,6 +3777,9 @@ impl Core {
         // F2: a composer submission is the user driving the shell — any
         // in-flight nested-chain re-establish stops.
         self.cancel_reestablish(id, "user input");
+        // A composer submission is a whole line: the injection keeps waiting
+        // for the prompt that comes back after it (nested-shell-hooks).
+        self.nesthook_on_input(id, true);
         if let Err(msg) = validate_submit_command(&cmd) {
             log::warn!("SubmitCommand for {id} refused: {msg}");
             if let Some(f) = frame_bytes(&D2C::Error {
@@ -4607,6 +4786,7 @@ pub fn run() -> anyhow::Result<()> {
         expected_exits: Mutex::new(HashSet::new()),
         reconnects: Mutex::new(HashMap::new()),
         reestablish: Mutex::new(HashMap::new()),
+        nesthooks: Mutex::new(HashMap::new()),
         probe_rt: Arc::new(remote_probe::Runtime::new()),
         probing: Mutex::new(HashSet::new()),
         hook_homes: Mutex::new(HashMap::new()),
@@ -4702,6 +4882,7 @@ pub fn run() -> anyhow::Result<()> {
                 // F2 nested-chain re-establish step gating (same no-op
                 // fast path: one lock probe while the map is empty).
                 flush_core.pump_reestablish();
+            flush_core.pump_nesthook();
                 // pw5-F3: coalesced state.json save for relabel-class
                 // changes (live_cwd folds, tracker verdicts). Serialize AND
                 // write stay under the state mutex — totally ordered with

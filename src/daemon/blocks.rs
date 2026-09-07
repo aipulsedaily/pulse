@@ -427,6 +427,49 @@ pub struct BlockStore {
     /// Runtime truth only — never persisted (the sidecar serializes
     /// epoch/base/recs); a launch rotation's `close_dangling` flushes it.
     pending_close: Option<PendingClose>,
+    /// nested-shell-hooks: hook tokens for the NESTED shells Pulse injected
+    /// into during this spawn, innermost LAST (index 0 = depth 1). Each is
+    /// minted per injection and registered ALONGSIDE `token` — the outer
+    /// shell's token never rotates for a nested episode, so a hook from
+    /// either world is accepted, and `classify_token` still says WHICH world
+    /// spoke. That distinction is load-bearing: the F1 episode-end rule
+    /// ("the outer prompt returning means the nested world is gone") is only
+    /// true for an OUTER-token `pre`, and the F2 re-establish trigger must
+    /// never fire on a nested prompt.
+    ///
+    /// Runtime truth only — never persisted, dropped by `rotate` (a new
+    /// spawn has no nested world yet) and popped back by `pop_nested_below`
+    /// when a shallower shell speaks again.
+    nested_tokens: Vec<String>,
+}
+
+/// nested-shell-hooks: cap on registered nested tokens for one spawn — the
+/// same "a re-establish line is a hint, not a transcript" bound the
+/// breadcrumb chain uses. Beyond it, injection stops (and says so) rather
+/// than growing an unbounded accept-list.
+pub const NESTED_TOKEN_MAX: usize = 8;
+
+/// nested-shell-hooks: which shell a token-checked hook came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookScope {
+    /// The login shell Pulse itself spawned (the rcfile/ps1/PROMPT lane).
+    Outer,
+    /// A nested shell Pulse witnessed being opened and injected hooks into.
+    /// `depth` is 1 for the first `sudo su`, 2 for a `su - deploy` inside
+    /// it, and so on.
+    Nested { depth: usize },
+}
+
+impl HookScope {
+    pub fn is_outer(self) -> bool {
+        matches!(self, HookScope::Outer)
+    }
+    pub fn depth(self) -> usize {
+        match self {
+            HookScope::Outer => 0,
+            HookScope::Nested { depth } => depth,
+        }
+    }
 }
 
 /// D* (perf-wave-3): the armed-but-deferred block close. The pre/9;9 OSCs
@@ -500,6 +543,7 @@ impl BlockStore {
             hooks_live: false,
             synthetic_open: false,
             pending_close: None,
+            nested_tokens: Vec::new(),
         }
     }
 
@@ -523,16 +567,57 @@ impl BlockStore {
         beyond
     }
 
-    /// Token gate for an incoming hook event: wrong token ⇒ false (the caller
-    /// logs the spoof and drops the event); right token ⇒ marks the bootstrap
-    /// live for this spawn and returns true. The single check site, so
-    /// `hooks_live` can never disagree with what actually got accepted.
-    pub fn accept_token(&mut self, token: &str) -> bool {
-        if token != self.token {
-            return false;
-        }
+    /// Token gate for an incoming hook event: `None` ⇒ the caller logs the
+    /// spoof and drops the event; `Some(scope)` ⇒ marks the bootstrap live
+    /// for this spawn. The single check site, so `hooks_live` can never
+    /// disagree with what actually got accepted.
+    ///
+    /// nested-shell-hooks: the gate also NAMES the shell. `None`
+    /// ⇒ the caller logs the spoof and drops the event (byte-identical to
+    /// the pre-nested `accept_token(false)` path); `Some(scope)` marks the
+    /// bootstrap live and tells the caller whether the outer login shell or
+    /// an injected nested shell spoke.
+    ///
+    /// Deliberately checks the OUTER token first: it is the hot path (every
+    /// prompt of every terminal), and a nested token can never collide with
+    /// it (both are freshly minted 64-bit randoms).
+    pub fn classify_token(&mut self, token: &str) -> Option<HookScope> {
+        let scope = if token == self.token {
+            HookScope::Outer
+        } else {
+            let depth = self.nested_tokens.iter().position(|t| t == token)? + 1;
+            HookScope::Nested { depth }
+        };
         self.hooks_live = true;
-        true
+        Some(scope)
+    }
+
+    /// Register a freshly minted token for a nested shell about to be
+    /// injected, returning its depth (1-based). Capped at `NESTED_TOKEN_MAX`:
+    /// a deeper chain stops registering rather than growing an unbounded
+    /// accept-list (`None` ⇒ the caller skips the injection and says so).
+    pub fn push_nested_token(&mut self, token: String) -> Option<usize> {
+        if self.nested_tokens.len() >= NESTED_TOKEN_MAX {
+            return None;
+        }
+        self.nested_tokens.push(token);
+        Some(self.nested_tokens.len())
+    }
+
+    /// A shell at `depth` spoke (0 = the outer login shell), so every world
+    /// INSIDE it is gone: drop those tokens, returning how many. This is
+    /// what stops a stale nested token from accepting hooks after its shell
+    /// exited (`exit` out of `su - deploy` back into `sudo su`), and what
+    /// makes the outer prompt returning a full reset.
+    pub fn pop_nested_below(&mut self, depth: usize) -> usize {
+        let before = self.nested_tokens.len();
+        self.nested_tokens.truncate(depth);
+        before - self.nested_tokens.len()
+    }
+
+    /// How many nested shells are currently hooked (0 = none).
+    pub fn nested_depth(&self) -> usize {
+        self.nested_tokens.len()
     }
 
     /// Spawn rotation (launch()): new epoch, fresh token, and the liveness
@@ -545,6 +630,9 @@ impl BlockStore {
         self.token = token;
         self.hooks_live = false;
         self.synthetic_open = false;
+        // nested-shell-hooks: a fresh spawn has no nested world yet — the
+        // old nested shells died with the old process tree.
+        self.nested_tokens.clear();
     }
 
     /// Atomic tmp+rename write (same pattern as SharedState::save), so a
@@ -1099,6 +1187,7 @@ mod tests {
             hooks_live: false,
             synthetic_open: false,
             pending_close: None,
+            nested_tokens: Vec::new(),
         };
         st.evict(100);
         assert_eq!(st.base, 100);
@@ -1127,6 +1216,7 @@ mod tests {
             hooks_live: false,
             synthetic_open: false,
             pending_close: None,
+            nested_tokens: Vec::new(),
         };
         st.open_block("first".into(), 10, 1);
         let changed = st.open_block("second".into(), 90, 2);
@@ -1195,14 +1285,75 @@ mod tests {
         st.rotate(TOK.into());
         assert_eq!(st.epoch, 1);
         assert!(!st.hooks_live, "rotation itself proves nothing");
-        assert!(!st.accept_token("00000000deadbeef"), "wrong token rejected");
+        assert!(st.classify_token("00000000deadbeef").is_none(), "wrong token rejected");
         assert!(!st.hooks_live, "a rejected event must not verify the hooks");
-        assert!(st.accept_token(TOK));
+        assert!(st.classify_token(TOK).is_some());
         assert!(st.hooks_live, "a correct-token event proves the bootstrap ran");
         st.rotate("fedcba9876543210".into());
         assert_eq!(st.epoch, 2);
         assert!(!st.hooks_live, "a new spawn starts unverified again");
-        assert!(!st.accept_token(TOK), "the old token no longer matches");
+        assert!(st.classify_token(TOK).is_none(), "the old token no longer matches");
+    }
+
+    /// nested-shell-hooks — the token scope registry: an injected nested
+    /// shell's token is accepted ALONGSIDE the outer one, `classify_token`
+    /// says which world spoke, a shell speaking retires every world inside
+    /// it, and a spawn rotation drops them all.
+    #[test]
+    fn nested_token_scopes() {
+        let mut st = BlockStore::load(Uuid::new_v4());
+        st.rotate(TOK.into());
+        assert_eq!(st.nested_depth(), 0);
+        assert_eq!(st.classify_token(TOK), Some(HookScope::Outer));
+        // An unregistered token is still a spoof — the stale-token warning
+        // path is unchanged for everything we did not mint.
+        assert!(st.classify_token("deadbeefdeadbeef").is_none());
+
+        assert_eq!(st.push_nested_token("aaaa1111aaaa1111".into()), Some(1));
+        assert_eq!(st.push_nested_token("bbbb2222bbbb2222".into()), Some(2));
+        assert_eq!(st.nested_depth(), 2);
+        assert_eq!(
+            st.classify_token("aaaa1111aaaa1111"),
+            Some(HookScope::Nested { depth: 1 })
+        );
+        assert_eq!(
+            st.classify_token("bbbb2222bbbb2222"),
+            Some(HookScope::Nested { depth: 2 }),
+        );
+        assert_eq!(st.classify_token(TOK), Some(HookScope::Outer), "outer still speaks");
+        assert_eq!(HookScope::Outer.depth(), 0);
+        assert!(HookScope::Outer.is_outer());
+        assert!(!HookScope::Nested { depth: 1 }.is_outer());
+
+        // The depth-1 shell speaking means the depth-2 world is gone: its
+        // token stops being accepted (a dead shell can never emit again, but
+        // an unbounded accept-list is exactly how a stale token would come
+        // back to bite).
+        assert_eq!(st.pop_nested_below(1), 1);
+        assert!(st.classify_token("bbbb2222bbbb2222").is_none());
+        assert_eq!(
+            st.classify_token("aaaa1111aaaa1111"),
+            Some(HookScope::Nested { depth: 1 })
+        );
+        // The OUTER shell speaking is a full reset of the nested world.
+        assert_eq!(st.pop_nested_below(0), 1);
+        assert_eq!(st.nested_depth(), 0);
+        assert!(st.classify_token("aaaa1111aaaa1111").is_none());
+
+        // Cap: a chain deeper than NESTED_TOKEN_MAX stops registering rather
+        // than growing the accept-list without bound.
+        for i in 0..NESTED_TOKEN_MAX {
+            assert_eq!(st.push_nested_token(format!("{i:016x}")), Some(i + 1));
+        }
+        assert_eq!(st.push_nested_token("ffffffffffffffff".into()), None);
+        assert!(st.classify_token("ffffffffffffffff").is_none());
+
+        // A spawn rotation drops every nested token: the new shell's world
+        // has no nested shells yet (they died with the old process tree).
+        st.rotate("1111222233334444".into());
+        assert_eq!(st.nested_depth(), 0);
+        assert!(st.classify_token(TOK).is_none());
+        assert_eq!(st.classify_token("1111222233334444"), Some(HookScope::Outer));
     }
 
     /// r2-F6: records beyond the journal's real head mean the sidecar's base
@@ -1220,6 +1371,7 @@ mod tests {
             hooks_live: false,
             synthetic_open: false,
             pending_close: None,
+            nested_tokens: Vec::new(),
         };
         st.open_block("ok".into(), 100, 1);
         st.on_pre(Some(0), 1, String::new(), 900, 2);
@@ -1269,7 +1421,7 @@ mod tests {
                         HookVerb::PromptStart => {
                             st.on_prompt_start(off, 3);
                         }
-                        _ if !st.accept_token(&ev.token) => {}
+                        _ if st.classify_token(&ev.token).is_none() => {}
                         HookVerb::Exec { cmd } => {
                             st.open_block(cmd, off, 1);
                         }
