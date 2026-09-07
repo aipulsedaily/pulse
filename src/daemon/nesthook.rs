@@ -28,9 +28,24 @@
 //! go would echo the whole base64 wall. So phase 1 types the reader line
 //! (`bootstrap::NESTED_READER`) and waits for its echo to come back and
 //! settle — which proves the remote shell has accepted and is EXECUTING it,
-//! i.e. `stty -echo` has run — and phase 2 then writes the two base64 payload
-//! lines invisibly. One echoed line is the whole visible artifact, and the
-//! payload scrubs even that out of bash's history.
+//! i.e. `stty -echo` has run — and phase 2 then writes the base64 payload
+//! lines invisibly.
+//!
+//! The seam is then made to read as if NOTHING was typed. The reader line is
+//! the only thing a terminal ever echoes, and phase 2 aims an erase payload
+//! at it: `erase_start_row` asks the daemon's own mirror for the row that
+//! echo starts on and returns one ONLY when the region from there to the
+//! cursor holds exactly our line and nothing else, so the shell's
+//! `\033[<row>;1H\033[J` can only ever wipe our own output before repainting
+//! its prompt in place. Anything the mirror does not vouch for (the echo
+//! scrolled off, the shell redrew, alt-screen) declines the erase and leaves
+//! the line honestly visible. The journal keeps the literal truth — echo,
+//! erase and all — and every renderer reproduces the same clean screen from
+//! it, so no render-side special case exists anywhere. Nothing of the
+//! injection reaches bash's history either, and it can never become a block
+//! record (no hooks exist in that shell yet, and the parent's DEBUG trap is
+//! process-local), so the sidebar, block history and Ctrl-R corpus never see
+//! it.
 //!
 //! Every abort is honest and leaves the shell EXACTLY as it is today: a
 //! credential prompt pending, an alt-screen TUI, an unknown shell family, a
@@ -159,21 +174,30 @@ pub(crate) enum OpenAction {
     /// A full-screen program owns the terminal — there is no prompt to type
     /// at and our line would land inside a TUI.
     AbortAlt,
-    /// Never settled: the world's state is unknown.
+    /// Settled and quiet, but the cursor row does not READ as a shell prompt
+    /// — the nested shell is showing something else that wants keys (field
+    /// case: a brand-new account whose zsh runs `zsh-newuser-install`, a
+    /// full-screen menu that ate our line one keypress at a time and left the
+    /// remainder strewn across the scrollback). Keep watching rather than
+    /// abort: a banner or a wizard the user dismisses is followed by a real
+    /// prompt, and `AbortTimeout` still bounds the wait.
+    WaitForPrompt,
+    /// Never settled at a prompt: the world's state is unknown.
     AbortTimeout,
     /// Settled, quiet, at an ordinary prompt: type the reader line.
     Send,
 }
 
 /// The phase-1 decision (pure). `quiet_for` = time since the journal last
-/// grew, `since_armed` = time since the opener was witnessed. The credential
-/// and alt-screen checks run at the SETTLED edge, where the tail line is the
-/// waiting prompt.
+/// grew, `since_armed` = time since the opener was witnessed. The credential,
+/// alt-screen and prompt-shape checks all run at the SETTLED edge, where the
+/// cursor row is whatever the nested world is waiting at.
 pub(crate) fn open_action(
     since_armed: Duration,
     quiet_for: Duration,
     tail_is_credential: bool,
     alt_screen: bool,
+    at_prompt: bool,
 ) -> OpenAction {
     if since_armed >= OPEN_TIMEOUT {
         return OpenAction::AbortTimeout;
@@ -186,6 +210,9 @@ pub(crate) fn open_action(
     }
     if tail_is_credential {
         return OpenAction::AbortCredential;
+    }
+    if !at_prompt {
+        return OpenAction::WaitForPrompt;
     }
     OpenAction::Send
 }
@@ -212,6 +239,52 @@ pub(crate) fn echo_ready(since_sent: Duration, quiet_for: Duration) -> bool {
 ///   Abandon, always: a mangled command line is never an acceptable price.
 pub(crate) fn input_keeps_waiting(submitted: bool) -> bool {
     submitted
+}
+
+/// The erase gate (pure): the 0-based screen row our echoed reader line
+/// STARTS on, or `None` — in which case nothing is erased and the line
+/// honestly stays visible.
+///
+/// This is the byte-exact proof that we only ever wipe our OWN output.
+/// `rows` are the mirror's rows 0..=`cursor_row` verbatim (space-padded, as
+/// the grid holds them). Walking UP from the cursor row, the tightest region
+/// whose joined text ends with exactly our reader line is our echo — a row
+/// higher would erase more than we typed, a row lower would leave part of it.
+/// Requirements, all of them load-bearing:
+///
+///   - the joined text must END with the reader line: anything printed after
+///     it means the shell moved on and the region is no longer only ours;
+///   - the match is on the reader line TRIMMED (bash echoes the leading
+///     space, zsh's line editor does not) and joined with NO separator, which
+///     is exactly how a wrapped line lands in the grid;
+///   - `None` when the line is not found in the last screenful at all — the
+///     usual cause is that the top of the echo already scrolled into
+///     scrollback, where an erase could never reach it anyway.
+///
+/// The row it returns is the row the PROMPT is on (our echo starts after the
+/// prompt text on that same row). Erasing from its column 0 takes the prompt
+/// with it, which is correct: the shell repaints the prompt right there, and
+/// the seam reads as if nothing was typed.
+pub(crate) fn erase_start_row(
+    rows: &[String],
+    cursor_row: usize,
+    reader: &str,
+) -> Option<usize> {
+    let needle = reader.trim();
+    if needle.is_empty() || cursor_row >= rows.len() {
+        return None;
+    }
+    let mut joined = String::new();
+    for start in (0..=cursor_row).rev() {
+        joined.clear();
+        for row in &rows[start..=cursor_row] {
+            joined.push_str(row);
+        }
+        if joined.trim_end().ends_with(needle) {
+            return Some(start);
+        }
+    }
+    None
 }
 
 /// nested-shell-hooks: what the re-establish engine needs to know before it
@@ -371,15 +444,36 @@ impl Core {
         }
     }
 
-    /// Write the two base64 payload lines (echo already suppressed by the
+    /// Write the three base64 payload lines (echo already suppressed by the
     /// reader line) and move to `AwaitInit`.
+    ///
+    /// The ERASE blob is composed HERE, not at arm time: it targets the row
+    /// the echoed reader line starts on, and that row can only be read off the
+    /// mirror once the echo has actually landed — after any wrapping and any
+    /// scrolling the terminal itself decided on.
     fn send_nesthook_payload(&self, id: Uuid) {
-        let lines = {
+        let reader = {
             let map = self.nesthooks.lock();
             let Some(e) = map.get(&id) else { return };
             if !matches!(e.phase, Phase::AwaitEcho { .. }) {
                 return;
             }
+            e.inj.reader.clone()
+        };
+        let erase_row = self.nesthook_erase_row(id, &reader);
+        if erase_row.is_none() {
+            log::info!(
+                "terminal {id}: the injected line stays visible — the mirror does not show it \
+                 exactly where it was typed (wrapped off-screen, or the shell redrew)"
+            );
+        }
+        let lines = {
+            let mut map = self.nesthooks.lock();
+            let Some(e) = map.get_mut(&id) else { return };
+            if !matches!(e.phase, Phase::AwaitEcho { .. }) {
+                return;
+            }
+            e.inj.erase_b64 = bootstrap::nested_erase_payload(erase_row);
             e.inj.payload_lines().map(str::to_string)
         };
         for l in &lines {
@@ -434,8 +528,9 @@ impl Core {
                         && reestablish::credential_prompt_line(
                             &self.last_screen_line(id).unwrap_or_default(),
                         );
-                    match open_action(now.duration_since(armed), quiet_for, cred, alt) {
-                        OpenAction::Wait => {}
+                    let at_prompt = settled && !alt && !cred && self.cursor_row_is_prompt(id);
+                    match open_action(now.duration_since(armed), quiet_for, cred, alt, at_prompt) {
+                        OpenAction::Wait | OpenAction::WaitForPrompt => {}
                         OpenAction::AbortCredential => self.cancel_nesthook(
                             id,
                             "a credential prompt is pending (hooks are never typed into one)",
@@ -444,9 +539,10 @@ impl Core {
                             id,
                             "a full-screen program owns the terminal (no prompt to inject at)",
                         ),
-                        OpenAction::AbortTimeout => {
-                            self.cancel_nesthook(id, "the nested shell never settled")
-                        }
+                        OpenAction::AbortTimeout => self.cancel_nesthook(
+                            id,
+                            "the nested shell never settled at a shell prompt",
+                        ),
                         OpenAction::Send => self.send_nesthook_reader(id, now),
                     }
                 }
@@ -480,6 +576,81 @@ impl Core {
     /// Journal length helper (the quiescence clock both phases read).
     fn journal_len(&self, id: Uuid) -> Option<u64> {
         self.journal(id).ok().map(|j| j.lock().absolute_len())
+    }
+
+    /// Does the mirror's cursor row READ as a shell prompt right now?
+    ///
+    /// Reuses `gui::composer::looks_like_shell_prompt` — the D2 heuristic
+    /// composer's arm signal, validated against 20 real prompt shapes and 17
+    /// adversarial negatives — so there is ONE definition of "that row is a
+    /// prompt" in the product and this gate cannot drift from the lane the
+    /// user sees. Field case it exists for: a brand-new account whose zsh
+    /// runs `zsh-newuser-install`, a full-screen menu that settles quietly
+    /// and then eats a typed line one keypress at a time.
+    fn cursor_row_is_prompt(&self, id: Uuid) -> bool {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::Flags;
+        let Some(term) = self.sessions.lock().get(&id).map(|s| s.term.clone()) else {
+            return false;
+        };
+        let t = term.lock();
+        let cursor = t.grid().cursor.point;
+        let (row, col) = (cursor.line.0, cursor.column.0);
+        if row < 0 || row as usize >= t.screen_lines() || col > t.columns() {
+            return false;
+        }
+        let grid_row = &t.grid()[Line(row)];
+        let mut prefix = String::with_capacity(col);
+        for c in 0..col {
+            let cell = &grid_row[Column(c)];
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            prefix.push(cell.c);
+        }
+        drop(t);
+        let trimmed = prefix.trim_end();
+        let gap = prefix.chars().count() - trimmed.chars().count();
+        crate::gui::composer::looks_like_shell_prompt(trimmed, gap)
+    }
+
+    /// The 1-based screen row the echoed reader line starts on, or `None`
+    /// when the mirror does not show our line exactly where we typed it.
+    ///
+    /// The mirror IS the truth about what the terminal did — every wrap and
+    /// every scroll is already folded into it — so asking it beats trying to
+    /// reproduce the terminal's own layout arithmetic daemon-side.
+    fn nesthook_erase_row(&self, id: Uuid, reader: &str) -> Option<usize> {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::Flags;
+        if self.terminal_is_alt(id) {
+            return None;
+        }
+        let term = self.sessions.lock().get(&id).map(|s| s.term.clone())?;
+        let t = term.lock();
+        let (cols, screen_rows) = (t.columns(), t.screen_lines());
+        let cursor_row = t.grid().cursor.point.line.0;
+        if cursor_row < 0 || cursor_row as usize >= screen_rows {
+            return None;
+        }
+        let rows: Vec<String> = (0..=cursor_row as usize)
+            .map(|r| {
+                let row = &t.grid()[Line(r as i32)];
+                let mut s = String::with_capacity(cols);
+                for c in 0..cols {
+                    let cell = &row[Column(c)];
+                    if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                        continue;
+                    }
+                    s.push(cell.c);
+                }
+                s
+            })
+            .collect();
+        drop(t);
+        erase_start_row(&rows, cursor_row as usize, reader).map(|r| r + 1)
     }
 
     /// Is a full-screen program on screen right now?
@@ -564,32 +735,144 @@ mod tests {
         assert_eq!(arm_verdict(false, false, false, true, 99), ArmVerdict::PinnedKind);
     }
 
-    /// Phase 1 gating: quiescence gates every transition; the credential and
-    /// alt-screen checks fire only at the settled edge; the timeout wins.
+    /// Phase 1 gating: quiescence gates every transition; the credential,
+    /// alt-screen and prompt-shape checks fire only at the settled edge; the
+    /// timeout wins.
     #[test]
     fn open_action_matrix() {
         let ms = Duration::from_millis;
-        assert_eq!(open_action(ms(100), ms(100), false, false), OpenAction::Wait);
-        assert_eq!(open_action(ms(600), ms(699), false, false), OpenAction::Wait);
-        assert_eq!(open_action(ms(1000), ms(700), false, false), OpenAction::Send);
+        assert_eq!(open_action(ms(100), ms(100), false, false, true), OpenAction::Wait);
+        assert_eq!(open_action(ms(600), ms(699), false, false, true), OpenAction::Wait);
+        assert_eq!(open_action(ms(1000), ms(700), false, false, true), OpenAction::Send);
         // Credential abort — the reestablish predicate, reused verbatim.
         assert_eq!(
-            open_action(ms(1000), ms(700), true, false),
+            open_action(ms(1000), ms(700), true, false, true),
             OpenAction::AbortCredential
         );
         assert!(reestablish::credential_prompt_line("[sudo] password for rig:"));
         // Alt-screen outranks the credential line (no prompt exists at all).
-        assert_eq!(open_action(ms(1000), ms(700), true, true), OpenAction::AbortAlt);
-        assert_eq!(open_action(ms(1000), ms(700), false, true), OpenAction::AbortAlt);
-        // Timeout outranks everything, settled or not.
+        assert_eq!(open_action(ms(1000), ms(700), true, true, true), OpenAction::AbortAlt);
+        assert_eq!(open_action(ms(1000), ms(700), false, true, true), OpenAction::AbortAlt);
+        // Settled but NOT at a shell prompt (a wizard/menu/banner): keep
+        // watching — never type a line into something that wants keypresses.
         assert_eq!(
-            open_action(OPEN_TIMEOUT, ms(100), false, false),
+            open_action(ms(1000), ms(700), false, false, false),
+            OpenAction::WaitForPrompt
+        );
+        // ...and the classifier this gate delegates to agrees on the shapes
+        // that matter here (one definition, shared with the composer lane).
+        use crate::gui::composer::looks_like_shell_prompt as prompt;
+        assert!(prompt("root@host:/home/rig#", 1), "a root prompt must pass");
+        assert!(prompt("host%", 1), "a zsh prompt must pass");
+        assert!(
+            !prompt("--- Type one of the keys in parentheses ---", 1),
+            "zsh-newuser-install's menu must never be typed into"
+        );
+        assert!(!prompt("Password:", 1));
+        assert!(!prompt("", 0));
+        // Timeout outranks everything, settled or not, prompt or not.
+        assert_eq!(
+            open_action(OPEN_TIMEOUT, ms(100), false, false, true),
             OpenAction::AbortTimeout
         );
         assert_eq!(
-            open_action(OPEN_TIMEOUT + ms(1), ms(900), true, true),
+            open_action(OPEN_TIMEOUT + ms(1), ms(900), true, true, false),
             OpenAction::AbortTimeout
         );
+    }
+
+    /// The erase gate: our own echoed line is found EXACTLY where we typed
+    /// it (wrapped or not), the real output above it is outside the region,
+    /// and anything that is not byte-for-byte our line erases nothing.
+    #[test]
+    fn erase_gate_matrix() {
+        let inj = bootstrap::nested_injection("cafebabe12345678");
+        let reader = inj.reader.trim().to_string();
+        let cols = 160usize;
+        // Lay a prompt + our echo out the way a real grid holds it:
+        // space-padded rows, wrapping at `cols`.
+        let laid_out = |prompt: &str, line: &str| -> Vec<String> {
+            let mut all: String = format!("{prompt}{line}");
+            let mut out = Vec::new();
+            while all.chars().count() > cols {
+                let head: String = all.chars().take(cols).collect();
+                all = all.chars().skip(cols).collect();
+                out.push(head);
+            }
+            let pad = cols - all.chars().count();
+            out.push(format!("{all}{}", " ".repeat(pad)));
+            out
+        };
+
+        // Real output the user produced, ABOVE the prompt — must never be
+        // inside the erased region.
+        let mut rows = vec![format!("rig@host:~$ sudo su{}", " ".repeat(140))];
+        let echo = laid_out("root@host:/home/rig# ", &reader);
+        let prompt_row = rows.len();
+        rows.extend(echo.clone());
+        let cursor = rows.len() - 1;
+        assert!(echo.len() > 1, "the reader line must actually wrap at 160 cols");
+        assert_eq!(
+            erase_start_row(&rows, cursor, &inj.reader),
+            Some(prompt_row),
+            "the erase must start at the PROMPT row, leaving the user's own line above it"
+        );
+
+        // Unwrapped (a very wide terminal) — same verdict, one row.
+        let wide = vec![
+            "rig@host:~$ sudo su".to_string(),
+            format!("root@host:/home/rig# {reader}    "),
+        ];
+        assert_eq!(erase_start_row(&wide, 1, &inj.reader), Some(1));
+
+        // zsh's line editor drops our leading space: still exactly our line.
+        let zsh = vec![format!("host% {}", reader)];
+        assert_eq!(erase_start_row(&zsh, 0, &inj.reader), Some(0));
+
+        // A line that is NOT ours erases nothing — including one that merely
+        // starts the same way, and one with our text plus a trailing edit.
+        let near = reader.replace("__pulse_b", "__pulse_X");
+        assert_eq!(
+            erase_start_row(&[format!("root@host:~# {near}")], 0, &inj.reader),
+            None,
+            "a near-miss must render untouched"
+        );
+        assert_eq!(
+            erase_start_row(&["root@host:~# stty -echo 2>/dev/null".to_string()], 0, &inj.reader),
+            None,
+            "a user's own `stty -echo` must render untouched"
+        );
+        assert_eq!(
+            erase_start_row(&[format!("root@host:~# {reader}; echo hi")], 0, &inj.reader),
+            None,
+            "text printed after our line means the region is no longer only ours"
+        );
+        assert_eq!(
+            erase_start_row(&["root@host:~# ls -la".to_string()], 0, &inj.reader),
+            None,
+            "ordinary output erases nothing"
+        );
+
+        // The top of the echo already scrolled off: the visible tail alone
+        // must NOT be treated as the whole line (an erase could not reach the
+        // scrolled-away rows anyway).
+        let tail_only: Vec<String> = echo[1..].to_vec();
+        let n = tail_only.len();
+        assert_eq!(
+            erase_start_row(&tail_only, n - 1, &inj.reader),
+            None,
+            "a partially scrolled-off echo must decline the erase"
+        );
+
+        // Degenerate inputs decline rather than panic.
+        assert_eq!(erase_start_row(&[], 0, &inj.reader), None);
+        assert_eq!(erase_start_row(&wide, 99, &inj.reader), None);
+        assert_eq!(erase_start_row(&wide, 1, "   "), None);
+
+        // ...and the payload the gate feeds: a row becomes an absolute CUP +
+        // erase-to-end-of-display, no row becomes an EMPTY blob (eval "").
+        assert!(!bootstrap::nested_erase_payload(Some(7)).is_empty());
+        assert!(bootstrap::nested_erase_payload(None).is_empty());
     }
 
     /// User input during phase 1: a SUBMITTED line keeps the injection

@@ -6857,19 +6857,54 @@ fn case_wsl_nested_hooks() -> anyhow::Result<()> {
         "an injected nested shell must certify at_prompt (the composer's integration signal)"
     );
 
-    // QUIET: the reader line is the ONE visible artifact. The base64 payload
-    // was typed with echo off, so it must appear NOWHERE in the journal —
-    // `X19UQ19UT0s` is base64 of the body's first bytes (`__TC_TOK`), which
-    // is token-independent and therefore a stable negative to assert on.
+    // QUIET — the money assertion for the seam: NOTHING of the injection is
+    // visible anywhere the user looks.
+    //
+    // `replay` is the daemon's own reconstruction (serialize.rs) — the exact
+    // bytes a fresh attach paints — so this covers live view, scrollback and
+    // restore in one shot:
+    //   - the reader line was echoed, then wiped by our own erase payload
+    //     (absolute CUP + erase-to-end-of-display, aimed by the mirror gate),
+    //     so the rendered screen must not contain it at all;
+    //   - the base64 payload lines were typed with echo off, so they never
+    //     reached the screen in the first place. `X19UQ19UT0s` is base64 of
+    //     the body's leading `__TC_TOK` — token-independent, a stable
+    //     negative to assert on.
     let text = strip_ansi(&String::from_utf8_lossy(&c.replay(id)?));
     anyhow::ensure!(
         !text.contains("X19UQ19UT0s"),
         "the base64 hook payload was ECHOED into the scrollback"
     );
     anyhow::ensure!(
-        text.matches("stty -echo").count() == 1,
-        "expected exactly ONE echoed reader line, found {}",
-        text.matches("stty -echo").count()
+        !text.contains("stty -echo"),
+        "the injected reader line survived into the render: {:?}",
+        text.lines()
+            .filter(|l| l.contains("stty -echo"))
+            .collect::<Vec<_>>()
+    );
+    anyhow::ensure!(
+        !text.contains("__pulse_"),
+        "injection plumbing survived into the render"
+    );
+    // The user's OWN adjacent output is untouched by the erase — the region
+    // wiped is only ever the row our echo started on and what followed it.
+    anyhow::ensure!(
+        text.contains("TC_NESTHOOK_OK"),
+        "the erase ate real output that came after it"
+    );
+    // ...and the injection is not a BLOCK either: the sidebar, block history
+    // and the composer's Ctrl-R/ghost corpus are all built from these
+    // records, so an injected line appearing here would surface as a command
+    // the user never ran. (It cannot: the line is typed into a shell whose
+    // hooks are not installed yet, and the parent shell's DEBUG trap is
+    // process-local to it.)
+    let recs = c.await_blocks(id, 10, |_| true)?;
+    anyhow::ensure!(
+        !recs
+            .iter()
+            .any(|r| r.cmd.contains("__pulse_") || r.cmd.contains("stty -echo")),
+        "the injected line was recorded as a block: {:?}",
+        recs.iter().map(|r| r.cmd.as_str()).collect::<Vec<_>>()
     );
     // ...and it is not left in the nested shell's interactive history.
     match ctl_run_retry(
