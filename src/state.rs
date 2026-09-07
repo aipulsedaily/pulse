@@ -281,6 +281,12 @@ pub struct ShellCfg {
     /// --resume <sid>` inside the re-established nested shell. Default ON
     /// (the user's ask); the opt-out. Appended with serde-default (fields
     /// are append-only-with-serde-default forever).
+    ///
+    /// nested-shell-hooks: the SAME switch gates hook injection into a
+    /// witnessed nested shell (`daemon::nesthook`) — it is the one setting
+    /// that governs Pulse typing into the user's shell on its own, so the
+    /// two must never diverge. Off ⇒ the pre-v0.1.14 lane exactly: a nested
+    /// shell stays hookless and the honest preface carries everything.
     #[serde(default = "default_true")]
     pub auto_reestablish: bool,
 }
@@ -361,11 +367,15 @@ pub struct NestedChain {
     /// starting cwd of the nested shell itself).
     #[serde(default)]
     pub entered_cwd: PathBuf,
-    /// The nested CLI's own cwd — ONLY when a v2 beacon carried it (the
-    /// hook script inside the nested account reads it off claude's own
-    /// SessionStart payload). Never inferred: an absent value renders the
-    /// preface's variant B ("run it from the conversation's directory")
-    /// instead of a guessed cd.
+    /// The nested CLI's own cwd. Two WITNESSES may write it, never a guess:
+    /// the injected nested shell's own exec hook (nested-shell-hooks — the
+    /// shell's real $PWD at the moment the CLI started, and the writer that
+    /// finally makes this field non-null in the field: a v2 beacon cannot
+    /// report for a remote ROOT user whose ~/.claude has no consent-installed
+    /// hook script, which is why every live ssh terminal carried `null` here
+    /// and v0.1.13's nested auto-resume could never arm), or a v2 beacon that
+    /// carried it. An absent value renders the preface's variant B ("run it
+    /// from the conversation's directory") instead of a guessed cd.
     #[serde(default)]
     pub cli_cwd: Option<PathBuf>,
     /// Wall-clock ms when the episode opened (diagnostics/staleness).

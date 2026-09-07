@@ -420,6 +420,44 @@ pub fn analyze_cmdline(cmd: &str, cwd: &Path) -> Option<InnerCli> {
     None
 }
 
+/// nested-shell-hooks: `analyze_cmdline` for the ONE compound shape Pulse
+/// itself types and users copy from its own preface — `cd '<dir>' && <cli>
+/// --resume <sid>` (`bootstrap::ssh_restore_trailing`,
+/// `tracker::nested_resume_step`). The plain classifier reads argv[0] (`cd`)
+/// and returns None, so the resume Pulse just typed produced a block but no
+/// identity — and the breadcrumb it needs for the NEXT reconnect went
+/// missing exactly where it was supposed to be re-witnessed.
+///
+/// Concrete-witness only, never a guess: the tail is analyzed by the SAME
+/// adapter classifier, and the `cd` target replaces the reported cwd only
+/// when it is an ABSOLUTE literal in the line (a relative or expanded one
+/// keeps the shell's own hook-reported cwd). A `;`-chain is deliberately NOT
+/// split — `&&` is the shape whose tail is guaranteed to have run.
+pub fn analyze_cmdline_with_cd(cmd: &str, cwd: &Path) -> Option<InnerCli> {
+    if let Some(cli) = analyze_cmdline(cmd, cwd) {
+        return Some(cli);
+    }
+    let (head, tail) = cmd.split_once("&&")?;
+    let head = head.trim();
+    let mut hw = head.split_whitespace();
+    if hw.next()? != "cd" {
+        return None;
+    }
+    let target = hw.next().unwrap_or_default();
+    if hw.next().is_some() {
+        return None; // `cd a b` is not a cd we understand
+    }
+    let target = target.trim_matches(|c| c == '\'' || c == '"');
+    let dir = if target.starts_with('/') {
+        Path::new(target).to_path_buf()
+    } else {
+        cwd.to_path_buf()
+    };
+    let mut cli = analyze_cmdline(tail.trim(), &dir)?;
+    cli.cwd = dir;
+    Some(cli)
+}
+
 /// Bug D / F1: does this command spawn a NESTED INTERACTIVE SHELL? The
 /// integration is process-local to the login shell (delivered via one-shot
 /// rcfile), so `sudo su` / `su` / a plain nested `bash` produce NO hook
@@ -1243,6 +1281,61 @@ mod tests {
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// nested-shell-hooks — `cd '<dir>' && <cli> --resume <sid>`, the shape
+    /// Pulse's own resume step types, is attributed to the CLI it ends in
+    /// with the cd target as the cwd. Concrete witness only: a relative cd
+    /// keeps the shell's reported cwd, a `;`-chain is not split, and a
+    /// non-adapter tail still classifies as nothing.
+    #[test]
+    fn compound_cd_resume_is_attributed() {
+        let here = Path::new("/var/log");
+        let cli = analyze_cmdline_with_cd(
+            "cd '/etc' && claude --resume aaaabbbb-cccc-dddd-eeee-ffff00001111",
+            here,
+        )
+        .expect("the resume step must attribute");
+        assert_eq!(cli.adapter, "claude");
+        assert_eq!(
+            cli.resume_token.as_deref(),
+            Some("aaaabbbb-cccc-dddd-eeee-ffff00001111")
+        );
+        assert_eq!(cli.confidence, CliConfidence::Explicit);
+        assert_eq!(cli.cwd, Path::new("/etc"), "the cd target is the CLI's cwd");
+        // Unquoted target, same verdict.
+        assert_eq!(
+            analyze_cmdline_with_cd("cd /etc && claude --resume abc-123", here)
+                .unwrap()
+                .cwd,
+            Path::new("/etc")
+        );
+        // A bare `claude` after the cd is still attributed — token-less and
+        // Ambiguous, exactly like the plain classifier (never a guess).
+        let bare = analyze_cmdline_with_cd("cd /etc && claude", here).unwrap();
+        assert_eq!(bare.resume_token, None);
+        assert_eq!(bare.confidence, CliConfidence::Ambiguous);
+        // A RELATIVE cd cannot be resolved from the line alone: keep the
+        // shell's own hook-reported cwd rather than inventing one.
+        assert_eq!(
+            analyze_cmdline_with_cd("cd logs && claude --resume abc-123", here)
+                .unwrap()
+                .cwd,
+            here
+        );
+        // Not our shape: `;`-chains (the tail may not have run), multi-word
+        // cd, a non-cd head, and a tail that names no adapter.
+        assert!(analyze_cmdline_with_cd("cd /etc; claude --resume abc", here).is_none());
+        assert!(analyze_cmdline_with_cd("cd /etc x && claude", here).is_none());
+        assert!(analyze_cmdline_with_cd("ls /etc && claude", here).is_none());
+        assert!(analyze_cmdline_with_cd("cd /etc && ls", here).is_none());
+        // The plain lane is untouched: a direct launch still wins first.
+        assert_eq!(
+            analyze_cmdline_with_cd("claude --resume abc-123", here)
+                .unwrap()
+                .cwd,
+            here
+        );
     }
 
     /// Bug D: the nested-shell classifier truth table (§4.1 of the research

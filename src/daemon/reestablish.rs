@@ -66,11 +66,28 @@ enum Phase {
         last_len: u64,
         last_change: Instant,
     },
+    /// nested-shell-hooks: every chain step settled, and a hook injection
+    /// into the freshly re-established nested shell is still in flight — the
+    /// resume is PARKED here until that shell's own hooked prompt arrives.
+    ///
+    /// Ordering is the whole point: `sudo su` → hooks injected → hooked
+    /// nested prompt → THEN the resume. Typing the resume at the raw nested
+    /// prompt (v0.1.13's behavior) starts a claude no hook can witness, so
+    /// the very identity the next reconnect needs is never recorded — the
+    /// field bug this closes. `since` bounds the wait: an unhookable shell
+    /// (dash/fish, no base64) still gets its resume, just unattributed.
+    AwaitNestedPrompt { since: Instant },
 }
 
 /// How long after the prompt witness before the step is typed (one pump
 /// tick's grace for the prompt paint).
 const SEND_GRACE: Duration = Duration::from_millis(250);
+
+/// nested-shell-hooks: how long the parked resume waits for the injected
+/// nested shell's hooked prompt before typing anyway. Longer than the
+/// injection's own init timeout, so the honest "it stays unhooked" log lands
+/// first and this is only ever the belt.
+const NESTED_HOOK_WAIT: Duration = Duration::from_secs(15);
 
 /// What the watcher should do with a settled/unsettled step — pure, so the
 /// step gating and password-abort are table-testable without a PTY.
@@ -161,6 +178,18 @@ pub(crate) fn reestablish_should_arm(chain_present: bool, hooked: bool, opt_in: 
 /// and the ordinary clear runs.
 fn pre_consumes(phase: &Phase) -> bool {
     matches!(phase, Phase::AwaitPrompt | Phase::PendingSend { .. })
+}
+
+/// nested-shell-hooks — the sequencing gate (pure): may the inner-CLI
+/// resume be typed NOW, given the state of the hook injection into the
+/// nested shell it will run in? `Absent` (nothing to inject — hookless
+/// family, opted out, credential abort) and `Hooked` (the shell announced
+/// its hooks) both go; `Pending` parks, because a resume typed into a shell
+/// that is one tick away from being hooked would run UNWITNESSED and leave
+/// the breadcrumb incomplete for the next reconnect — the exact loop this
+/// feature closes.
+pub(crate) fn resume_may_send(nest: NestState) -> bool {
+    !matches!(nest, NestState::Pending)
 }
 
 /// Pure resume-step gate (nested-cli-resume): the ONLY watch action that
@@ -274,6 +303,10 @@ impl Core {
                     None
                 }
                 Phase::Watch { .. } => map.remove(&id),
+                // nested-shell-hooks: parked for the nested hooked prompt,
+                // and the OUTER prompt spoke instead — the nested shell is
+                // gone; the resume must not be typed at the login shell.
+                Phase::AwaitNestedPrompt { .. } => map.remove(&id),
             };
             (consumed, aborted)
         };
@@ -286,10 +319,48 @@ impl Core {
         consumed
     }
 
+    /// nested-shell-hooks: a NESTED-scope `pre` landed — the injected shell
+    /// has painted its first hooked prompt. That is exactly the witness the
+    /// parked resume was waiting for: the shell accepting the next line is
+    /// the re-established nested shell AND its exec hook will attribute the
+    /// CLI (spec-I1 ordering intact, now with attribution).
+    pub(super) fn reestablish_on_nested_pre(&self, id: Uuid) {
+        let entry = {
+            let mut map = self.reestablish.lock();
+            match map.get(&id).map(|e| e.phase) {
+                Some(Phase::AwaitNestedPrompt { .. }) => map.remove(&id),
+                _ => None,
+            }
+        };
+        let Some(e) = entry else { return };
+        self.finish_resume(id, &e, "the nested shell's hooked prompt settled");
+    }
+
+    /// Type the parked/settled inner-CLI resume, or leave the manual hint.
+    fn finish_resume(&self, id: Uuid, e: &Reestablish, why: &str) {
+        let n = e.steps.len();
+        match &e.resume {
+            Some(cmd) if self.type_reestablish_line(id, cmd) => {
+                log::info!(
+                    "terminal {id}: nested chain re-established ({n} step(s) typed, {why}); resuming the inner CLI: {cmd}"
+                );
+            }
+            Some(_) => {
+                log::info!(
+                    "terminal {id}: nested chain re-established ({n} step(s) typed) but the session is gone — inner-CLI resume skipped"
+                );
+                self.push_resume_hint(id, e);
+            }
+            None => {
+                log::info!("terminal {id}: nested chain re-established ({n} step(s) typed)");
+            }
+        }
+    }
+
     /// Type one command line + Enter into the PTY (the C2D::Input write
     /// path — writer cloned out, write outside the sessions lock). Returns
     /// false when the session is gone.
-    fn type_reestablish_line(&self, id: Uuid, cmd: &str) -> bool {
+    pub(super) fn type_reestablish_line(&self, id: Uuid, cmd: &str) -> bool {
         let writer = self.sessions.lock().get(&id).map(|s| s.writer.clone());
         let Some(w) = writer else { return false };
         use std::io::Write;
@@ -342,11 +413,22 @@ impl Core {
         /// A Watch-phase row: (id, sent, last_len, last_change, has_more).
         type WatchRow = (Uuid, Instant, u64, Instant, bool);
         let now = Instant::now();
+        let parked: Vec<Uuid>;
         let (due_sends, watching): (Vec<(Uuid, usize)>, Vec<WatchRow>) = {
             let map = self.reestablish.lock();
             if map.is_empty() {
                 return;
             }
+            // nested-shell-hooks: a park that outlived the injection's own
+            // honest give-up types the resume anyway — an unhookable nested
+            // shell must still get its CLI back, just unattributed.
+            parked = map
+                .iter()
+                .filter_map(|(id, e)| match e.phase {
+                    Phase::AwaitNestedPrompt { since } if now.duration_since(since) >= NESTED_HOOK_WAIT => Some(*id),
+                    _ => None,
+                })
+                .collect();
             let sends = map
                 .iter()
                 .filter_map(|(id, e)| match e.phase {
@@ -367,6 +449,16 @@ impl Core {
                 .collect();
             (sends, watches)
         };
+        for id in parked {
+            let entry = self.reestablish.lock().remove(&id);
+            if let Some(e) = entry {
+                self.finish_resume(
+                    id,
+                    &e,
+                    "the nested shell never reported hooks — resuming unattributed",
+                );
+            }
+        }
         for (id, step) in due_sends {
             self.send_reestablish_step(id, step);
         }
@@ -441,6 +533,23 @@ impl Core {
                     // user against the wrong session store): the command
                     // executes strictly inside the nested context or not at
                     // all.
+                    // nested-shell-hooks: the chain is up, but the hooks
+                    // may still be going into it. PARK the resume until the
+                    // nested shell reports its own hooked prompt — a resume
+                    // typed one tick early runs unwitnessed and leaves the
+                    // breadcrumb incomplete for the next reconnect.
+                    let nest = self.nesthook_state(id);
+                    if !resume_may_send(nest) {
+                        if let Some(e) = self.reestablish.lock().get_mut(&id) {
+                            if e.resume.is_some() {
+                                e.phase = Phase::AwaitNestedPrompt { since: now };
+                                log::info!(
+                                    "terminal {id}: nested chain re-established; holding the inner-CLI resume for the nested shell's hooked prompt"
+                                );
+                                continue;
+                            }
+                        }
+                    }
                     let Some(e) = self.reestablish.lock().remove(&id) else {
                         continue;
                     };
@@ -449,27 +558,8 @@ impl Core {
                         e.steps.len(),
                         "Done edge requires the LAST chain step to have settled"
                     );
-                    let n = e.steps.len();
-                    match &e.resume {
-                        Some(cmd) if resume_may_type(action) && self.type_reestablish_line(id, cmd) => {
-                            log::info!(
-                                "terminal {id}: nested chain re-established ({n} step(s) typed); resuming the inner CLI: {cmd}"
-                            );
-                        }
-                        Some(_) => {
-                            // Session died between the settle and the type —
-                            // leave the manual hint, exactly like an abort.
-                            log::info!(
-                                "terminal {id}: nested chain re-established ({n} step(s) typed) but the session is gone — inner-CLI resume skipped"
-                            );
-                            self.push_resume_hint(id, &e);
-                        }
-                        None => {
-                            log::info!(
-                                "terminal {id}: nested chain re-established ({n} step(s) typed)"
-                            );
-                        }
-                    }
+                    debug_assert!(resume_may_type(action), "Done is the only resume edge");
+                    self.finish_resume(id, &e, "every chain step settled");
                 }
             }
         }
@@ -478,7 +568,7 @@ impl Core {
     /// Last non-blank line of the live mirror screen (the grid `read
     /// --screen` serializes) — the settled prompt line the credential check
     /// inspects.
-    fn last_screen_line(&self, id: Uuid) -> Option<String> {
+    pub(super) fn last_screen_line(&self, id: Uuid) -> Option<String> {
         use alacritty_terminal::grid::Dimensions;
         use alacritty_terminal::index::{Column, Line};
         use alacritty_terminal::term::cell::Flags;

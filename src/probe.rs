@@ -98,6 +98,14 @@
 //!   wsl_composer_semantics  P6a: bracketed-paste advertised, Ctrl+C
 //!                 re-latches a clean prompt (D15), multi-line paste yields
 //!                 ONE block carrying both lines (SKIPs without WSL)
+//!   wsl_nested_hooks  nested-shell-hooks: a witnessed nested `bash` is
+//!                 INJECTED with Pulse's own hook body — its own token-checked
+//!                 init (a NEW shell pid), real blocks with real exit codes and
+//!                 POSIX cwd typed INSIDE it, a certifying prompt, the
+//!                 breadcrumb kept while it lives and retired by the outer
+//!                 prompt on `exit`; plus the quiet contract (exactly one
+//!                 echoed reader line, the base64 payload never echoed) and
+//!                 the credential/alt-screen/opt-out refusals
 //!   wsl_restore   P6a: cd /tmp is hook-tracked into live_cwd verbatim,
 //!                 survives a graceful daemon restart, respawns via
 //!                 `wsl --cd /tmp`, and the seam rules hold (SKIPs without WSL)
@@ -6425,6 +6433,19 @@ fn wsl_probe_distro() -> Option<String> {
 /// program wsl.exe, args `-d <distro>` — the daemon synthesizes the
 /// --cd/--exec tail) and wait until Running.
 fn create_wsl_terminal(c: &mut Conn, name: &str, distro: &str) -> anyhow::Result<Uuid> {
+    create_wsl_terminal_cfg(c, name, distro, None)
+}
+
+/// `create_wsl_terminal` with an explicit ShellCfg — the nested-shell-hooks
+/// legs pin BOTH lanes: opted out (`auto_reestablish: false` ⇒ no hook
+/// injection, the pre-v0.1.14 hookless nested contract) and the default
+/// (injection on).
+fn create_wsl_terminal_cfg(
+    c: &mut Conn,
+    name: &str,
+    distro: &str,
+    shell_cfg: Option<crate::state::ShellCfg>,
+) -> anyhow::Result<Uuid> {
     c.send(&C2D::CreateTerminal {
         spec: NewTerminal {
             name: name.into(),
@@ -6434,7 +6455,7 @@ fn create_wsl_terminal(c: &mut Conn, name: &str, distro: &str) -> anyhow::Result
             args: vec!["-d".into(), distro.into()],
             cwd: "C:\\".into(),
             already_launched: false,
-            shell_cfg: None,
+            shell_cfg,
         },
     })?;
     let state = c.snapshot_until(15, |s| {
@@ -6684,6 +6705,246 @@ fn case_wsl_composer_semantics() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// nested-shell-hooks `wsl_nested_hooks` — the regression pin for the whole
+/// feature, on a plain nested `bash` (the SAME signal class as the field's
+/// `ssh` → `sudo su`, with no root and no password needed, so it runs
+/// everywhere `wsl_hooks` does).
+///
+/// The field bug it locks down: Pulse's integration was delivered once, as a
+/// self-deleting login rcfile, so a nested shell had no token, no hooks, no
+/// blocks, no cwd, and therefore no inner-CLI attribution — which is why
+/// every live ssh terminal carried `nested_chain.cli_cwd = null` and
+/// v0.1.13's nested auto-resume could never arm.
+///
+/// Asserts, end to end through a real ConPTY:
+///   - the WITNESSED episode arms an injection and the nested shell reports
+///     its OWN token-checked init from a NEW shell pid;
+///   - commands typed INSIDE it form real blocks with real exit codes and a
+///     POSIX cwd (the block machinery is fully alive one level down);
+///   - a prompt CERTIFIES inside it (the composer's integration signal — the
+///     "no Pulse integration in this shell" lane is gone);
+///   - the breadcrumb survives while the nested shell lives and is retired
+///     by the OUTER shell's own prompt on `exit` (the nested `pre` must never
+///     retire it — the scope rule);
+///   - the QUIET contract: exactly ONE echoed reader line in the whole
+///     journal, the base64 payload never echoed, and the injection line never
+///     left in bash history.
+fn case_wsl_nested_hooks() -> anyhow::Result<()> {
+    let Some(distro) = wsl_probe_distro() else {
+        return Err(skip("no WSL distro in the Lxss registry".into()));
+    };
+    let log0 = daemon_log_len();
+    let master = master_token()?;
+    let mut c = Conn::open()?;
+    let _ = c.first_snapshot()?;
+    let id = create_wsl_terminal(&mut c, "__probe_wsl_nesthook__", &distro)?;
+    c.send(&C2D::Attach { id, cols: 120, rows: 30 })?;
+    let mut ctl = Conn::open_ctl(&master, None)?;
+    let mut rid = 4700u64;
+    await_hooked_prompt(&mut ctl, &mut rid, id, 90)?;
+    std::thread::sleep(Duration::from_millis(400));
+    let outer_pid = hook_shell_pids(log0, id)
+        .last()
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("no outer init in daemon.log"))?;
+
+    // Enter a nested interactive bash — a WITNESSED episode (the outer
+    // shell's exec hook), which is the ONE trigger for injection.
+    c.send(&C2D::Input {
+        id,
+        bytes: b"bash\r".to_vec(),
+    })?;
+
+    // The nested shell announces ITSELF: a second token-checked init, from a
+    // different shell pid. That is the whole feature in one assertion — the
+    // hooks are alive in a shell Pulse did not spawn.
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        let pids = hook_shell_pids(log0, id);
+        if pids.iter().any(|p| *p != outer_pid) {
+            break;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "the nested shell never reported its own hooks: {:?}",
+            log_since(log0)
+                .lines()
+                .filter(|l| l.contains("nested"))
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let log = log_since(log0);
+    anyhow::ensure!(
+        log.contains("nested-shell episode opened (bash)"),
+        "no witnessed episode"
+    );
+    anyhow::ensure!(
+        log.contains("nested hook injection armed (depth 1"),
+        "injection never armed"
+    );
+    anyhow::ensure!(
+        log.contains("nested shell hooked (depth 1"),
+        "the injection never reported success"
+    );
+
+    // The breadcrumb is open and NOT retired by the nested shell's own
+    // prompt (the scope rule: only the OUTER shell's `pre` ends the episode).
+    let snap = c.snapshot_until(20, |s| {
+        s.terminals
+            .iter()
+            .any(|t| t.id == id && t.nested_chain.is_some())
+    })?;
+    let chain = snap
+        .terminals
+        .iter()
+        .find(|t| t.id == id)
+        .and_then(|t| t.nested_chain.clone())
+        .expect("breadcrumb");
+    anyhow::ensure!(chain.cmds == vec!["bash".to_string()], "chain {:?}", chain.cmds);
+
+    // Blocks work INSIDE the nested shell: a real exit code and a POSIX cwd,
+    // through the same P5 run gate the outer shell uses.
+    match ctl_run_retry(
+        &mut ctl,
+        &mut rid,
+        id,
+        "cd /tmp && echo TC_NESTHOOK_OK && false",
+        Some(RunWait { timeout_ms: 30_000, tail_bytes: 8192 }),
+        60,
+    )? {
+        CtlBody::RunDone { exit, output, .. } => {
+            anyhow::ensure!(
+                exit == Some(1),
+                "the nested shell's REAL exit code must ride the block, got {exit:?}"
+            );
+            anyhow::ensure!(
+                output.contains("TC_NESTHOOK_OK"),
+                "nested block output missing marker: {output:?}"
+            );
+        }
+        other => anyhow::bail!("Run inside the nested shell returned {other:?}"),
+    }
+    let recs = c.await_blocks(id, 20, |recs| {
+        recs.iter()
+            .any(|r| r.cmd.contains("TC_NESTHOOK_OK") && r.end_off.is_some())
+    })?;
+    let rec = recs
+        .iter()
+        .find(|r| r.cmd.contains("TC_NESTHOOK_OK"))
+        .unwrap();
+    anyhow::ensure!(rec.exit == Some(1), "record exit {:?}", rec.exit);
+    anyhow::ensure!(
+        rec.cwd
+            .as_ref()
+            .is_some_and(|p| p.to_string_lossy().starts_with('/')),
+        "nested block cwd should be a POSIX path, got {:?}",
+        rec.cwd
+    );
+    // ...and the `bash` opener rec CLOSED (pre-injection it stayed open for
+    // the whole visit — that open rec is exactly what made the GUI render
+    // "no Pulse integration in this shell").
+    let opener = recs.iter().find(|r| r.cmd.trim() == "bash").unwrap();
+    anyhow::ensure!(
+        opener.end_off.is_some(),
+        "the nested shell's own hooked prompt must close the opener rec"
+    );
+    // A prompt CERTIFIES inside the nested shell (the composer integrates).
+    std::thread::sleep(Duration::from_millis(600));
+    let (at_prompt, _clean) = attach_prompt_state(id, 120, 30)?;
+    anyhow::ensure!(
+        at_prompt,
+        "an injected nested shell must certify at_prompt (the composer's integration signal)"
+    );
+
+    // QUIET: the reader line is the ONE visible artifact. The base64 payload
+    // was typed with echo off, so it must appear NOWHERE in the journal —
+    // `X19UQ19UT0s` is base64 of the body's first bytes (`__TC_TOK`), which
+    // is token-independent and therefore a stable negative to assert on.
+    let text = strip_ansi(&String::from_utf8_lossy(&c.replay(id)?));
+    anyhow::ensure!(
+        !text.contains("X19UQ19UT0s"),
+        "the base64 hook payload was ECHOED into the scrollback"
+    );
+    anyhow::ensure!(
+        text.matches("stty -echo").count() == 1,
+        "expected exactly ONE echoed reader line, found {}",
+        text.matches("stty -echo").count()
+    );
+    // ...and it is not left in the nested shell's interactive history.
+    match ctl_run_retry(
+        &mut ctl,
+        &mut rid,
+        id,
+        // The bracket keeps THIS command's own history entry from matching
+        // the pattern it greps for (a self-match would always report 1).
+        "builtin history | grep -c '__pulse_[b]' || true",
+        Some(RunWait { timeout_ms: 30_000, tail_bytes: 4096 }),
+        60,
+    )? {
+        CtlBody::RunDone { output, .. } => {
+            anyhow::ensure!(
+                output.lines().any(|l| l.trim() == "0"),
+                "the injection line was left in bash history: {output:?}"
+            );
+        }
+        other => anyhow::bail!("history check returned {other:?}"),
+    }
+
+    // `exit` hands the world back: the OUTER shell's prompt returns, the
+    // breadcrumb retires, and the outer hooks keep working (the nested token
+    // is dropped with the shell that owned it — no stale-token rejection).
+    c.send(&C2D::Input {
+        id,
+        bytes: b"exit\r".to_vec(),
+    })?;
+    let snap = c.snapshot_until(30, |s| {
+        s.terminals
+            .iter()
+            .any(|t| t.id == id && t.nested_chain.is_none())
+    })?;
+    anyhow::ensure!(
+        snap.terminals.iter().any(|t| t.id == id),
+        "terminal vanished after exit"
+    );
+    match ctl_run_retry(
+        &mut ctl,
+        &mut rid,
+        id,
+        "echo TC_NESTHOOK_BACK",
+        Some(RunWait { timeout_ms: 30_000, tail_bytes: 4096 }),
+        60,
+    )? {
+        CtlBody::RunDone { exit, output, .. } => {
+            anyhow::ensure!(exit == Some(0), "outer exit {exit:?}");
+            anyhow::ensure!(output.contains("TC_NESTHOOK_BACK"), "outer output {output:?}");
+        }
+        other => anyhow::bail!("Run after exit returned {other:?}"),
+    }
+    anyhow::ensure!(
+        !log_since(log0).contains("wrong token rejected"),
+        "a nested hook token was rejected — the registry lost a live shell"
+    );
+
+    ensure_no_new_panics(log0)?;
+    delete_terminal(&mut c, id);
+    Ok(())
+}
+
+/// Shell pids from this terminal's token-checked `init` lines, in order —
+/// the outer login shell first, then any injected nested shell.
+fn hook_shell_pids(log0: u64, id: Uuid) -> Vec<u32> {
+    let needle = format!("terminal {id}: block hooks active (shell pid ");
+    log_since(log0)
+        .lines()
+        .filter_map(|l| {
+            let rest = l.split_once(&needle)?.1;
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse().ok()
+        })
+        .collect()
+}
+
 /// Bug D pin `wsl_nested_shell` (option c — the recovery path), extended by
 /// D2 (the heuristic composer's submission lane): a plain nested `bash` is
 /// the SAME signal class as `sudo su` over ssh (staging-proven, no root
@@ -6708,7 +6969,21 @@ fn case_wsl_nested_shell() -> anyhow::Result<()> {
     let master = master_token()?;
     let mut c = Conn::open()?;
     let _ = c.first_snapshot()?;
-    let id = create_wsl_terminal(&mut c, "__probe_wsl_nested__", &distro)?;
+    // nested-shell-hooks: this case pins the HOOKLESS nested lane — the one
+    // an opted-out terminal (and any shell the injection cannot hook) still
+    // gets. `auto_reestablish: false` is the same switch that governs Pulse
+    // typing into the user's shell at all, so opting out here keeps this
+    // contract byte-identical to pre-v0.1.14. The hooked lane is
+    // `wsl_nested_hooks`.
+    let id = create_wsl_terminal_cfg(
+        &mut c,
+        "__probe_wsl_nested__",
+        &distro,
+        Some(crate::state::ShellCfg {
+            auto_reestablish: false,
+            ..Default::default()
+        }),
+    )?;
     c.send(&C2D::Attach { id, cols: 120, rows: 30 })?;
     let mut ctl = Conn::open_ctl(&master, None)?;
     let mut rid = 4300u64;
@@ -10875,6 +11150,7 @@ pub fn run(case: Option<&str>) -> anyhow::Result<()> {
         ("wsl_hooks", case_wsl_hooks),
         ("wsl_composer_semantics", case_wsl_composer_semantics),
         ("wsl_nested_shell", case_wsl_nested_shell),
+        ("wsl_nested_hooks", case_wsl_nested_hooks),
         ("wsl_hostile_prompt_command", case_wsl_hostile_prompt_command),
         ("wsl_restore", case_wsl_restore),
         ("cmd_hooks", case_cmd_hooks),
