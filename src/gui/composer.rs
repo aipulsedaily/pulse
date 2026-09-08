@@ -4870,11 +4870,11 @@ pub fn show(
                     );
                 }
                 LaneContent::CliSession => {
-                    // cli-strip-parity - the lane paints NOTHING, deliberately.
+                    // cli-strip-parity — the lane paints NOTHING, deliberately.
                     //
                     // A NATIVE claude terminal (`TermKind::Claude`: the program
                     // IS claude) is hookless, so `strip_eligible` is false and
-                    // it gets no strip at all - claude's TUI runs to the window
+                    // it gets no strip at all — claude's TUI runs to the window
                     // edge. The same session reached through a nested/ssh shell
                     // sits on a HOOKED terminal, so it did get a strip: pulsing
                     // dot, command, elapsed timer and an ownership caption,
@@ -4882,13 +4882,13 @@ pub fn show(
                     // presentations of one thing; the user sees them side by
                     // side and the nested one reads as leftover chrome.
                     //
-                    // So: no dot, no command, no timer, no caption - and once
+                    // So: no dot, no command, no timer, no caption — and once
                     // the ownership has held for HIDE_AFTER the band collapses
                     // through the SAME `collapsed_lane` path the alt-screen
                     // TUIs use, handing its 36px back to the grid. The two
                     // cases are then identical. Ordinary busy commands are
                     // untouched (`LaneContent::Busy` below keeps its dot and
-                    // timer); the KBD corner stays live on hover.
+                    // timer); the ⌨ corner stays live on hover.
                 }
                 LaneContent::AltScreen => {
                     // Bug C/C2: pre-collapse this paints at full alpha; once
@@ -5039,7 +5039,7 @@ pub fn show(
                         let dur = super::term_view::fmt_duration(
                             now_ms().saturating_sub(rec.started_ms),
                         );
-                        // cli-strip-parity: no CLI caption here any more - an
+                        // cli-strip-parity: no CLI caption here any more — an
                         // attributed CLI session no longer reaches this arm at
                         // all (`LaneContent::CliSession` above collapses the
                         // whole band, matching a native CLI terminal). What is
@@ -5242,11 +5242,11 @@ pub fn show(
     // so `Wake ▸`/`Cancel`/`Restore ▸` paint at full strength the same
     // frame their lane appears.
     let cluster_alpha = if lane_is_alt || lane_is_cli { reveal } else { 1.0 };
-    // cli-strip-parity: inside a CLI peek the keyboard glyph shows ALONE.
-    // History and Run have no business floating over a live CLI's own input
-    // box, and the whole point of that peek is the one control still live
-    // there. Before the collapse (reveal == 1.0, the band is real furniture)
-    // every slot paints exactly as it always has.
+    // cli-strip-parity: inside a CLI peek the ⌨ shows ALONE. History and
+    // Run have no business floating over a live CLI's own input box, and the
+    // whole point of that peek is the one control still live there. Before
+    // the collapse (reveal == 1.0, the band is real furniture) every slot
+    // paints exactly as it always has.
     let slot_alpha = if lane_is_cli && collapsed { 0.0 } else { cluster_alpha };
     if cluster_alpha > 0.0 {
         let compose = state.mode == ComposerMode::Compose;
