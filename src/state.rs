@@ -213,6 +213,15 @@ fn wsl_family(args: &[String]) -> ShellFamily {
     }
 }
 
+/// typed-ssh-nested: is this `wsl` argv (WITHOUT argv[0]) the bare
+/// interactive shape? Deliberately the SAME two shapes `wsl_family` hooks —
+/// a bare spawn or `-d <distro>` — so a typed `wsl` and a `wsl` TERMINAL can
+/// never disagree about whether the world behind them is one Pulse hooks.
+/// Anything else (`wsl -e …`, `wsl --system`, a command tail) is false.
+pub fn wsl_interactive_shell(args: &[&str]) -> bool {
+    matches!(args, [] | ["-d" | "--distribution", _])
+}
+
 /// The ssh destination (host) an argv addresses — the first non-flag arg,
 /// skipping OpenSSH's value-taking flags — and it must be the LAST arg: any
 /// token after the destination is a REMOTE COMMAND in ssh's grammar (the
@@ -220,15 +229,9 @@ fn wsl_family(args: &[String]) -> ShellFamily {
 /// classify Other and are never hooked (the wsl exotic-argv doctrine).
 /// Shared by the classifier and the launcher's freeform-host validation.
 pub fn ssh_destination(args: &[String]) -> Option<&str> {
-    // OpenSSH value-taking flags (`man ssh` synopsis, 9.x):
-    // -B -b -c -D -E -e -F -I -i -J -L -l -m -O -o -p -Q -R -S -W -w.
-    const VALUE_FLAGS: &[&str] = &[
-        "-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O",
-        "-o", "-p", "-Q", "-R", "-S", "-W", "-w",
-    ];
     let mut it = args.iter().enumerate();
     while let Some((idx, a)) = it.next() {
-        if VALUE_FLAGS.contains(&a.as_str()) {
+        if a.starts_with('-') && a.len() == 2 && ssh_flag_takes_value(a.as_bytes()[1] as char) {
             let _ = it.next(); // consume the flag's value
             continue;
         }
@@ -239,6 +242,97 @@ pub fn ssh_destination(args: &[String]) -> Option<&str> {
         return (idx == args.len() - 1).then_some(a.as_str());
     }
     None
+}
+
+/// OpenSSH's value-taking SHORT flags (`man ssh` synopsis, 9.x):
+/// `-B -b -c -D -E -e -F -I -i -J -L -l -m -O -o -p -Q -R -S -W -w`. Held as
+/// characters (not `-x` tokens) so the same table serves both the token
+/// scanner in `ssh_destination` and the cluster scanner in
+/// `ssh_interactive_login`, which has to understand `-p2222` (glued value)
+/// and `-tp 2222` (cluster whose LAST letter takes the value) — one grammar,
+/// zero drift between the terminal classifier and the nested classifier.
+const SSH_VALUE_FLAG_CHARS: &str = "BbcDEeFIiJLlmOopQRSWw";
+
+/// typed-ssh-nested: short flags that make an `ssh <dest>` invocation NOT an
+/// interactive login shell even though a destination is present. Each one is
+/// a shape whose session either never runs a shell or never has a tty:
+///
+/// | flag | why it is not an interactive login shell |
+/// |---|---|
+/// | `-N` | "do not execute a remote command" — the pure forwarder |
+/// | `-T` | disable pseudo-terminal allocation |
+/// | `-n` | stdin redirected from `/dev/null` |
+/// | `-f` | go to background before command execution |
+/// | `-W` | stdio forwarding to `host:port` — a tunnel, not a shell |
+/// | `-O` | send a control command to a master and exit |
+/// | `-Q` | query supported algorithms and exit |
+/// | `-G` | print the effective configuration and exit |
+/// | `-V` | print the version and exit |
+///
+/// Note what is deliberately ABSENT: `-D`/`-L`/`-R` (port forwards) still
+/// allocate an ordinary interactive session in OpenSSH — "forwarding only"
+/// is spelled `-N`, which is here. `-t` (force tty) is likewise absent: it
+/// is the *more* interactive shape.
+const SSH_NOT_INTERACTIVE: &str = "NTnfWOQGV";
+
+fn ssh_flag_takes_value(c: char) -> bool {
+    SSH_VALUE_FLAG_CHARS.contains(c)
+}
+
+/// typed-ssh-nested: is this `ssh` argv (WITHOUT argv[0]) an INTERACTIVE
+/// REMOTE LOGIN SHELL — the shape whose remote world Pulse can hook as a
+/// nested shell?
+///
+/// Conservative by construction, exactly like `nested_shell_argv`'s `sudo`
+/// arm: every uncertainty degrades to FALSE. Specifically
+///
+///   - a flag-value MISS (`ssh -p` with nothing after it) ⇒ false;
+///   - any long option (`--help`, `--`) or a bare `-` ⇒ false (ssh's
+///     synopsis has no long options, so an unrecognised shape is a shape we
+///     do not understand);
+///   - anything at all after the destination ⇒ false, because in ssh's
+///     grammar that is a REMOTE COMMAND: the session runs it and exits.
+///     This is the deliberate verdict for `ssh -t host 'sudo su'` too —
+///     `ssh -t host <op>` is one shape whether `<op>` is `sudo su` or `ls`,
+///     nothing in the argv distinguishes "operand that yields an
+///     interactive shell" from "operand that prints and exits", and the
+///     re-establish engine would replay the guess verbatim into a live
+///     shell. `state::ssh_destination` (the terminal classifier) refuses the
+///     same shape, so the two classifiers cannot disagree about it.
+pub fn ssh_interactive_login(args: &[&str]) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        let Some(flags) = a.strip_prefix('-') else {
+            // The destination. Anything trailing it is a remote command.
+            return i == args.len() - 1;
+        };
+        if flags.is_empty() || flags.starts_with('-') {
+            return false; // bare `-`, `--`, or a long option
+        }
+        let mut rest = flags;
+        let mut needs_next = false;
+        while let Some(c) = rest.chars().next() {
+            rest = &rest[c.len_utf8()..];
+            if SSH_NOT_INTERACTIVE.contains(c) {
+                return false;
+            }
+            if ssh_flag_takes_value(c) {
+                // Glued (`-p2222`) ⇒ the value rides along; otherwise the
+                // NEXT token is the value.
+                needs_next = rest.is_empty();
+                break;
+            }
+        }
+        i += 1;
+        if needs_next {
+            if i >= args.len() {
+                return false; // flag-value miss ⇒ never a false positive
+            }
+            i += 1;
+        }
+    }
+    false // no destination at all: bare `ssh` prints its usage and exits
 }
 
 /// Per-family user choices the classifier can't derive (P6 §2). Appended to

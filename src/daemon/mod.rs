@@ -2763,6 +2763,15 @@ impl Core {
     /// Toolhelp descendant walk is skipped (Linux/remote procs are
     /// invisible), and inner_cli is owned by the hook lifecycle.
     fn hook_fed_family_ids(&self) -> HashSet<Uuid> {
+        // typed-ssh-nested: a LIVE crossing episode makes a pwsh/cmd
+        // terminal hook-fed FOR AS LONG AS IT LASTS. Once `ssh <host>` /
+        // `wsl` / `docker exec -it ... bash` is running, the local PEB still
+        // says `C:\Users\...` while the remote hooks report `/home/...` —
+        // and the Win32 tracker, ticking every second, would stamp the local
+        // path back over the remote one (the field report's "the composer
+        // still shows the LOCAL cwd"). The episode ending returns the
+        // terminal to the Win32 tracker on the very next tick.
+        let crossing = self.nested_open.lock().clone();
         self.state
             .lock()
             .terminals
@@ -2772,7 +2781,10 @@ impl Core {
                     crate::state::shell_family(&t.kind, &t.program, &t.args),
                     crate::state::ShellFamily::WslShell { .. }
                         | crate::state::ShellFamily::Ssh { .. }
-                )
+                ) || (crossing.contains(&t.id)
+                    && t.nested_chain.as_ref().is_some_and(|c| {
+                        c.cmds.first().is_some_and(|o| tracker::crosses_to_posix(o))
+                    }))
             })
             .map(|t| t.id)
             .collect()
@@ -2793,21 +2805,57 @@ impl Core {
         hook_cwd: Option<std::path::PathBuf>,
         scope: blocks::HookScope,
     ) {
+        // typed-ssh-nested: read the episode marker BEFORE the state lock
+        // (`hook_fed_family_ids` takes them in this order; one order, no
+        // deadlock).
+        let episode_live = self.nested_open.lock().contains(&id);
         let (cwd, is_ssh, program, args) = {
             let state = self.state.lock();
             let Some(t) = state.terminal(id) else { return };
             let family = crate::state::shell_family(&t.kind, &t.program, &t.args);
-            if !matches!(
+            let hook_fed = matches!(
                 family,
                 crate::state::ShellFamily::WslShell { .. }
                     | crate::state::ShellFamily::Ssh { .. }
-            ) {
-                return; // pwsh/cmd keep the Win32 tracker
+            );
+            // typed-ssh-nested: is a CROSSING episode (`ssh <host>`, `wsl`,
+            // `docker exec -it … bash`) live in this terminal? While one is,
+            // the shell speaking at a NESTED depth is a real POSIX shell,
+            // whatever the terminal's own family is.
+            let crossing = t.nested_chain.as_ref().is_some_and(|c| {
+                c.cmds.first().is_some_and(|o| tracker::crosses_to_posix(o))
+            });
+            let cwd = hook_cwd
+                .or_else(|| t.live_cwd.clone())
+                .unwrap_or_else(|| t.cwd.clone());
+            if !hook_fed {
+                // pwsh/cmd keep the Win32 tracker for everything they run
+                // LOCALLY. Two shapes escape that, and only two:
+                if scope.is_outer() {
+                    // (a) the terminal's own shell typing a CROSSING opener
+                    // — not a local process to track but a doorway into a
+                    // POSIX world the bash/zsh hook body fits exactly. (The
+                    // field report: a hooked local PowerShell where
+                    // `ssh 203.0.113.10` read as an ordinary long-running
+                    // command forever.)
+                    if tracker::nested_shell_cmd(cmd) && tracker::crosses_to_posix(cmd) {
+                        drop(state);
+                        self.open_nested_chain(id, cmd, &cwd);
+                    }
+                    return;
+                }
+                // (b) an exec inside that world, reported by the hooks the
+                // injection put there. Everything below — CLI attribution,
+                // `cli_cwd`, deeper hops — applies unchanged.
+                if !(episode_live && crossing) {
+                    return;
+                }
             }
             (
-                hook_cwd
-                    .or_else(|| t.live_cwd.clone())
-                    .unwrap_or_else(|| t.cwd.clone()),
+                cwd,
+                // The remote-probe/sidecar legs below ride the terminal's OWN
+                // ssh transport, which a pwsh terminal does not have: only a
+                // real Ssh FAMILY may arm them, never a crossing episode.
                 matches!(family, crate::state::ShellFamily::Ssh { .. }),
                 t.program.clone(),
                 t.args.clone(),

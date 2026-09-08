@@ -106,6 +106,13 @@
 //!                 prompt on `exit`; plus the quiet contract (exactly one
 //!                 echoed reader line, the base64 payload never echoed) and
 //!                 the credential/alt-screen/opt-out refusals
+//!   pwsh_typed_nested_hooks  typed-ssh-nested: a TYPED crossing opener
+//!                 (`wsl -d <distro>`, the same class as `ssh <host>`) in a
+//!                 LOCAL PWSH terminal opens an episode, arms the injection,
+//!                 hooks the POSIX shell one hop away, closes the opener rec
+//!                 (prompt back, not a forever-Busy span), holds the INNER
+//!                 cwd against the Win32 tracker, extends to depth 2, and
+//!                 retires cleanly on `exit` (SKIPs without WSL)
 //!   wsl_restore   P6a: cd /tmp is hook-tracked into live_cwd verbatim,
 //!                 survives a graceful daemon restart, respawns via
 //!                 `wsl --cd /tmp`, and the seam rules hold (SKIPs without WSL)
@@ -5328,6 +5335,7 @@ fn case_composer_gate_replay() -> anyhow::Result<()> {
             cursor_clean: true,
             episode_used: false,
             asleep: false,
+            cli_session: false,
         })
     };
     anyhow::ensure!(
@@ -6959,6 +6967,284 @@ fn case_wsl_nested_hooks() -> anyhow::Result<()> {
     anyhow::ensure!(
         !log_since(log0).contains("wrong token rejected"),
         "a nested hook token was rejected — the registry lost a live shell"
+    );
+
+    ensure_no_new_panics(log0)?;
+    delete_terminal(&mut c, id);
+    Ok(())
+}
+
+/// typed-ssh-nested `pwsh_typed_nested_hooks` — the regression pin for the
+/// FIELD REPORT this branch exists for: in an ordinary hooked LOCAL
+/// PowerShell terminal the user typed `ssh 203.0.113.10`, the remote login
+/// succeeded, and Pulse treated the whole thing as one long-running command —
+/// the local cwd in the composer, `ssh 203.0.113.10 . 7.5 s - Enter queues`
+/// in the lane, and no integration at all in the remote shell.
+///
+/// The root cause was that `tracker::nested_shell_argv` never classified
+/// `ssh`, so no episode opened and v0.1.14's injection never armed. The fix
+/// needed more than a classifier arm, though: the terminal's OWN family is
+/// pwsh, which is not hook-fed, so the exec-hook router returned early, the
+/// injection's family gate refused, and the Win32 tracker would have stamped
+/// the local `C:\...` back over the remote cwd on every tick.
+///
+/// This case exercises exactly that path with `wsl` standing in for `ssh` —
+/// the SAME crossing-opener class (a pwsh terminal one step from a POSIX
+/// world), with no network, no host key and no password, so it runs wherever
+/// `wsl_hooks` does. The ssh argv grammar itself is pinned exhaustively by
+/// `tracker::tests::nested_shell_cmd_truth_table`, and the real ssh link is
+/// field-proven on a disposable rig.
+///
+/// Asserts, end to end through a real ConPTY:
+///   - a TYPED crossing opener in a PWSH terminal opens an episode and arms
+///     an injection (pre-fix: `ArmVerdict::WrongFamily`, nothing at all);
+///   - the POSIX shell one hop away reports its OWN token-checked init;
+///   - the composer gets a PROMPT back, not a forever-Busy span: the opener
+///     rec CLOSES and `at_prompt` certifies;
+///   - the strip shows the INNER cwd — `live_cwd` is a POSIX path and STAYS
+///     one across tracker ticks (the Win32 suppression);
+///   - blocks work inside it, with real exit codes and POSIX cwds;
+///   - DEPTH 2: a `bash` typed inside the crossed world hooks as well and
+///     EXTENDS the chain (the `ssh` -> `sudo su` shape);
+///   - `exit` all the way out retires the breadcrumb and hands the local
+///     shell back, with no stale-token rejection anywhere.
+fn case_pwsh_typed_nested_hooks() -> anyhow::Result<()> {
+    let Some(distro) = wsl_probe_distro() else {
+        return Err(skip("no WSL distro in the Lxss registry".into()));
+    };
+    let opener = format!("wsl -d {distro}");
+    anyhow::ensure!(
+        crate::daemon::tracker::nested_shell_cmd(&opener)
+            && crate::daemon::tracker::crosses_to_posix(&opener),
+        "the probe's own opener must classify as a crossing nested shell"
+    );
+    let log0 = daemon_log_len();
+    let master = master_token()?;
+    let mut c = Conn::open()?;
+    let _ = c.first_snapshot()?;
+    let id = create_probe_terminal(&mut c, "__probe_typed_nest__")?;
+    c.send(&C2D::Attach { id, cols: 120, rows: 30 })?;
+    let mut ctl = Conn::open_ctl(&master, None)?;
+    let mut rid = 4900u64;
+    await_hooked_prompt(&mut ctl, &mut rid, id, 90)?;
+    std::thread::sleep(Duration::from_millis(400));
+    let outer_pids = hook_shell_pids(log0, id);
+
+    // The typed crossing opener — a WITNESSED episode from the pwsh exec
+    // hook, which pre-fix went nowhere at all.
+    c.send(&C2D::Input {
+        id,
+        bytes: format!("{opener}\r").into_bytes(),
+    })?;
+
+    // The POSIX shell one hop away announces ITSELF: a token-checked init
+    // from a shell pid the local terminal never had.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let pids = hook_shell_pids(log0, id);
+        if pids.iter().any(|p| !outer_pids.contains(p)) {
+            break;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "the crossed shell never reported its own hooks: {:?}",
+            log_since(log0)
+                .lines()
+                .filter(|l| l.contains("nested"))
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let log = log_since(log0);
+    anyhow::ensure!(
+        log.contains(&format!("nested-shell episode opened ({opener})")),
+        "a typed crossing opener must open an episode in a pwsh terminal"
+    );
+    anyhow::ensure!(
+        log.contains("nested hook injection armed (depth 1"),
+        "injection never armed (the pwsh family gate must not refuse a crossing opener)"
+    );
+    anyhow::ensure!(
+        log.contains("nested shell hooked (depth 1"),
+        "the injection never reported success"
+    );
+
+    // ITEM 4 — the composer consequence. The opener rec CLOSES at the crossed
+    // shell's own hooked prompt (the field bug rendered it as a
+    // forever-counting Busy span, "Enter queues"), and a prompt certifies.
+    let recs = c.await_blocks(id, 23, |recs| {
+        recs.iter()
+            .any(|r| r.cmd.trim() == opener && r.end_off.is_some())
+    })?;
+    anyhow::ensure!(
+        recs.iter()
+            .any(|r| r.cmd.trim() == opener && r.end_off.is_some()),
+        "the crossing opener rec must close - otherwise the lane stays Busy forever"
+    );
+    std::thread::sleep(Duration::from_millis(600));
+    let (at_prompt, _clean) = attach_prompt_state(id, 120, 30)?;
+    anyhow::ensure!(
+        at_prompt,
+        "a hooked crossed shell must certify at_prompt (the composer's integration signal)"
+    );
+
+    // ...and the strip's cwd is the INNER one. The Win32 tracker ticks about
+    // once a second with the LOCAL pwsh PEB in hand, so sampling twice a
+    // couple of seconds apart pins the suppression, not just the first report.
+    // POLLED, not snapshot-driven: `live_cwd` settles while the injection
+    // runs, and a quiet terminal broadcasts no further Snapshot to wake a
+    // `snapshot_until` predicate. A fresh connection's first Snapshot is
+    // always the CURRENT state.
+    let posix_cwd = || -> String {
+        Conn::open()
+            .ok()
+            .and_then(|mut cc| cc.first_snapshot().ok())
+            .and_then(|st| {
+                st.terminals
+                    .iter()
+                    .find(|t| t.id == id)
+                    .and_then(|t| t.live_cwd.clone())
+            })
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let mut first = posix_cwd();
+    while !first.starts_with('/') {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "the strip must show the INNER cwd, got {first:?}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        first = posix_cwd();
+    }
+    // ...and it STAYS the inner one across Win32 tracker ticks (~1s each):
+    // that is the regression pin for the suppression, not just for the first
+    // report.
+    std::thread::sleep(Duration::from_millis(3500));
+    let second = posix_cwd();
+    anyhow::ensure!(
+        second.starts_with('/'),
+        "the Win32 tracker stamped the LOCAL cwd back over the inner one: {second:?}"
+    );
+
+    // Blocks work inside the crossed world, through the same P5 run gate.
+    match ctl_run_retry(
+        &mut ctl,
+        &mut rid,
+        id,
+        "cd /tmp && echo TC_TYPED_NEST_OK && false",
+        Some(RunWait { timeout_ms: 30_000, tail_bytes: 8192 }),
+        60,
+    )? {
+        CtlBody::RunDone { exit, output, .. } => {
+            anyhow::ensure!(exit == Some(1), "real exit code expected, got {exit:?}");
+            anyhow::ensure!(output.contains("TC_TYPED_NEST_OK"), "output {output:?}");
+        }
+        other => anyhow::bail!("Run inside the crossed shell returned {other:?}"),
+    }
+    let recs = c.await_blocks(id, 20, |recs| {
+        recs.iter()
+            .any(|r| r.cmd.contains("TC_TYPED_NEST_OK") && r.end_off.is_some())
+    })?;
+    let rec = recs
+        .iter()
+        .find(|r| r.cmd.contains("TC_TYPED_NEST_OK"))
+        .unwrap();
+    anyhow::ensure!(
+        rec.cwd
+            .as_ref()
+            .is_some_and(|p| p.to_string_lossy().starts_with('/')),
+        "block cwd should be POSIX, got {:?}",
+        rec.cwd
+    );
+
+    // DEPTH 2 — the `ssh` -> `sudo su` shape. A plain nested shell typed
+    // INSIDE the crossed world is depth 2 and EXTENDS the chain (it must
+    // never replace it with a bare one-link breadcrumb).
+    c.send(&C2D::Input {
+        id,
+        bytes: b"bash\r".to_vec(),
+    })?;
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while !log_since(log0).contains("nested shell hooked (depth 2") {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "depth 2 never hooked: {:?}",
+            log_since(log0)
+                .lines()
+                .filter(|l| l.contains("nested"))
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let snap = c.snapshot_until(21, |s| {
+        s.terminals.iter().any(|t| {
+            t.id == id
+                && t.nested_chain
+                    .as_ref()
+                    .is_some_and(|ch| ch.cmds.len() == 2)
+        })
+    })?;
+    let chain = snap
+        .terminals
+        .iter()
+        .find(|t| t.id == id)
+        .and_then(|t| t.nested_chain.clone())
+        .expect("breadcrumb");
+    anyhow::ensure!(
+        chain.cmds == vec![opener.clone(), "bash".to_string()],
+        "the depth-2 chain must EXTEND the crossing opener, got {:?}",
+        chain.cmds
+    );
+
+    // The seam is quiet here too — the injection is neither rendered nor
+    // recorded as a block, at either depth.
+    let text = strip_ansi(&String::from_utf8_lossy(&c.replay(id)?));
+    anyhow::ensure!(
+        !text.contains("__pulse_") && !text.contains("X19UQ19UT0s"),
+        "injection plumbing survived into the render"
+    );
+    let recs = c.await_blocks(id, 10, |_| true)?;
+    anyhow::ensure!(
+        !recs.iter().any(|r| r.cmd.contains("__pulse_")),
+        "the injected line was recorded as a block"
+    );
+
+    // EXIT — all the way back to the local shell: the breadcrumb retires and
+    // the LOCAL shell answers again.
+    c.send(&C2D::Input { id, bytes: b"exit\r".to_vec() })?;
+    std::thread::sleep(Duration::from_millis(1500));
+    c.send(&C2D::Input { id, bytes: b"exit\r".to_vec() })?;
+    let snap = c.snapshot_until(40, |s| {
+        s.terminals
+            .iter()
+            .any(|t| t.id == id && t.nested_chain.is_none())
+    })?;
+    anyhow::ensure!(
+        snap.terminals.iter().any(|t| t.id == id),
+        "terminal vanished after exit"
+    );
+    match ctl_run_retry(
+        &mut ctl,
+        &mut rid,
+        id,
+        "Write-Output TC_TYPED_NEST_BACK",
+        Some(RunWait { timeout_ms: 30_000, tail_bytes: 4096 }),
+        60,
+    )? {
+        CtlBody::RunDone { exit, output, .. } => {
+            anyhow::ensure!(exit == Some(0), "local shell exit {exit:?}");
+            anyhow::ensure!(
+                output.contains("TC_TYPED_NEST_BACK"),
+                "the LOCAL shell must answer again after exit: {output:?}"
+            );
+        }
+        other => anyhow::bail!("Run after exit returned {other:?}"),
+    }
+    anyhow::ensure!(
+        !log_since(log0).contains("wrong token rejected"),
+        "a nested hook token was rejected - the registry lost a live shell"
     );
 
     ensure_no_new_panics(log0)?;
@@ -11186,6 +11472,7 @@ pub fn run(case: Option<&str>) -> anyhow::Result<()> {
         ("wsl_composer_semantics", case_wsl_composer_semantics),
         ("wsl_nested_shell", case_wsl_nested_shell),
         ("wsl_nested_hooks", case_wsl_nested_hooks),
+        ("pwsh_typed_nested_hooks", case_pwsh_typed_nested_hooks),
         ("wsl_hostile_prompt_command", case_wsl_hostile_prompt_command),
         ("wsl_restore", case_wsl_restore),
         ("cmd_hooks", case_cmd_hooks),
