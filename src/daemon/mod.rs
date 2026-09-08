@@ -2907,7 +2907,14 @@ impl Core {
         // a worker thread and persisted as the probes\<id>.json sidecar —
         // the diff basis the restore-time correlate leg consumes. Explicit
         // launches carry their own token and are never probed here.
-        if is_ssh {
+        // OUTER SCOPE ONLY. The probe lists the store of the account THIS
+        // terminal's own ssh transport reaches — the outer login user. A CLI
+        // launched inside an injected NESTED shell (`sudo su`, `su - deploy`)
+        // belongs to a different account entirely, so probing on its exec
+        // snapshots the wrong store. Restore-time correlation already
+        // refuses nested identities, so this was wrong-account work rather
+        // than a wrong restore; the initial probe now carries the same gate.
+        if is_ssh && scope.is_outer() {
             remote_probe::spawn_snapshot_leg(self, id, &inner, program, args, (epoch, start_off));
         }
         // nested-shell-hooks: an exec witnessed by an INJECTED shell's own

@@ -5200,6 +5200,7 @@ fn case_history_cross_session() -> anyhow::Result<()> {
 fn case_composer_gate_replay() -> anyhow::Result<()> {
     use crate::daemon::blocks::HookVerb;
     use crate::gui::composer::{gate, ComposerState, GateInputs, GateVerdict, RawReason};
+    use crate::gui::term_backend::HookCounters;
     use egui::{Key, Modifiers};
 
     let log0 = daemon_log_len();
@@ -5321,6 +5322,7 @@ fn case_composer_gate_replay() -> anyhow::Result<()> {
     let gate_at = |st: &ComposerState, boff: usize| -> GateVerdict {
         let abs = base_off + boff as u64;
         gate(&GateInputs {
+            exec_busy: false,
             hooked: true,
             running: true,
             alt: false,
@@ -5360,7 +5362,15 @@ fn case_composer_gate_replay() -> anyhow::Result<()> {
             }
             _ => {}
         }
-        st.on_stream_events(pre_n, exec_n, now);
+        // One hook event per iteration, so the interleave is exact: the
+        // verb just counted IS the latest event in the stream.
+        st.on_stream_events(
+            match verb {
+                HookVerb::Exec { .. } => HookCounters::exec_last(pre_n, exec_n),
+                _ => HookCounters::prompt_last(pre_n, exec_n),
+            },
+            now,
+        );
         let verdict = gate_at(&st, *boff);
         match verb {
             HookVerb::Pre { .. } => match verdict {
