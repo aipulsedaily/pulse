@@ -119,8 +119,12 @@ pub(crate) enum ArmVerdict {
     /// episode to trust and no prompt lane to inject at (a hookless spawn
     /// keeps its pre-nested behavior exactly).
     NotHooked,
-    /// pwsh/cmd: the hook body is bash/zsh. Nested shells there are not a
-    /// thing Pulse witnesses through a POSIX exec hook.
+    /// pwsh/cmd, and the opener does not cross into a POSIX world: the hook
+    /// body is bash/zsh, and a nested `bash`/`sudo su` typed at a Windows
+    /// prompt lands in whatever happens to be on PATH — a world Pulse never
+    /// set up. (typed-ssh-nested: a CROSSING opener — `ssh <host>`, `wsl`,
+    /// `docker exec -it … bash` — does reach a POSIX world in one step and
+    /// is armed even from pwsh.)
     WrongFamily,
     /// `ShellCfg.auto_reestablish` off — the one switch that governs Pulse
     /// typing into the user's shell on its own.
@@ -132,12 +136,14 @@ pub(crate) enum ArmVerdict {
 }
 
 /// The launch/witness-time arm gate (pure). `hooked` is the spawn's real
-/// hook verdict, `hook_fed` that the family is one whose execs we witness
-/// (WSL/ssh), `opt_in` the per-terminal switch, `claude_kind` the pinned
-/// terminal class, `depth` the nested tokens already registered.
+/// hook verdict, `posix_world` that the nested shell will run in a POSIX
+/// world the bash/zsh hook body fits — the family is hook-fed (WSL/ssh) OR
+/// the opener crosses into one (typed-ssh-nested) — `opt_in` the
+/// per-terminal switch, `claude_kind` the pinned terminal class, `depth` the
+/// nested tokens already registered.
 pub(crate) fn arm_verdict(
     hooked: bool,
-    hook_fed: bool,
+    posix_world: bool,
     opt_in: bool,
     claude_kind: bool,
     depth: usize,
@@ -145,7 +151,7 @@ pub(crate) fn arm_verdict(
     if claude_kind {
         return ArmVerdict::PinnedKind;
     }
-    if !hook_fed {
+    if !posix_world {
         return ArmVerdict::WrongFamily;
     }
     if !hooked {
@@ -174,6 +180,13 @@ pub(crate) enum OpenAction {
     /// A full-screen program owns the terminal — there is no prompt to type
     /// at and our line would land inside a TUI.
     AbortAlt,
+    /// typed-ssh-nested: the settled tail line is ssh's HOST-KEY
+    /// confirmation (`… (yes/no/[fingerprint])?`). It is not a credential,
+    /// but it is a trust decision that is the USER's alone to make — and it
+    /// is the specific hazard of a typed `ssh`: the line is a question, so
+    /// the shell-prompt gate would only have parked us on it for 20 s. Abort
+    /// loudly instead. Anything typed here would be answered as `yes`/`no`.
+    AbortHostKey,
     /// Settled and quiet, but the cursor row does not READ as a shell prompt
     /// — the nested shell is showing something else that wants keys (field
     /// case: a brand-new account whose zsh runs `zsh-newuser-install`, a
@@ -196,6 +209,7 @@ pub(crate) fn open_action(
     since_armed: Duration,
     quiet_for: Duration,
     tail_is_credential: bool,
+    tail_is_hostkey: bool,
     alt_screen: bool,
     at_prompt: bool,
 ) -> OpenAction {
@@ -210,6 +224,9 @@ pub(crate) fn open_action(
     }
     if tail_is_credential {
         return OpenAction::AbortCredential;
+    }
+    if tail_is_hostkey {
+        return OpenAction::AbortHostKey;
     }
     if !at_prompt {
         return OpenAction::WaitForPrompt;
@@ -309,19 +326,39 @@ impl Core {
     /// so an injection can never be armed for a shell Pulse did not watch
     /// being opened.
     pub(super) fn arm_nesthook(&self, id: Uuid, opener: &str) {
-        let (hooked, opt_in, claude_kind, hook_fed) = {
+        // typed-ssh-nested: the episode marker is read BEFORE the state lock
+        // (`hook_fed_family_ids` orders them this way; one order, no
+        // deadlock).
+        let episode_live = self.nested_open.lock().contains(&id);
+        let (hooked, opt_in, claude_kind, posix_world) = {
             let state = self.state.lock();
             let Some(t) = state.terminal(id) else { return };
             let fam = crate::state::shell_family(&t.kind, &t.program, &t.args);
+            // typed-ssh-nested: what has to be POSIX is the world the nested
+            // shell RUNS IN, not the shell that typed the opener. Three ways
+            // to be there:
+            //   1. a hook-fed FAMILY (WSL/ssh) is already there;
+            //   2. this very opener CROSSES (`ssh <host>`, `wsl`,
+            //      `docker exec -it ... bash`) — one step, even from pwsh;
+            //   3. a crossing episode is ALREADY live, so a plain `sudo su`
+            //      typed inside it is depth 2 in a POSIX world (the
+            //      `ssh host` → `sudo su` shape).
+            let posix_world = matches!(
+                fam,
+                crate::state::ShellFamily::WslShell { .. }
+                    | crate::state::ShellFamily::Ssh { .. }
+            ) || crate::daemon::tracker::crosses_to_posix(opener)
+                || (episode_live
+                    && t.nested_chain.as_ref().is_some_and(|c| {
+                        c.cmds
+                            .first()
+                            .is_some_and(|o| crate::daemon::tracker::crosses_to_posix(o))
+                    }));
             (
                 t.hooked,
                 t.shell_cfg.clone().unwrap_or_default().auto_reestablish,
                 matches!(t.kind, TermKind::Claude { .. }),
-                matches!(
-                    fam,
-                    crate::state::ShellFamily::WslShell { .. }
-                        | crate::state::ShellFamily::Ssh { .. }
-                ),
+                posix_world,
             )
         };
         // The token is minted and REGISTERED before a byte is typed: the
@@ -334,7 +371,7 @@ impl Core {
             let mut map = self.blocks.lock();
             let Some(store) = map.get_mut(&id) else { return };
             let already = store.nested_depth();
-            match arm_verdict(hooked, hook_fed, opt_in, claude_kind, already) {
+            match arm_verdict(hooked, posix_world, opt_in, claude_kind, already) {
                 ArmVerdict::Arm => {}
                 why => {
                     // WrongFamily is the pwsh/cmd common case — debug, not a
@@ -523,17 +560,38 @@ impl Core {
                     let quiet_for = now.duration_since(last_change);
                     let settled = quiet_for >= OPEN_QUIET;
                     let alt = settled && self.terminal_is_alt(id);
-                    let cred = settled
-                        && !alt
-                        && reestablish::credential_prompt_line(
-                            &self.last_screen_line(id).unwrap_or_default(),
-                        );
-                    let at_prompt = settled && !alt && !cred && self.cursor_row_is_prompt(id);
-                    match open_action(now.duration_since(armed), quiet_for, cred, alt, at_prompt) {
+                    let tail = if settled && !alt {
+                        self.last_screen_line(id).unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    let cred = reestablish::credential_prompt_line(&tail);
+                    // typed-ssh-nested: ONE definition of "that row is ssh's
+                    // host-key question" — the composer's pre-shell auth
+                    // classifier, reused verbatim (the same reuse discipline
+                    // as `looks_like_shell_prompt` below).
+                    let hostkey = matches!(
+                        crate::gui::composer::detect_auth_prompt(&tail),
+                        crate::gui::composer::AuthPrompt::HostKey
+                    );
+                    let at_prompt =
+                        settled && !alt && !cred && !hostkey && self.cursor_row_is_prompt(id);
+                    match open_action(
+                        now.duration_since(armed),
+                        quiet_for,
+                        cred,
+                        hostkey,
+                        alt,
+                        at_prompt,
+                    ) {
                         OpenAction::Wait | OpenAction::WaitForPrompt => {}
                         OpenAction::AbortCredential => self.cancel_nesthook(
                             id,
                             "a credential prompt is pending (hooks are never typed into one)",
+                        ),
+                        OpenAction::AbortHostKey => self.cancel_nesthook(
+                            id,
+                            "the remote host's key is waiting to be confirmed — that answer is yours alone (nothing was typed)",
                         ),
                         OpenAction::AbortAlt => self.cancel_nesthook(
                             id,
@@ -720,6 +778,26 @@ mod tests {
             ArmVerdict::WrongFamily,
             "pwsh/cmd never get a bash hook body typed at them"
         );
+        // typed-ssh-nested: the SECOND argument is "the nested shell will
+        // run in a POSIX world", which a crossing opener supplies even in a
+        // pwsh terminal — this is the field-report case (a hooked local
+        // PowerShell where the user typed `ssh 203.0.113.10`).
+        use crate::daemon::tracker::crosses_to_posix;
+        for opener in ["ssh 203.0.113.10", "wsl", "docker exec -it web bash"] {
+            assert!(crosses_to_posix(opener), "{opener:?}");
+            assert_eq!(
+                arm_verdict(true, crosses_to_posix(opener), true, false, 0),
+                ArmVerdict::Arm
+            );
+        }
+        for opener in ["sudo su", "bash", "su - root"] {
+            assert!(!crosses_to_posix(opener), "{opener:?}");
+            assert_eq!(
+                arm_verdict(true, crosses_to_posix(opener), true, false, 0),
+                ArmVerdict::WrongFamily,
+                "a local nested shell typed at a Windows prompt is still refused"
+            );
+        }
         assert_eq!(arm_verdict(true, true, false, false, 0), ArmVerdict::OptedOut);
         assert_eq!(
             arm_verdict(true, true, true, true, 0),
@@ -741,22 +819,51 @@ mod tests {
     #[test]
     fn open_action_matrix() {
         let ms = Duration::from_millis;
-        assert_eq!(open_action(ms(100), ms(100), false, false, true), OpenAction::Wait);
-        assert_eq!(open_action(ms(600), ms(699), false, false, true), OpenAction::Wait);
-        assert_eq!(open_action(ms(1000), ms(700), false, false, true), OpenAction::Send);
+        // (since_armed, quiet_for, credential, hostkey, alt, at_prompt)
+        assert_eq!(open_action(ms(100), ms(100), false, false, false, true), OpenAction::Wait);
+        assert_eq!(open_action(ms(600), ms(699), false, false, false, true), OpenAction::Wait);
+        assert_eq!(open_action(ms(1000), ms(700), false, false, false, true), OpenAction::Send);
         // Credential abort — the reestablish predicate, reused verbatim.
         assert_eq!(
-            open_action(ms(1000), ms(700), true, false, true),
+            open_action(ms(1000), ms(700), true, false, false, true),
             OpenAction::AbortCredential
         );
         assert!(reestablish::credential_prompt_line("[sudo] password for rig:"));
-        // Alt-screen outranks the credential line (no prompt exists at all).
-        assert_eq!(open_action(ms(1000), ms(700), true, true, true), OpenAction::AbortAlt);
-        assert_eq!(open_action(ms(1000), ms(700), false, true, true), OpenAction::AbortAlt);
+        // typed-ssh-nested: ssh's host-key question aborts too, and the
+        // composer's auth classifier is the ONE definition of that row.
+        assert_eq!(
+            open_action(ms(1000), ms(700), false, true, false, true),
+            OpenAction::AbortHostKey
+        );
+        use crate::gui::composer::{detect_auth_prompt, AuthPrompt};
+        for row in [
+            "Are you sure you want to continue connecting (yes/no/[fingerprint])?",
+            "Are you sure you want to continue connecting (yes/no)?",
+        ] {
+            assert_eq!(detect_auth_prompt(row), AuthPrompt::HostKey, "{row:?}");
+        }
+        assert_eq!(
+            detect_auth_prompt("rig@127.0.0.1's password:"),
+            AuthPrompt::Password
+        );
+        assert_eq!(
+            detect_auth_prompt("Enter passphrase for key '/home/z/.ssh/id_rig':"),
+            AuthPrompt::Password
+        );
+        assert_eq!(detect_auth_prompt("rig@host:~$"), AuthPrompt::None);
+        // A credential line outranks the host-key line (both abort anyway).
+        assert_eq!(
+            open_action(ms(1000), ms(700), true, true, false, true),
+            OpenAction::AbortCredential
+        );
+        // Alt-screen outranks both (no prompt exists at all).
+        assert_eq!(open_action(ms(1000), ms(700), true, false, true, true), OpenAction::AbortAlt);
+        assert_eq!(open_action(ms(1000), ms(700), false, true, true, true), OpenAction::AbortAlt);
+        assert_eq!(open_action(ms(1000), ms(700), false, false, true, true), OpenAction::AbortAlt);
         // Settled but NOT at a shell prompt (a wizard/menu/banner): keep
         // watching — never type a line into something that wants keypresses.
         assert_eq!(
-            open_action(ms(1000), ms(700), false, false, false),
+            open_action(ms(1000), ms(700), false, false, false, false),
             OpenAction::WaitForPrompt
         );
         // ...and the classifier this gate delegates to agrees on the shapes
@@ -772,11 +879,11 @@ mod tests {
         assert!(!prompt("", 0));
         // Timeout outranks everything, settled or not, prompt or not.
         assert_eq!(
-            open_action(OPEN_TIMEOUT, ms(100), false, false, true),
+            open_action(OPEN_TIMEOUT, ms(100), false, false, false, true),
             OpenAction::AbortTimeout
         );
         assert_eq!(
-            open_action(OPEN_TIMEOUT + ms(1), ms(900), true, true, false),
+            open_action(OPEN_TIMEOUT + ms(1), ms(900), true, true, true, false),
             OpenAction::AbortTimeout
         );
     }

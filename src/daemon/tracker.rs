@@ -467,9 +467,18 @@ pub fn analyze_cmdline_with_cd(cmd: &str, cwd: &Path) -> Option<InnerCli> {
 /// classifier, zero drift between the composer's honesty lane and the
 /// breadcrumb. Pure and conservative by design: a false negative degrades to
 /// today's behavior (Busy row / no breadcrumb), a false positive still
-/// records a true statement. v2 candidates (same table, deliberately out of
-/// v1): `ssh <dest>` with no command operand, `docker exec -it …`, `wsl`,
-/// `nix shell`.
+/// records a true statement.
+///
+/// typed-ssh-nested (v0.1.15) promotes the v2 candidates the doc parked:
+/// a TYPED remote/container shell — `ssh <dest>`, `wsl`, `docker|podman exec
+/// -it … <shell>`, `kubectl exec -it … -- <shell>`, `distrobox|toolbox
+/// enter` — is an interactive nested shell exactly like `sudo su`, and the
+/// world behind it is POSIX, so the same hook body works there. Each arm
+/// uses the same value-consuming-flag discipline as `sudo`, with one
+/// difference that matters: for these openers an UNRECOGNISED flag degrades
+/// to FALSE rather than being skipped, because their flag surfaces are much
+/// larger than sudo's and a wrong skip could turn a finite command into a
+/// false "interactive shell" verdict.
 pub fn nested_shell_cmd(cmd: &str) -> bool {
     let argv: Vec<&str> = cmd.split_whitespace().collect();
     nested_shell_argv(&argv)
@@ -517,8 +526,164 @@ fn nested_shell_argv(argv: &[&str]) -> bool {
             }
             false
         }
+        // typed-ssh-nested. The grammar lives in `state` next to
+        // `ssh_destination`/`wsl_family` — the classifiers that decide the
+        // same question for a PROGRAM-LEVEL terminal — so a typed opener and
+        // a terminal spawned with the same argv can never disagree.
+        "ssh" => crate::state::ssh_interactive_login(&argv[1..]),
+        "wsl" => crate::state::wsl_interactive_shell(&argv[1..]),
+        "docker" | "podman" => container_exec_shell(&argv[1..]),
+        "kubectl" | "oc" => kubectl_exec_shell(&argv[1..]),
+        "distrobox" | "toolbox" => box_enter(&argv[1..]),
         _ => false,
     }
+}
+
+/// typed-ssh-nested: `docker exec -it <container> <shell>` (and the
+/// byte-identical `podman exec`). TRUE only for the fully interactive shape:
+///
+///   - the subcommand must be `exec` (`docker run -it …` is deliberately NOT
+///     covered — `run`'s flag surface is an order of magnitude larger and a
+///     single unmodelled value-flag would misread the image name as a
+///     command);
+///   - BOTH a tty and stdin must be requested (`-it`, `-ti`, `-i -t`,
+///     `--interactive --tty`) — without them there is no shell to hook;
+///   - `exec`'s own value-taking flags are consumed (`-e/--env`,
+///     `-u/--user`, `-w/--workdir`, `--detach-keys`, `--env-file`);
+///   - an UNRECOGNISED flag ⇒ false;
+///   - the first bare operand is the container, and the REST must itself
+///     classify as a nested shell through this very function (so
+///     `docker exec -it c bash` is true and `docker exec -it c ls` is not).
+fn container_exec_shell(args: &[&str]) -> bool {
+    let Some((sub, mut rest)) = args.split_first() else {
+        return false;
+    };
+    if *sub != "exec" {
+        return false;
+    }
+    let (mut tty, mut interactive) = (false, false);
+    while let Some((a, tail)) = rest.split_first() {
+        let Some(flags) = a.strip_prefix('-') else {
+            // Container id/name, then the command it runs.
+            return tty && interactive && !tail.is_empty() && nested_shell_argv(tail);
+        };
+        rest = tail;
+        if let Some(long) = flags.strip_prefix('-') {
+            match long {
+                "tty" => tty = true,
+                "interactive" => interactive = true,
+                "privileged" => {}
+                // Detached ⇒ no terminal for us to hook.
+                "detach" => return false,
+                "env" | "user" | "workdir" | "detach-keys" | "env-file" => {
+                    let Some((_, tail)) = rest.split_first() else {
+                        return false; // flag-value miss
+                    };
+                    rest = tail;
+                }
+                // `--user=root` and friends carry their own value; anything
+                // else is a flag we do not model.
+                l if l.split_once('=').is_some_and(|(k, _)| {
+                    matches!(k, "env" | "user" | "workdir" | "detach-keys" | "env-file")
+                }) => {}
+                _ => return false,
+            }
+            continue;
+        }
+        // Short cluster: `-it`, `-ti`, `-u root`, `-uroot`.
+        let mut cur = flags;
+        while let Some(c) = cur.chars().next() {
+            cur = &cur[c.len_utf8()..];
+            match c {
+                't' => tty = true,
+                'i' => interactive = true,
+                'd' => return false, // detached ⇒ no terminal to hook
+                'e' | 'u' | 'w' => {
+                    if cur.is_empty() {
+                        let Some((_, tail)) = rest.split_first() else {
+                            return false; // flag-value miss
+                        };
+                        rest = tail;
+                    }
+                    cur = "";
+                }
+                _ => return false,
+            }
+        }
+    }
+    false // no container operand
+}
+
+/// typed-ssh-nested: `kubectl exec -it <pod> [-n ns] [-c ctr] -- <shell>`
+/// (and OpenShift's `oc`, whose exec grammar is kubectl's). Only the
+/// `--`-separated form is accepted: `--` is where kubectl's own flags
+/// provably stop and the remote command provably starts, so nothing before
+/// it has to be modelled at all — the conservative reading of a very large
+/// flag surface. The deprecated `kubectl exec -it pod bash` (no `--`) is
+/// FALSE by design.
+fn kubectl_exec_shell(args: &[&str]) -> bool {
+    let Some((sub, rest)) = args.split_first() else {
+        return false;
+    };
+    if *sub != "exec" {
+        return false;
+    }
+    let Some(sep) = rest.iter().position(|a| *a == "--") else {
+        return false;
+    };
+    let (head, tail) = rest.split_at(sep);
+    let tail = &tail[1..];
+    let tty = head.iter().any(|a| {
+        *a == "--tty" || (a.starts_with('-') && !a.starts_with("--") && a.contains('t'))
+    });
+    let stdin = head.iter().any(|a| {
+        *a == "--stdin" || (a.starts_with('-') && !a.starts_with("--") && a.contains('i'))
+    });
+    tty && stdin && !tail.is_empty() && nested_shell_argv(tail)
+}
+
+/// typed-ssh-nested: `distrobox enter [name]` / `toolbox enter [name]` — the
+/// subcommand whose WHOLE purpose is an interactive shell in the box (the
+/// finite form is `distrobox enter … -- <cmd>` / `toolbox run <cmd>`). A
+/// trailing bare operand is the BOX NAME, exactly as it is a username for
+/// `su`, so it does not disqualify; a `--` separator or an explicit
+/// `-e/--extra`-style command operand does.
+fn box_enter(args: &[&str]) -> bool {
+    let Some((sub, rest)) = args.split_first() else {
+        return false;
+    };
+    *sub == "enter"
+        && !rest
+            .iter()
+            .any(|a| *a == "--" || *a == "-e" || a.starts_with("--exec") || a.starts_with("-e="))
+}
+
+/// typed-ssh-nested: does this nested-shell opener CROSS INTO A POSIX WORLD
+/// Pulse can hook — a remote host, a WSL distro, a container?
+///
+/// This is the one thing that distinguishes the new openers from the old
+/// ones, and it is what lets the injection arm on a terminal whose OWN
+/// family is pwsh/cmd: the hook body is bash/zsh, so what has to be POSIX is
+/// the world the opener lands in, not the shell that typed it. `sudo su` /
+/// `bash` typed in a pwsh terminal stay excluded — there the target world is
+/// whatever `bash.exe` happens to be on PATH, which Pulse never set up.
+///
+/// Callers must still check `nested_shell_cmd` — this only names the family
+/// of opener, never that the argv is interactive.
+pub fn crosses_to_posix(cmd: &str) -> bool {
+    let argv: Vec<&str> = cmd.split_whitespace().collect();
+    let Some(first) = argv.first() else {
+        return false;
+    };
+    let stem = first
+        .rsplit(['/', '\\'])
+        .next()
+        .map(|c| c.strip_suffix(".exe").unwrap_or(c).to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(
+        stem.as_str(),
+        "ssh" | "wsl" | "docker" | "podman" | "kubectl" | "oc" | "distrobox" | "toolbox"
+    )
 }
 
 /// F1: is `key` an enabled CLI adapter? Gates the nested-beacon mint — a
@@ -1372,6 +1537,44 @@ mod tests {
             "/usr/bin/bash",
             "/bin/su -",
             "  bash  ",
+            // typed-ssh-nested: interactive remote/container login shells.
+            "ssh devbox",
+            "ssh 203.0.113.10",
+            "ssh dev@203.0.113.10",
+            "ssh -t host",
+            "ssh -tt host",
+            "ssh -p 2222 rig@127.0.0.1",
+            "ssh -p2222 rig@127.0.0.1",
+            "ssh -i ~/.ssh/id_rig rig@host",
+            "ssh -o StrictHostKeyChecking=no rig@host",
+            "ssh -q -o BatchMode=yes -p 2222 rig@host",
+            // Port forwards still allocate an ordinary interactive session;
+            // "forwarding only" is spelled -N (below, negative).
+            "ssh -L 8080:localhost:80 host",
+            "ssh -R 9000:localhost:9000 host",
+            "ssh -D 1080 host",
+            "ssh -J jump host",
+            "/usr/bin/ssh host",
+            "ssh.exe host",
+            "wsl",
+            "wsl -d Ubuntu-24.04",
+            "wsl --distribution Ubuntu",
+            "docker exec -it web bash",
+            "docker exec -ti web bash",
+            "docker exec --interactive --tty web bash",
+            "docker exec -it -u root web bash",
+            "docker exec -it -uroot web zsh",
+            "docker exec -it --user=root web sh",
+            "docker exec -it -e FOO=1 web bash",
+            "podman exec -it box bash",
+            "kubectl exec -it mypod -- bash",
+            "kubectl exec -it mypod -n prod -c app -- sh",
+            "kubectl exec --stdin --tty mypod -- bash",
+            "oc exec -it mypod -- bash",
+            "distrobox enter",
+            "distrobox enter arch",
+            "toolbox enter",
+            "toolbox enter fedora-40",
         ] {
             assert!(nested_shell_cmd(cmd), "{cmd:?} must classify nested");
         }
@@ -1386,8 +1589,6 @@ mod tests {
             "sushi",
             "bashful",
             "echo bash",
-            "ssh host uptime",
-            "ssh devbox",
             "bash -c 'sleep 5'",
             "sh -c ls",
             "bash script.sh",
@@ -1397,8 +1598,135 @@ mod tests {
             "cat",
             "python3",
             "",
+            // typed-ssh-nested negatives — every flag form we accept has its
+            // disqualifying twin here.
+            "ssh",                             // usage, then exit
+            "ssh host uptime",                 // remote command operand
+            "ssh host ls -la",
+            "ssh -t host 'sudo su'",           // still a command operand (see the doc)
+            "ssh -t host sudo su",
+            "ssh -N -L 8080:localhost:80 host", // forwarding only
+            "ssh -N host",
+            "ssh -T host",                     // no pty
+            "ssh -n host",
+            "ssh -f -N host",
+            "ssh -W target:22 jump",           // stdio tunnel
+            "ssh -O check host",               // control command
+            "ssh -Q cipher",
+            "ssh -G host",
+            "ssh -V",
+            "ssh --help",
+            "ssh --",
+            "ssh -",
+            "ssh -p",                          // flag-value miss ⇒ FALSE
+            "ssh -i",
+            "ssh -o",
+            "ssh -p 2222",                     // no destination
+            "sshuttle -r host 0/0",            // lookalike stem
+            "sshfs host:/ /mnt",
+            "wsl ls",
+            "wsl -e bash",
+            "wsl --system",
+            "wsl -d Ubuntu ls",
+            "wsl -u root",
+            "docker exec web bash",            // no -it
+            "docker exec -i web bash",         // no tty
+            "docker exec -t web bash",         // no stdin
+            "docker exec -it web ls",          // finite command
+            "docker exec -it web",             // no command
+            "docker exec -dit web bash",       // detached
+            "docker exec -it --detach web bash",
+            "docker exec -it --nonesuch web bash", // unmodelled flag ⇒ FALSE
+            "docker exec -it -u web bash",     // -u eats "web": no container left
+            "docker run -it ubuntu bash",      // `run` deliberately not covered
+            "docker ps",
+            "podman exec box bash",
+            "kubectl exec -it mypod bash",     // no `--` separator
+            "kubectl exec -it mypod -- ls",
+            "kubectl exec mypod -- bash",      // no -it
+            "kubectl get pods",
+            "kubectl exec -it mypod --",       // empty command
+            "distrobox",
+            "distrobox list",
+            "distrobox enter arch -- ls",
+            "distrobox enter -e ls",
+            "toolbox run fedora ls",
         ] {
             assert!(!nested_shell_cmd(cmd), "{cmd:?} must NOT classify nested");
+        }
+    }
+
+    /// typed-ssh-nested: the two classifiers that answer "is the world behind
+    /// this argv an interactive POSIX shell?" — the TERMINAL one
+    /// (`state::shell_family`, which decides whether a spawned ssh/wsl
+    /// terminal gets hooks) and the NESTED one (`nested_shell_cmd`, which
+    /// decides whether a TYPED opener starts an episode) — must never
+    /// disagree on a shape both can see. A disagreement is the
+    /// double-classification hazard: a program-level ssh terminal whose own
+    /// argv also reads as a nested opener, or vice versa.
+    #[test]
+    fn typed_and_program_level_ssh_agree() {
+        use crate::state::{shell_family, ShellFamily, TermKind};
+        for argv in [
+            vec!["host"],
+            vec!["dev@203.0.113.10"],
+            vec!["-p", "2222", "rig@127.0.0.1"],
+            vec!["-p2222", "rig@127.0.0.1"],
+            vec!["-i", "key", "host"],
+            vec!["-t", "host"],
+            vec!["host", "uptime"],
+            vec!["-t", "host", "sudo", "su"],
+            vec!["-p"],
+            vec![],
+        ] {
+            let owned: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+            let program_level = matches!(
+                shell_family(&TermKind::Shell, "ssh.exe", &owned),
+                ShellFamily::Ssh { .. }
+            );
+            let typed = nested_shell_cmd(&format!("ssh {}", argv.join(" ")));
+            assert_eq!(
+                program_level, typed,
+                "ssh {argv:?}: program-level={program_level} typed={typed}"
+            );
+        }
+        // Where they intentionally diverge, the NESTED side is the stricter
+        // one — never the other way round (a nested false positive is what
+        // types into a live shell).
+        for argv in [vec!["-N", "host"], vec!["-T", "host"], vec!["-W", "h:22", "j"]] {
+            let owned: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+            assert!(matches!(
+                shell_family(&TermKind::Shell, "ssh.exe", &owned),
+                ShellFamily::Ssh { .. }
+            ));
+            assert!(!nested_shell_cmd(&format!("ssh {}", argv.join(" "))));
+        }
+    }
+
+    /// typed-ssh-nested: only the CROSSING openers may arm an injection from
+    /// a pwsh/cmd terminal — the hook body is bash/zsh, so the world the
+    /// opener lands in has to be POSIX by construction.
+    #[test]
+    fn crosses_to_posix_table() {
+        for cmd in [
+            "ssh host",
+            "/usr/bin/ssh host",
+            "ssh.exe host",
+            "wsl",
+            "docker exec -it c bash",
+            "podman exec -it c bash",
+            "kubectl exec -it p -- bash",
+            "oc exec -it p -- bash",
+            "distrobox enter",
+            "toolbox enter",
+        ] {
+            assert!(crosses_to_posix(cmd), "{cmd:?} must cross to POSIX");
+        }
+        for cmd in [
+            "sudo su", "su -", "bash", "zsh", "sh", "dash", "fish", "ksh", "login", "",
+            "sshuttle -r h 0/0", "wslconfig /l",
+        ] {
+            assert!(!crosses_to_posix(cmd), "{cmd:?} must NOT cross to POSIX");
         }
     }
 

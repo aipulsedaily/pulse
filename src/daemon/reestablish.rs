@@ -498,10 +498,20 @@ impl Core {
             // The credential check reads the settled screen's LAST non-blank
             // line (mirror truth — same grid ctl `read --screen` serializes).
             let tail_line = || self.last_screen_line(id).unwrap_or_default();
+            // typed-ssh-nested: a replayed `ssh <host>` step can land on the
+            // host-key question just as easily as on a password prompt — both
+            // are answers only the user may give, so both abort the chain.
             let action = watch_action(
                 since_sent,
                 quiet_for,
-                quiet_for >= STEP_QUIET && credential_prompt_line(&tail_line()),
+                quiet_for >= STEP_QUIET && {
+                    let tail = tail_line();
+                    credential_prompt_line(&tail)
+                        || matches!(
+                            crate::gui::composer::detect_auth_prompt(&tail),
+                            crate::gui::composer::AuthPrompt::HostKey
+                        )
+                },
                 has_more,
             );
             match action {
@@ -509,7 +519,7 @@ impl Core {
                 WatchAction::AbortCredential => {
                     self.cancel_reestablish(
                         id,
-                        "a credential prompt appeared — finish it manually (credentials are never auto-typed)",
+                        "a prompt only you can answer appeared (a credential, or a host key to confirm) — finish it manually; Pulse never types those",
                     );
                 }
                 WatchAction::AbortTimeout => {

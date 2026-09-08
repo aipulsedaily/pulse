@@ -237,13 +237,24 @@ impl App {
             }
             let comp_had_focus = self.composers.get(&id).is_some_and(|c| c.has_focus);
             let grid_focused = win_focused && !overlay_open && !comp_had_focus;
+            // typed-ssh-nested: an ATTRIBUTED inner CLI is live in this
+            // terminal (the daemon opens `inner_cli` from the CLI's own exec
+            // hook and clears it when its block closes). A Claude-KIND
+            // terminal is a CLI session by construction — the same predicate
+            // the sidebar's activity dot uses (`gui::activity_for`). While
+            // one is running the permanent editor stands down so keystrokes
+            // reach the CLI, not a queue.
+            let cli_session = self.state.terminal(id).is_some_and(|t| {
+                matches!(t.kind, crate::state::TermKind::Claude { .. })
+                    || t.inner_cli.is_some()
+            });
             let wake = match (
                 self.composers.get_mut(&id),
                 self.terms.get(&id),
                 self.blocks.get(&id),
             ) {
                 (Some(st), Some(backend), Some(bl)) => {
-                    let w = st.tick(backend, &bl.recs, running, grid_focused, now);
+                    let w = st.tick(backend, &bl.recs, running, grid_focused, cli_session, now);
                     comp_active = st.mode == ComposerMode::Compose;
                     w
                 }

@@ -156,6 +156,12 @@ pub enum RawReason {
     NoPrompt,
     /// User typed raw / clicked the grid at an armed prompt (episode used).
     UserRaw,
+    /// typed-ssh-nested: an ATTRIBUTED inner CLI (claude/codex/…) owns the
+    /// open block. It is not a shell command that will finish and hand the
+    /// prompt back — it is an interactive session with its own editor, and
+    /// the keys belong to IT. The strip states that instead of counting
+    /// elapsed seconds and queueing Enter.
+    CliSession,
     /// Session exited.
     Dead,
     /// SLEEP §7.3: the user shelved this terminal — lane shows `☾ asleep`
@@ -177,6 +183,14 @@ pub struct GateInputs {
     /// SLEEP: the persisted asleep flag (covers the Sleeping drain
     /// transient too, where `running` is still true for a moment).
     pub asleep: bool,
+    /// typed-ssh-nested: the daemon has an ATTRIBUTED inner CLI for this
+    /// terminal. `inner_cli` is opened by the CLI's own exec hook and
+    /// CLEARED when its block closes (`Core::clear_cli_block_on_close`), so
+    /// while it is `Some` an interactive CLI really is running right now —
+    /// the same predicate the sidebar's activity dot uses
+    /// (`gui::activity_for`). Paired with `open_block` it is the one case
+    /// where the permanent editor must NOT own the keyboard.
+    pub cli_session: bool,
 }
 
 #[derive(PartialEq, Debug)]
@@ -206,6 +220,14 @@ pub fn gate(i: &GateInputs) -> GateVerdict {
     }
     if i.alt {
         return GateVerdict::Blocked(RawReason::AltScreen);
+    }
+    // typed-ssh-nested: an attributed CLI owning the open block outranks the
+    // ordinary Busy span. Both block the editor, but only this one says the
+    // keys belong to a live session rather than queueing them for a prompt
+    // that will not come back until the CLI exits. Ordinary commands (a long
+    // `cargo build`) keep the Busy/queue contract byte-for-byte.
+    if i.cli_session && i.open_block {
+        return GateVerdict::Blocked(RawReason::CliSession);
     }
     if i.open_block {
         return GateVerdict::Blocked(RawReason::Busy);
@@ -742,6 +764,12 @@ pub struct ComposerState {
     /// Blocked(Asleep), on_exited's reason pick, and the `☾ asleep` +
     /// `Wake ▸` lane. Draft is KEPT through sleep (the on_exited contract).
     pub asleep: bool,
+    /// typed-ssh-nested: an ATTRIBUTED inner CLI is running in this terminal
+    /// right now (the daemon's `inner_cli`, opened by the CLI's exec hook
+    /// and cleared when its block closes). Restamped by `tick` every frame;
+    /// read by `gate_inputs`. When it is true and a block is open, the
+    /// permanent editor stands down and the keyboard belongs to the CLI.
+    cli_session: bool,
     /// This terminal's shell family is Ssh (v0.1.1 pre-shell state): gates
     /// the raw-conversation strip labels ("ssh is asking…", the password
     /// lock line) — the pre-shell ARM VETO applies to every family, but the
@@ -886,6 +914,7 @@ impl Default for ComposerState {
         Self {
             mode: ComposerMode::Raw(RawReason::NoPrompt),
             draft: String::new(),
+            cli_session: false,
             is_cmd: false,
             fam: complete::Family::Pwsh,
             tab: None,
@@ -1887,6 +1916,7 @@ impl ComposerState {
             cursor_clean: backend.cursor_at_prompt_end() || heur_live,
             episode_used: self.episode_used,
             asleep: self.asleep,
+            cli_session: self.cli_session,
         }
     }
 
@@ -1911,12 +1941,18 @@ impl ComposerState {
         recs: &[BlockRec],
         running: bool,
         grid_focused: bool,
+        cli_session: bool,
         now: Instant,
     ) -> Option<Instant> {
         // Dead-relaunch fix a: stash the key-ownership signal for `show`'s
         // Enter-to-relaunch gate (same frame — central ticks right before
         // it shows).
         self.term_focused = grid_focused;
+        // typed-ssh-nested: the daemon's attributed-CLI verdict for this
+        // frame. Stashed rather than threaded through `gate_inputs` because
+        // `show` and `history_run_allowed` read the same inputs and central
+        // always ticks immediately before showing (same frame, same truth).
+        self.cli_session = cli_session;
         // Tier-2b: the Ctrl-R overlay lives strictly inside a focused
         // Compose. Any demotion since last frame (alt flip, exit, reset,
         // Esc-blur) closes it and restores the stashed draft — the sweep
@@ -2050,6 +2086,33 @@ impl ComposerState {
                     });
                     self.want_focus = false;
                     self.has_focus = false;
+                } else if inputs.cli_session && inputs.open_block {
+                    // CLI SESSION (the permanent editor's exception TWO,
+                    // typed-ssh-nested). An attributed inner CLI —
+                    // claude/codex/... — is not a command that will finish and
+                    // hand the prompt back; it is an interactive session with
+                    // its own editor, and every keystroke belongs to it. Held
+                    // Compose here is what made a nested `claude` render as
+                    // `claude exploration# . 23.9 s — Enter queues` and
+                    // swallow the user's typing into a queue.
+                    //
+                    // Yield exactly like the inline-prompt exception: nothing
+                    // fires, the queue folds into the visible draft (never
+                    // lost, never blind-run), and the gate re-arms clean at
+                    // the next fresh prompt — which is precisely when the CLI
+                    // has exited and `inner_cli` has been cleared. Ordinary
+                    // busy commands are untouched (`cli_session` is false for
+                    // them, so a long `cargo build` still queues).
+                    if trace_enabled() {
+                        log::info!(
+                            "[composer] inner CLI owns the open block -> editor yields raw"
+                        );
+                    }
+                    self.fold_pending_into_draft();
+                    self.mode = ComposerMode::Raw(RawReason::CliSession);
+                    self.want_focus = false;
+                    self.has_focus = false;
+                    self.last_activity = Some(now);
                 } else if !inputs.at_prompt
                     && (inputs.open_block || self.busy_since.is_some())
                     && inline_interactive_prompt(&backend.cursor_row_text())
@@ -4539,6 +4602,18 @@ pub fn show(
                         let dur = super::term_view::fmt_duration(
                             now_ms().saturating_sub(rec.started_ms),
                         );
+                        // typed-ssh-nested: the Busy lane's contract line.
+                        // For an ordinary command the strip says nothing (the
+                        // editor is one Compose click away); for an
+                        // ATTRIBUTED CLI session it states where the keys go,
+                        // because that is the whole difference — the keyboard
+                        // is already live and pointed at the CLI.
+                        let dur =
+                            if matches!(state.mode, ComposerMode::Raw(RawReason::CliSession)) {
+                                format!("{dur} \u{b7} your keys go straight to it")
+                            } else {
+                                dur
+                            };
                         painter.text(
                             Pos2::new(lane_x + 24.0 + cw, strip_rect.center().y),
                             Align2::LEFT_CENTER,
@@ -4928,6 +5003,7 @@ mod tests {
             cursor_clean: true,
             episode_used: false,
             asleep: false,
+            cli_session: false,
         }
     }
 
@@ -5286,9 +5362,9 @@ mod tests {
         for _ in 0..5 {
             // Alt on, held ALMOST to the deadline.
             b.advance_live(b"\x1b[?1049h\x1b[2J\x1b[Hflap");
-            st.tick(&b, &recs, true, false, t);
+            st.tick(&b, &recs, true, false, false, t);
             t += HIDE_AFTER - Duration::from_millis(20);
-            st.tick(&b, &recs, true, false, t);
+            st.tick(&b, &recs, true, false, false, t);
             assert!(
                 !strip_hidden(&st, true, true, false, t),
                 "sub-HIDE_AFTER alt hold must never collapse"
@@ -5296,14 +5372,14 @@ mod tests {
             // Alt off: reserved instantly, clock cleared.
             b.advance_live(b"\x1b[?1049l");
             t += Duration::from_millis(10);
-            st.tick(&b, &recs, true, false, t);
+            st.tick(&b, &recs, true, false, false, t);
             assert!(!strip_hidden(&st, true, false, false, t));
             assert_eq!(st.alt_since, None);
             t += Duration::from_millis(10);
         }
         // A genuinely stable hold still collapses (the latch isn't wedged).
         b.advance_live(b"\x1b[?1049h");
-        st.tick(&b, &recs, true, false, t);
+        st.tick(&b, &recs, true, false, false, t);
         assert!(strip_hidden(&st, true, true, false, t + HIDE_AFTER));
     }
 
@@ -5320,7 +5396,7 @@ mod tests {
         let recs: Vec<BlockRec> = Vec::new();
         let mut st = ComposerState::default();
         let t0 = Instant::now();
-        st.tick(&b, &recs, true, false, t0);
+        st.tick(&b, &recs, true, false, false, t0);
         assert_eq!(st.mode, ComposerMode::Raw(RawReason::AltScreen));
         assert_eq!(st.alt_since, Some(t0), "rising edge stamps the clock");
         assert!(
@@ -5329,7 +5405,7 @@ mod tests {
         );
         // Stable alt: the stamp never slides.
         let t1 = t0 + HIDE_AFTER;
-        st.tick(&b, &recs, true, false, t1);
+        st.tick(&b, &recs, true, false, false, t1);
         assert_eq!(st.alt_since, Some(t0));
         assert!(
             strip_hidden(&st, true, true, false, t1),
@@ -5338,20 +5414,20 @@ mod tests {
         // Sleep mid-htop (freeze-frame path): the lane flips to Asleep —
         // visible `Wake ▸` — the clock untouched for the wake return.
         st.asleep = true;
-        st.tick(&b, &recs, true, false, t1);
+        st.tick(&b, &recs, true, false, false, t1);
         assert_eq!(st.mode, ComposerMode::Raw(RawReason::Asleep));
         assert!(!strip_hidden(&st, true, true, false, t1));
         st.asleep = false;
         // Falling edge clears; the strip is back the same tick.
         b.advance_live(b"\x1b[?1049l");
         let t2 = t1 + Duration::from_millis(10);
-        st.tick(&b, &recs, true, false, t2);
+        st.tick(&b, &recs, true, false, false, t2);
         assert_eq!(st.alt_since, None, "falling edge clears the clock");
         assert!(!strip_hidden(&st, true, false, false, t2));
         // Re-entry restarts the full HIDE_AFTER wait.
         b.advance_live(b"\x1b[?1049h");
         let t3 = t2 + Duration::from_millis(10);
-        st.tick(&b, &recs, true, false, t3);
+        st.tick(&b, &recs, true, false, false, t3);
         assert_eq!(st.alt_since, Some(t3), "re-entry restarts the hysteresis");
         assert!(!strip_hidden(&st, true, true, false, t3));
         assert!(strip_hidden(&st, true, true, false, t3 + HIDE_AFTER));
@@ -5374,7 +5450,7 @@ mod tests {
         assert!(b.mode().contains(TermMode::ALT_SCREEN));
         let recs: Vec<BlockRec> = Vec::new();
         let mut st = ComposerState::default();
-        st.tick(&b, &recs, true, false, Instant::now());
+        st.tick(&b, &recs, true, false, false, Instant::now());
         assert_eq!(st.mode, ComposerMode::Raw(RawReason::AltScreen));
         // Pretend the hysteresis elapsed a while ago (show() reads
         // Instant::now() internally, so backdate the latch).
@@ -5446,7 +5522,7 @@ mod tests {
         // TUI exits (alt falls): the predicate flips the same tick; the
         // strip is a real reserved band again, full interaction restored.
         b.advance_live(b"\x1b[?1049l");
-        st.tick(&b, &recs, true, false, Instant::now());
+        st.tick(&b, &recs, true, false, false, Instant::now());
         let collapsed = strip_hidden(&st, true, false, false, Instant::now());
         assert!(!collapsed, "alt exit ⇒ reserved band back, same tick");
         let out = frame(&mut st, &b, collapsed, Pos2::new(400.0, 300.0));
@@ -5557,7 +5633,7 @@ mod tests {
         st.on_stream_events(f.pre_seen, f.exec_seen, now);
         // Same instant as the latch — must arm (grid had focus ⇒ want_focus).
         let recs: Vec<BlockRec> = Vec::new();
-        st.tick(&b, &recs, true, true, now);
+        st.tick(&b, &recs, true, true, false, now);
         assert_eq!(
             st.mode,
             ComposerMode::Compose,
@@ -5704,6 +5780,7 @@ mod tests {
             cursor_clean: true,
             episode_used: st.episode_used,
             asleep: false,
+            cli_session: false,
         };
         // Hooked prompt: pre edge latches, gate arms.
         st.on_stream_events(1, 0, now);
@@ -5855,13 +5932,13 @@ mod tests {
         // Quiet window still running: no latch, honest Blocked(Busy), and
         // the pending mint schedules its own wakeup (the nested prompt will
         // never repaint on its own).
-        let wake = st.tick(&b, &recs, true, true, t0);
+        let wake = st.tick(&b, &recs, true, true, false, t0);
         assert!(!st.heur_live(&b));
         assert_eq!(st.mode, ComposerMode::Raw(RawReason::Busy));
         assert!(wake.is_some(), "pending mint must schedule a wakeup");
         // Quiet elapsed + prompt-shaped cursor row + cursor anchor: minted.
         let t1 = t0 + HEUR_QUIET + Duration::from_millis(100);
-        st.tick(&b, &recs, true, true, t1);
+        st.tick(&b, &recs, true, true, false, t1);
         assert!(st.heur_live(&b));
         assert_eq!(st.mode, ComposerMode::Compose, "AutoArm through the gate");
         assert!(st.want_focus, "grid had focus ⇒ editor takes it");
@@ -5880,12 +5957,12 @@ mod tests {
         // …and the now-dirty row (`root@box:/# x`) must NOT re-arm even
         // after a full quiet window: the classifier IS the clean check.
         let t2 = t1 + HEUR_QUIET + Duration::from_millis(200);
-        st.tick(&b, &recs, true, true, t2);
+        st.tick(&b, &recs, true, true, false, t2);
         assert!(!st.heur_live(&b), "dirty prompt never arms");
         // A fresh CLEAN prompt row re-mints after quiet.
         b.advance_live(b"\r\nroot@box:/# ");
         let t3 = t2 + HEUR_QUIET + Duration::from_millis(500);
-        st.tick(&b, &recs, true, true, t3);
+        st.tick(&b, &recs, true, true, false, t3);
         assert!(st.heur_live(&b), "fresh clean prompt re-mints");
         // A tokened marker edge (the returning pre) ends the EPISODE, not
         // just the latch — integration owns the prompt again.
@@ -5911,7 +5988,7 @@ mod tests {
             truncated: false,
         }];
         let t1b = t0b + HEUR_QUIET + Duration::from_millis(100);
-        st2.tick(&b2, &busy, true, true, t1b);
+        st2.tick(&b2, &busy, true, true, false, t1b);
         assert!(
             !st2.heur_live(&b2),
             "detection is scoped to classified nested-shell episodes"
@@ -5929,7 +6006,7 @@ mod tests {
     fn heur_submit_routes_ledger() {
         let (b, mut st, recs, t0) = heur_episode_setup();
         let t1 = t0 + HEUR_QUIET + Duration::from_millis(100);
-        st.tick(&b, &recs, true, true, t1);
+        st.tick(&b, &recs, true, true, false, t1);
         assert_eq!(st.mode, ComposerMode::Compose);
         let cover = cover_line_for(&st, &b, true, t1);
         assert!(cover.is_some());
@@ -5975,7 +6052,7 @@ mod tests {
     fn heur_post_submit_resolution() {
         let (mut b, mut st, recs, t0) = heur_episode_setup();
         let t1 = t0 + HEUR_QUIET + Duration::from_millis(100);
-        st.tick(&b, &recs, true, true, t1);
+        st.tick(&b, &recs, true, true, false, t1);
         let cover = cover_line_for(&st, &b, true, t1);
         let _ = st.dispatch_submission(&b, cover, None, "whoami", t1);
         assert!(st.post_submit.is_some());
@@ -5987,7 +6064,7 @@ mod tests {
         // 350ms after dispatch — past the INTEGRATED threshold: the
         // heuristic window must hold (300ms would always lose to the
         // echo+output+quiet cycle a fresh latch needs).
-        st.tick(&b, &recs, true, true, t1 + Duration::from_millis(350));
+        st.tick(&b, &recs, true, true, false, t1 + Duration::from_millis(350));
         assert_eq!(st.mode, ComposerMode::Compose);
         assert!(st.post_submit.is_some(), "heuristic window outlives 300ms");
         assert_eq!(st.draft, "id");
@@ -5995,7 +6072,7 @@ mod tests {
         // resolves the window — draft kept, Compose held, no bytes fired.
         b.advance_live(b"root@box:/# ");
         let t2 = t1 + Duration::from_millis(800);
-        st.tick(&b, &recs, true, true, t2);
+        st.tick(&b, &recs, true, true, false, t2);
         assert!(st.heur_live(&b));
         assert!(st.post_submit.is_none(), "fresh latch closes the window");
         assert_eq!(st.mode, ComposerMode::Compose);
@@ -6007,13 +6084,13 @@ mod tests {
         // command keeps the editor and its visible draft (permanent editor).
         let (mut b, mut st, recs, t0) = heur_episode_setup();
         let t1 = t0 + HEUR_QUIET + Duration::from_millis(100);
-        st.tick(&b, &recs, true, true, t1);
+        st.tick(&b, &recs, true, true, false, t1);
         let cover = cover_line_for(&st, &b, true, t1);
         let _ = st.dispatch_submission(&b, cover, None, "sleep 100", t1);
         b.advance_live(b"sleep 100\r\n"); // echo, then silence — no prompt
         st.draft = "id2".into();
         let late = t1 + HEUR_FLUSH + Duration::from_millis(10);
-        st.tick(&b, &recs, true, true, late);
+        st.tick(&b, &recs, true, true, false, late);
         assert_eq!(
             st.mode,
             ComposerMode::Compose,
@@ -6036,7 +6113,7 @@ mod tests {
     fn heur_handback() {
         let (mut b, mut st, recs, t0) = heur_episode_setup();
         let t1 = t0 + HEUR_QUIET + Duration::from_millis(100);
-        st.tick(&b, &recs, true, true, t1);
+        st.tick(&b, &recs, true, true, false, t1);
         assert_eq!(st.mode, ComposerMode::Compose);
         st.has_focus = true;
         // `exit`: echo/output, then the login shell's tokened pre + prompt
@@ -6060,7 +6137,7 @@ mod tests {
         // in flight) — F7 keeps the composer armed; the recaptured 133;B
         // certifies the cursor again.
         assert!(b.cursor_at_prompt_end());
-        st.tick(&b, &recs, true, true, t2 + Duration::from_millis(16));
+        st.tick(&b, &recs, true, true, false, t2 + Duration::from_millis(16));
         assert_eq!(st.mode, ComposerMode::Compose);
     }
 
@@ -6073,7 +6150,7 @@ mod tests {
     fn show_heur_types_and_submits() {
         let (b, mut st, recs, t0) = heur_episode_setup();
         let t1 = t0 + HEUR_QUIET + Duration::from_millis(100);
-        st.tick(&b, &recs, true, true, t1);
+        st.tick(&b, &recs, true, true, false, t1);
         assert_eq!(st.mode, ComposerMode::Compose);
 
         let ctx = egui::Context::default();
@@ -6149,13 +6226,13 @@ mod tests {
     fn heur_activate_never_chords() {
         let (b, mut st, recs, t0) = heur_episode_setup();
         let t1 = t0 + HEUR_QUIET + Duration::from_millis(100);
-        st.tick(&b, &recs, true, true, t1);
+        st.tick(&b, &recs, true, true, false, t1);
         assert_eq!(st.mode, ComposerMode::Compose);
         // The user yields to the grid: episode consumed, latch kept.
         st.blur_to_grid();
         assert_eq!(st.mode, ComposerMode::Raw(RawReason::UserRaw));
         assert!(st.episode_used);
-        st.tick(&b, &recs, true, true, t1 + Duration::from_millis(16));
+        st.tick(&b, &recs, true, true, false, t1 + Duration::from_millis(16));
         assert_eq!(
             st.mode,
             ComposerMode::Raw(RawReason::UserRaw),
@@ -6239,7 +6316,7 @@ mod tests {
         let recs: Vec<BlockRec> = Vec::new();
         let mut st = ComposerState::default();
         pump_counters(&mut st, &b, now);
-        st.tick(&b, &recs, true, true, now);
+        st.tick(&b, &recs, true, true, false, now);
         assert_eq!(st.mode, ComposerMode::Compose);
         st.draft = "keep me".into();
 
@@ -6249,18 +6326,18 @@ mod tests {
         assert!(!b.cursor_at_prompt_end());
 
         // Inside the window: still Compose (transients must not flap).
-        let wake = st.tick(&b, &recs, true, true, now);
+        let wake = st.tick(&b, &recs, true, true, false, now);
         assert_eq!(st.mode, ComposerMode::Compose, "no instant demotion");
         assert!(
             wake.is_some_and(|w| w <= now + DEMOTE),
             "a pending demotion must schedule its own wakeup (idle terminals repaint rarely)"
         );
-        st.tick(&b, &recs, true, true, now + DEMOTE - Duration::from_millis(10));
+        st.tick(&b, &recs, true, true, false, now + DEMOTE - Duration::from_millis(10));
         assert_eq!(st.mode, ComposerMode::Compose);
 
         // Past the window: demoted, draft intact, episode NOT consumed (a
         // genuine fresh latch may auto-re-arm).
-        st.tick(&b, &recs, true, true, now + DEMOTE);
+        st.tick(&b, &recs, true, true, false, now + DEMOTE);
         assert_eq!(
             st.mode,
             ComposerMode::Raw(RawReason::NoPrompt),
@@ -6277,12 +6354,12 @@ mod tests {
         let recs: Vec<BlockRec> = Vec::new();
         let mut st = ComposerState::default();
         pump_counters(&mut st, &b, now);
-        st.tick(&b, &recs, true, true, now);
+        st.tick(&b, &recs, true, true, false, now);
         assert_eq!(st.mode, ComposerMode::Compose);
 
         // Blip: cursor drifts (conhost repaint mid-flight)…
         b.advance_live(b"x");
-        st.tick(&b, &recs, true, true, now + Duration::from_millis(100));
+        st.tick(&b, &recs, true, true, false, now + Duration::from_millis(100));
         assert_eq!(st.mode, ComposerMode::Compose);
 
         // …and heals: a fresh prompt frame re-captures prompt_end exactly
@@ -6296,7 +6373,7 @@ mod tests {
 
         // Well past DEMOTE from the original blip: still Compose (the clock
         // reset when health returned).
-        st.tick(&b, &recs, true, true, now + DEMOTE + Duration::from_millis(200));
+        st.tick(&b, &recs, true, true, false, now + DEMOTE + Duration::from_millis(200));
         assert_eq!(
             st.mode,
             ComposerMode::Compose,
@@ -6317,7 +6394,7 @@ mod tests {
         let recs: Vec<BlockRec> = Vec::new();
         let mut st = ComposerState::default();
         pump_counters(&mut st, &b, now);
-        st.tick(&b, &recs, true, true, now);
+        st.tick(&b, &recs, true, true, false, now);
         assert_eq!(st.mode, ComposerMode::Compose);
 
         // 5 seconds of ~30Hz key-repeat, delivered a few per frame.
@@ -6332,7 +6409,7 @@ mod tests {
                 "consecutive spacers must coalesce at the cap"
             );
             t += Duration::from_millis(33);
-            st.tick(&b, &recs, true, true, t); // resolves a completed window
+            st.tick(&b, &recs, true, true, false, t); // resolves a completed window
             if let Some((bytes, spacer)) = st.pump_pending(&b, None, None, t) {
                 assert_eq!(bytes, b"\r");
                 assert!(spacer);
@@ -6346,7 +6423,7 @@ mod tests {
                 b.advance_live(&frame);
                 pump_counters(&mut st, &b, t);
             }
-            st.tick(&b, &recs, true, true, t);
+            st.tick(&b, &recs, true, true, false, t);
             assert_eq!(
                 st.mode,
                 ComposerMode::Compose,
@@ -6360,7 +6437,7 @@ mod tests {
         // Release: the residual queue drains and the state stays armed.
         for _ in 0..10 {
             t += Duration::from_millis(50);
-            st.tick(&b, &recs, true, true, t);
+            st.tick(&b, &recs, true, true, false, t);
             if st.pump_pending(&b, None, None, t).is_some() {
                 let mut frame = hook_bytes("pre", r#"{"e":0,"n":99,"d":"C:"}"#);
                 frame.extend_from_slice(b"\r\nPS C:\\> ");
@@ -6368,7 +6445,7 @@ mod tests {
                 b.advance_live(&frame);
                 pump_counters(&mut st, &b, t);
             }
-            st.tick(&b, &recs, true, true, t);
+            st.tick(&b, &recs, true, true, false, t);
         }
         assert!(st.pending.is_empty(), "queue fully drained after release");
         assert_eq!(st.mode, ComposerMode::Compose, "armed lane survives the hold");
@@ -6382,7 +6459,7 @@ mod tests {
         let recs: Vec<BlockRec> = Vec::new();
         let mut st = ComposerState::default();
         pump_counters(&mut st, &b, now);
-        st.tick(&b, &recs, true, true, now);
+        st.tick(&b, &recs, true, true, false, now);
         for _ in 0..3 {
             st.push_spacer();
         }
@@ -6394,7 +6471,7 @@ mod tests {
         // more is sent; past it the queue is dropped, never blind-fired.
         assert!(st.pump_pending(&b, None, None, now + Duration::from_millis(100)).is_none());
         let late = now + POST_SUBMIT_FLUSH + Duration::from_millis(50);
-        st.tick(&b, &recs, true, true, late);
+        st.tick(&b, &recs, true, true, false, late);
         assert!(st.pending.is_empty(), "abandoned queue");
         assert!(st.take_pending_clear().is_none(), "spacers are never blind-fired");
         assert_eq!(st.mode, ComposerMode::Compose, "abandon is not a yield");
@@ -6411,10 +6488,10 @@ mod tests {
         let recs: Vec<BlockRec> = Vec::new();
         let mut st = ComposerState::default();
         pump_counters(&mut st, &b, now);
-        st.tick(&b, &recs, true, true, now);
+        st.tick(&b, &recs, true, true, false, now);
         b.advance_live(b"stray");
-        st.tick(&b, &recs, true, true, now); // clock starts
-        st.tick(&b, &recs, true, true, now + DEMOTE); // demoted
+        st.tick(&b, &recs, true, true, false, now); // clock starts
+        st.tick(&b, &recs, true, true, false, now + DEMOTE); // demoted
         assert_eq!(st.mode, ComposerMode::Raw(RawReason::NoPrompt));
 
         // Fresh episode: new prompt, new arm — an immediately-unhealthy
@@ -6425,10 +6502,10 @@ mod tests {
         b.advance_live(&frame);
         let t1 = now + DEMOTE + Duration::from_millis(100);
         pump_counters(&mut st, &b, t1);
-        st.tick(&b, &recs, true, true, t1);
+        st.tick(&b, &recs, true, true, false, t1);
         assert_eq!(st.mode, ComposerMode::Compose, "fresh latch re-arms");
         b.advance_live(b"y");
-        st.tick(&b, &recs, true, true, t1 + Duration::from_millis(10));
+        st.tick(&b, &recs, true, true, false, t1 + Duration::from_millis(10));
         assert_eq!(
             st.mode,
             ComposerMode::Compose,
@@ -6464,7 +6541,7 @@ mod tests {
         // exec hook scanned FIRST (ConPTY reorder); echo not yet rendered.
         b.advance_live(&hook_bytes("exec", r#"{"c":"echo hi"}"#));
         pump_counters(&mut st, &b, now);
-        st.tick(&b, &recs, true, false, now);
+        st.tick(&b, &recs, true, false, false, now);
         assert_eq!(
             st.hold_line(&b, now),
             Some(0),
@@ -6473,12 +6550,12 @@ mod tests {
 
         // Partial echo: the row shows LESS text than submitted — keep holding.
         b.advance_live(b"ec");
-        st.tick(&b, &recs, true, false, now);
+        st.tick(&b, &recs, true, false, false, now);
         assert_eq!(st.hold_line(&b, now), Some(0), "partial echo must keep the hold");
 
         // Full echo in the row's cells ⇒ release, pixel-continuous swap.
         b.advance_live(b"ho hi");
-        st.tick(&b, &recs, true, false, now);
+        st.tick(&b, &recs, true, false, false, now);
         assert_eq!(st.hold_line(&b, now), None, "echo landing releases the hold");
     }
 
@@ -6500,7 +6577,7 @@ mod tests {
         let _ = st.submit(&b, Some(0), None);
         assert_eq!(st.hold_line(&b, now), Some(0));
         b.advance_live(b"\r\n");
-        st.tick(&b, &recs, true, false, now);
+        st.tick(&b, &recs, true, false, false, now);
         assert_eq!(st.hold_line(&b, now), None, "cursor below the row releases");
 
         // Grid scroll (prompt on the bottom row) ⇒ release: the pinned line
@@ -6520,7 +6597,7 @@ mod tests {
         assert_eq!(st.hold_line(&b, now), Some(3));
         b.advance(b"\r\nout"); // bottom-row newline: rows scroll into history
         assert!(b.history_size() > 0, "test must actually scroll");
-        st.tick(&b, &recs, true, false, now);
+        st.tick(&b, &recs, true, false, false, now);
         assert_eq!(st.hold_line(&b, now), None, "grid scroll releases");
 
         // Safety cap: nothing observable ever arrives.
@@ -6730,7 +6807,7 @@ mod tests {
         st.draft = "echo hi".into();
         let _ = st.submit(&b, cover_line_for(&st, &b, true, now), Some("C:\\"));
         b.advance_live(b"echo hi"); // shell echoes the command on the prompt row
-        st.tick(&b, &recs, true, false, now);
+        st.tick(&b, &recs, true, false, false, now);
         assert_eq!(st.hold_line(&b, now), None, "echo landed ⇒ released");
         assert_eq!(
             st.take_pending_history_cover(),
@@ -6747,7 +6824,7 @@ mod tests {
         st.draft = "never echoed".into();
         let _ = st.submit(&b, Some(0), Some("C:\\"));
         let later = Instant::now() + SUBMIT_HOLD_MAX + Duration::from_millis(1);
-        st.tick(&b, &recs, true, false, later);
+        st.tick(&b, &recs, true, false, false, later);
         assert_eq!(st.hold_line(&b, later), None);
         assert_eq!(
             st.take_pending_history_cover(),
@@ -6764,7 +6841,7 @@ mod tests {
         st.draft = "line1\nline2".into();
         let _ = st.submit(&b, Some(0), Some("C:\\"));
         b.advance_live(b"line1"); // first line echoes
-        st.tick(&b, &recs, true, false, now);
+        st.tick(&b, &recs, true, false, false, now);
         assert_eq!(
             st.take_pending_history_cover(),
             None,
@@ -6795,14 +6872,14 @@ mod tests {
         let mut st = ComposerState::default();
         st.on_attach_prompt(now);
         assert!(st.at_prompt_latched());
-        st.tick(&b, &recs, true, true, now);
+        st.tick(&b, &recs, true, true, false, now);
         assert_eq!(st.mode, ComposerMode::Compose, "clean cold-attach auto-arms");
 
         // Dirty: replayed cursor past the prompt end (typed input) ⇒ manual.
         let b = seeded(b"PS C:\\> ls", 8);
         let mut st = ComposerState::default();
         st.on_attach_prompt(now);
-        st.tick(&b, &recs, true, true, now);
+        st.tick(&b, &recs, true, true, false, now);
         assert_eq!(
             st.mode,
             ComposerMode::Raw(RawReason::NoPrompt),
@@ -6820,7 +6897,7 @@ mod tests {
             end_off: None,
             ..rec("claude")
         }];
-        st.tick(&b, &open, true, true, now);
+        st.tick(&b, &open, true, true, false, now);
         assert_ne!(st.mode, ComposerMode::Compose, "an open block blocks arming");
     }
 
@@ -6848,7 +6925,7 @@ mod tests {
         assert!(st.episode_used);
         // Arm frame and well beyond: ManualOnly — no chord, no arm, ever.
         for dt in [0u64, 100, 500, 1000] {
-            st.tick(&b, &recs, true, true, now + Duration::from_millis(dt));
+            st.tick(&b, &recs, true, true, false, now + Duration::from_millis(dt));
             assert_eq!(
                 st.mode,
                 ComposerMode::Raw(RawReason::NoPrompt),
@@ -6875,7 +6952,7 @@ mod tests {
         st.blur_to_grid(); // explicit ⌨/Esc yield ⇒ UserRaw + episode used
         assert_eq!(st.mode, ComposerMode::Raw(RawReason::UserRaw));
         st.on_raw_input(now);
-        st.tick(&b, &recs, true, true, now);
+        st.tick(&b, &recs, true, true, false, now);
         assert_eq!(
             st.mode,
             ComposerMode::Raw(RawReason::UserRaw),
@@ -6906,7 +6983,7 @@ mod tests {
         b.seed_prompt_end(2, 8);
         let mut st = ComposerState::default();
         st.on_attach_prompt(now);
-        st.tick(&b, &recs, true, true, now);
+        st.tick(&b, &recs, true, true, false, now);
         assert_eq!(st.mode, ComposerMode::Compose, "cold attach arms");
         assert_eq!(
             cover_line_for(&st, &b, true, now),
@@ -6935,14 +7012,14 @@ mod tests {
         let f = b.block_feed.as_ref().unwrap();
         let (pre0, exec0) = (f.pre_seen, f.exec_seen);
         st.on_stream_events(pre0, exec0, now);
-        st.tick(&b, &recs, true, true, now);
+        st.tick(&b, &recs, true, true, false, now);
         assert_eq!(st.mode, ComposerMode::Compose);
         st.draft = "half-written".into();
         // Frames pass while the user selects scrollback / scrolls (the cover
         // may drop presentationally, but no state hook fires): armed, draft
         // and latch untouched.
         for _ in 0..3 {
-            st.tick(&b, &recs, true, false, now);
+            st.tick(&b, &recs, true, false, false, now);
         }
         assert_eq!(st.mode, ComposerMode::Compose);
         assert_eq!(st.draft, "half-written");
@@ -6951,12 +7028,12 @@ mod tests {
         // this prompt episode…
         st.blur_to_grid();
         assert_eq!(st.mode, ComposerMode::Raw(RawReason::UserRaw));
-        st.tick(&b, &recs, true, true, now);
+        st.tick(&b, &recs, true, true, false, now);
         assert_eq!(st.mode, ComposerMode::Raw(RawReason::UserRaw));
         assert_eq!(st.draft, "half-written", "draft survives the blur");
         // …until the next pre re-opens it and the gate re-arms.
         st.on_stream_events(pre0 + 1, exec0, now);
-        st.tick(&b, &recs, true, true, now);
+        st.tick(&b, &recs, true, true, false, now);
         assert_eq!(st.mode, ComposerMode::Compose);
     }
 
@@ -7364,7 +7441,7 @@ mod tests {
         st.on_stream_events(f.pre_seen, f.exec_seen, now);
         // Same-cwd history entry, so the ghost IS eligible and visible.
         let recs = vec![rec_at("cd Users\\proj", Some(&cwd))];
-        st.tick(&b, &recs, true, true, now);
+        st.tick(&b, &recs, true, true, false, now);
         assert_eq!(st.mode, ComposerMode::Compose);
 
         let ctx = egui::Context::default();
@@ -7626,7 +7703,7 @@ mod tests {
         st.draft = "query".into();
         st.mode = ComposerMode::Raw(RawReason::NoPrompt); // external demote
         let recs: Vec<BlockRec> = Vec::new();
-        st.tick(&b, &recs, true, false, now);
+        st.tick(&b, &recs, true, false, false, now);
         assert!(!st.search_active(), "overlay dies with Compose");
         assert_eq!(st.draft, "kept", "stash restored by the tick sweep");
         // After blur, tab_press works again (the suppression is scoped).
@@ -7674,7 +7751,7 @@ mod tests {
             .iter()
             .map(|c| rec(c))
             .collect();
-        st.tick(&b, &recs, true, true, now);
+        st.tick(&b, &recs, true, true, false, now);
         assert_eq!(st.mode, ComposerMode::Compose);
 
         let ctx = egui::Context::default();
@@ -7914,7 +7991,7 @@ mod tests {
         let f = b.block_feed.as_ref().unwrap();
         let (pre, exec) = (f.pre_seen, f.exec_seen);
         st.on_stream_events(pre, exec, now);
-        st.tick(b, recs, true, true, now);
+        st.tick(b, recs, true, true, false, now);
         if let Some((l, c, cwd, cmd)) = st.take_pending_history_cover() {
             b.add_history_cover(l, c, cwd, cmd);
         }
@@ -8408,7 +8485,7 @@ mod tests {
         d.extend_from_slice(b"claude\r\n\x1b[?1049h");
         b.advance_live(&d);
         pump_counters(&mut st, &b, now);
-        st.tick(&b, &recs, true, false, now + Duration::from_millis(60));
+        st.tick(&b, &recs, true, false, false, now + Duration::from_millis(60));
 
         assert_eq!(st.mode, ComposerMode::Raw(RawReason::AltScreen));
         assert_eq!(
@@ -8443,14 +8520,14 @@ mod tests {
         st.draft = "dfs".into(); // typed during the ping
 
         // Inside the threshold: still buffering.
-        st.tick(&b, &recs, true, false, now + POST_SUBMIT_FLUSH - Duration::from_millis(10));
+        st.tick(&b, &recs, true, false, false, now + POST_SUBMIT_FLUSH - Duration::from_millis(10));
         assert_eq!(st.mode, ComposerMode::Compose);
         assert!(st.take_pending_clear().is_none());
         assert_eq!(st.draft, "dfs");
 
         // Past it: window closed, Compose HELD, zero bytes, draft intact —
         // the editor never leaves (box-away time = 0).
-        st.tick(&b, &recs, true, false, now + POST_SUBMIT_FLUSH + Duration::from_millis(10));
+        st.tick(&b, &recs, true, false, false, now + POST_SUBMIT_FLUSH + Duration::from_millis(10));
         assert_eq!(st.mode, ComposerMode::Compose, "the editor never yields on the threshold");
         assert!(st.take_pending_clear().is_none(), "no raw flush, ever");
         assert_eq!(st.draft, "dfs", "typing stays visible in the draft");
@@ -8468,12 +8545,131 @@ mod tests {
         b.advance_live(&d);
         let t2 = now + Duration::from_secs(2);
         pump_counters(&mut st, &b, t2);
-        st.tick(&b, &recs, true, false, t2);
+        st.tick(&b, &recs, true, false, false, t2);
         let (bytes, spacer) = st
             .pump_pending(&b, None, Some("C:\\"), t2)
             .expect("queued submission fires at the clean fresh prompt");
         assert_eq!(bytes, b"dfs\r");
         assert!(!spacer);
+    }
+
+    /// typed-ssh-nested (the addendum): an ATTRIBUTED inner CLI owning the
+    /// open block takes the keyboard back from the permanent editor.
+    ///
+    /// The field regression: with the nested `sudo su` shell HOOKED (v0.1.14),
+    /// `claude --resume ...` inside it became an ordinary witnessed exec — an
+    /// open block, a Busy span, and the strip counting `claude exploration#
+    /// ... 23.9 s - Enter queues` while the user's keystrokes went into a
+    /// queue instead of into claude. Before v0.1.14 the same shell was
+    /// unhooked, so the honest raw lane accidentally let keys through.
+    ///
+    /// Pinned here, both directions: an ordinary busy command KEEPS the
+    /// permanent editor (a long `cargo build` must still queue), an
+    /// attributed CLI yields it, the queued draft folds back visibly (never
+    /// lost, never blind-run), and the editor re-arms once the CLI is gone.
+    #[test]
+    fn attributed_cli_owns_the_keyboard() {
+        let now = Instant::now();
+        let mut b = backend_full_screen_prompt();
+        let mut st = ComposerState::default();
+        assert_eq!(sim_frame(&mut st, &mut b, &[], now), Some(5));
+        st.draft = "claude".into();
+        let _ = st.submit(&b, Some(5), Some("C:\\"));
+        let mut d = hook_bytes("exec", r#"{"c":"claude"}"#);
+        d.extend_from_slice(b"claude\r\n");
+        b.advance_live(&d);
+        pump_counters(&mut st, &b, now);
+        let open = vec![BlockRec {
+            epoch: 1,
+            n: 0,
+            cmd: "claude".into(),
+            cwd: None,
+            exit: None,
+            started_ms: 0,
+            ended_ms: None,
+            start_off: 0,
+            end_off: None,
+            truncated: false,
+        }];
+
+        // (a) NOT yet attributed — an ordinary busy span. The permanent
+        // editor holds, exactly as it has since the permanent-editor work.
+        let t1 = now + POST_SUBMIT_FLUSH + Duration::from_millis(10);
+        st.tick(&b, &open, true, false, false, t1);
+        assert_eq!(
+            st.mode,
+            ComposerMode::Compose,
+            "an ordinary busy command must keep the editor (Enter queues)"
+        );
+
+        // (b) The exec hook attributes it: `inner_cli` is live. The editor
+        // stands down and the keyboard is the CLI's.
+        st.draft = "hello claude".into();
+        st.queue_draft();
+        assert!(st.draft.is_empty(), "queued");
+        let t2 = t1 + Duration::from_millis(16);
+        st.tick(&b, &open, true, false, true, t2);
+        assert_eq!(st.mode, ComposerMode::Raw(RawReason::CliSession));
+        assert!(
+            !st.want_focus && !st.has_focus,
+            "the editor must release focus or it re-grabs it every frame"
+        );
+        assert_eq!(
+            st.draft, "hello claude",
+            "the queued line folds back into the VISIBLE draft"
+        );
+        assert!(st.take_pending_clear().is_none(), "nothing fires on the yield");
+
+        // ...and it STAYS yielded frame after frame (the Raw arm re-derives
+        // the same verdict rather than re-arming into the running CLI).
+        st.tick(&b, &open, true, true, true, t2 + Duration::from_millis(16));
+        assert_eq!(st.mode, ComposerMode::Raw(RawReason::CliSession));
+
+        // (c) The CLI exits: its block closes, the daemon clears `inner_cli`,
+        // a fresh hooked prompt certifies -> the editor re-arms exactly as it
+        // always did. No stickiness, no special case on the way back.
+        let mut d = hook_bytes("pre", r#"{"e":0,"n":2,"d":"C:"}"#);
+        d.extend_from_slice(b"PS C:\\> ");
+        d.extend_from_slice(b"\x1b]133;B\x07");
+        b.advance_live(&d);
+        let t3 = t2 + Duration::from_secs(1);
+        pump_counters(&mut st, &b, t3);
+        st.tick(&b, &[rec("claude")], true, true, false, t3);
+        assert_eq!(
+            st.mode,
+            ComposerMode::Compose,
+            "the editor comes back the moment the CLI is gone"
+        );
+    }
+
+    /// The gate row for the same rule, in isolation: only the PAIR
+    /// (attributed CLI + open block) blocks as a CLI session. An attributed
+    /// CLI with no open block is an idle prompt (its block already closed)
+    /// and arms normally; an open block with no CLI is the ordinary Busy span.
+    #[test]
+    fn cli_session_gate_rows() {
+        let mut i = raw_inputs();
+        i.open_block = true;
+        assert_eq!(gate(&i), GateVerdict::Blocked(RawReason::Busy));
+        i.cli_session = true;
+        assert_eq!(gate(&i), GateVerdict::Blocked(RawReason::CliSession));
+        i.open_block = false;
+        assert_eq!(
+            gate(&i),
+            GateVerdict::AutoArm,
+            "a cleared block hands the prompt back even with a stale CLI flag"
+        );
+        // Alt-screen and death still outrank it.
+        let mut i = raw_inputs();
+        i.cli_session = true;
+        i.open_block = true;
+        i.alt = true;
+        assert_eq!(gate(&i), GateVerdict::Blocked(RawReason::AltScreen));
+        let mut i = raw_inputs();
+        i.cli_session = true;
+        i.open_block = true;
+        i.running = false;
+        assert_eq!(gate(&i), GateVerdict::Blocked(RawReason::Dead));
     }
 
     /// An EMPTY buffer at the threshold (nothing typed since Enter),
@@ -8496,7 +8692,7 @@ mod tests {
         pump_counters(&mut st, &b, now);
 
         let late = now + POST_SUBMIT_FLUSH + Duration::from_millis(10);
-        st.tick(&b, &recs, true, false, late);
+        st.tick(&b, &recs, true, false, false, late);
         assert_eq!(st.mode, ComposerMode::Compose, "no yield at the threshold");
         assert!(st.take_pending_clear().is_none(), "no bytes for an empty buffer");
         assert!(!st.buffering());
@@ -8633,7 +8829,7 @@ mod tests {
     fn heur_editor_never_leaves_across_submit_cycle() {
         let (mut b, mut st, recs, t0) = heur_episode_setup();
         let t1 = t0 + HEUR_QUIET + Duration::from_millis(100);
-        st.tick(&b, &recs, true, true, t1);
+        st.tick(&b, &recs, true, true, false, t1);
         assert_eq!(st.mode, ComposerMode::Compose);
         let cover = cover_line_for(&st, &b, true, t1);
         let _ = st.dispatch_submission(&b, cover, None, "apt update", t1);
@@ -8655,7 +8851,7 @@ mod tests {
                 b.advance_live(&bytes);
                 fed += 1;
             }
-            st.tick(&b, &recs, true, true, now);
+            st.tick(&b, &recs, true, true, false, now);
             assert_eq!(
                 lane_content(&st, true, false, true, now),
                 LaneContent::Editor,
@@ -8703,7 +8899,7 @@ mod tests {
         // +600ms: the user types the next command — into the DRAFT (the
         // editor is present and focused; keys can no longer fall raw).
         let t_type = t0 + Duration::from_millis(600);
-        st.tick(&b, &recs, true, true, t_type);
+        st.tick(&b, &recs, true, true, false, t_type);
         assert_eq!(st.mode, ComposerMode::Compose, "box present while typing");
         st.draft = "git status".into();
         // …and presses Enter: queue (the busy_hold Enter routing).
@@ -8711,7 +8907,7 @@ mod tests {
 
         // Well past DEMOTE with the command still running: never demoted.
         let t_demote = t_type + DEMOTE + Duration::from_millis(100);
-        st.tick(&b, &recs, true, true, t_demote);
+        st.tick(&b, &recs, true, true, false, t_demote);
         assert_eq!(
             st.mode,
             ComposerMode::Compose,
@@ -8728,7 +8924,7 @@ mod tests {
         b.advance_live(&d);
         let t_prompt = t0 + Duration::from_millis(1245);
         pump_counters(&mut st, &b, t_prompt);
-        st.tick(&b, &recs, true, true, t_prompt);
+        st.tick(&b, &recs, true, true, false, t_prompt);
         assert_eq!(st.mode, ComposerMode::Compose);
         let (bytes, spacer) = st
             .pump_pending(&b, None, Some("C:\\"), t_prompt)
@@ -8757,7 +8953,7 @@ mod tests {
         exec.extend_from_slice(b"sleep 60\r\n");
         b.advance_live(&exec);
         pump_counters(&mut st, &b, t0);
-        st.tick(&b, &recs, true, true, t0 + DEMOTE + Duration::from_secs(5));
+        st.tick(&b, &recs, true, true, false, t0 + DEMOTE + Duration::from_secs(5));
         assert_eq!(
             st.mode,
             ComposerMode::Compose,
@@ -8777,7 +8973,7 @@ mod tests {
             end_off: None,
             truncated: false,
         }];
-        st.tick(&b, &open, true, true, t0 + DEMOTE + Duration::from_secs(10));
+        st.tick(&b, &open, true, true, false, t0 + DEMOTE + Duration::from_secs(10));
         assert_eq!(
             st.mode,
             ComposerMode::Compose,
@@ -8808,12 +9004,12 @@ mod tests {
 
         // Ordinary output: the editor holds.
         b.advance_live(b"make: entering directory\r\n");
-        st.tick(&b, &recs, true, true, t0 + Duration::from_millis(400));
+        st.tick(&b, &recs, true, true, false, t0 + Duration::from_millis(400));
         assert_eq!(st.mode, ComposerMode::Compose);
 
         // The command asks: the classifier yields the editor same frame.
         b.advance_live(b"[sudo] password for alec: ");
-        st.tick(&b, &recs, true, true, t0 + Duration::from_millis(500));
+        st.tick(&b, &recs, true, true, false, t0 + Duration::from_millis(500));
         assert_eq!(
             st.mode,
             ComposerMode::Raw(RawReason::Busy),
@@ -8831,7 +9027,7 @@ mod tests {
         b.advance_live(&d);
         let t1 = t0 + Duration::from_millis(900);
         pump_counters(&mut st, &b, t1);
-        st.tick(&b, &recs, true, true, t1);
+        st.tick(&b, &recs, true, true, false, t1);
         assert_eq!(st.mode, ComposerMode::Compose, "re-arms at the fresh prompt");
     }
 
@@ -8972,7 +9168,7 @@ mod tests {
         let f = b.block_feed.as_ref().unwrap();
         let (pre, exec) = (f.pre_seen, f.exec_seen);
         st.on_stream_events(pre, exec, now);
-        st.tick(b, recs, true, true, now);
+        st.tick(b, recs, true, true, false, now);
         if let Some((l, c, cwd, cmd)) = st.take_pending_history_cover() {
             b.add_history_cover(l, c, cwd, cmd);
         }
@@ -9257,7 +9453,7 @@ mod tests {
         // was Raw through its own 300ms window). Sim `now` past the window is
         // fine HERE — we WANT the arm to mint.
         let tm = t0 + HEUR_QUIET + Duration::from_millis(50);
-        st.tick(&b, &recs, true, true, tm);
+        st.tick(&b, &recs, true, true, false, tm);
         assert_eq!(st.mode, ComposerMode::Compose);
         assert!(st.heur_live(&b));
 
@@ -9266,7 +9462,7 @@ mod tests {
         let _ = st.dispatch_submission(&b, cover, None, "whoami", tm);
         let _ = st.take_submit_cmd();
         b.advance_live(b"whoami\r\nroot\r\n");
-        st.tick(&b, &recs, true, true, tm + Duration::from_millis(10));
+        st.tick(&b, &recs, true, true, false, tm + Duration::from_millis(10));
         assert!(!st.heur_live(&b), "output tore the arm latch down");
         assert_eq!(st.mode, ComposerMode::Compose, "permanent editor: box stays up");
 
@@ -9279,7 +9475,7 @@ mod tests {
         // cover paints THIS frame (zero dual-prompt frames), while the arm has
         // NOT minted (quiet < HEUR_QUIET).
         let rn = Instant::now();
-        st.tick(&b, &recs, true, true, rn);
+        st.tick(&b, &recs, true, true, false, rn);
         assert_eq!(st.mode, ComposerMode::Compose);
         assert!(!st.heur_live(&b), "arm still waiting (quiet < HEUR_QUIET) at frame N");
         assert_eq!(
@@ -9291,7 +9487,7 @@ mod tests {
         // Frame N+1: still at rest (no output since ⇒ feed_gen unchanged) —
         // the cover HOLDS (not revoked), still before the arm mints.
         let rn2 = Instant::now();
-        st.tick(&b, &recs, true, true, rn2);
+        st.tick(&b, &recs, true, true, false, rn2);
         assert!(!st.heur_live(&b), "arm still waiting at frame N+1 (cover ≠ arm)");
         assert_eq!(
             cover_line_for(&st, &b, true, rn2),
@@ -9303,7 +9499,7 @@ mod tests {
         // takes the row over seamlessly (same row, no flash).
         std::thread::sleep(HEUR_QUIET + Duration::from_millis(30));
         let rn3 = Instant::now();
-        st.tick(&b, &recs, true, true, rn3);
+        st.tick(&b, &recs, true, true, false, rn3);
         assert!(st.heur_live(&b), "the arm mints after the full HEUR_QUIET");
         assert_eq!(
             cover_line_for(&st, &b, true, rn3),
@@ -9322,7 +9518,7 @@ mod tests {
     fn heur_optimistic_cover_never_covers_streaming() {
         let (mut b, mut st, recs, t0) = heur_episode_setup();
         let tm = t0 + HEUR_QUIET + Duration::from_millis(50);
-        st.tick(&b, &recs, true, true, tm);
+        st.tick(&b, &recs, true, true, false, tm);
         assert_eq!(st.mode, ComposerMode::Compose);
         let cover = cover_line_for(&st, &b, true, tm);
         let _ = st.dispatch_submission(&b, cover, None, "make", tm);
@@ -9337,7 +9533,7 @@ mod tests {
         for i in 0..6 {
             b.advance_live(b"Building target #");
             let rn = Instant::now();
-            st.tick(&b, &recs, true, true, rn);
+            st.tick(&b, &recs, true, true, false, rn);
             assert!(!st.heur_live(&b), "arm must not mint over streaming output");
             if cover_line_for(&st, &b, true, rn).is_some() {
                 covered_frames += 1;
@@ -9354,7 +9550,7 @@ mod tests {
         // non-prompt row, a genuinely fresh at-rest prompt covers again.
         b.advance_live(b"regular output line\r\n"); // cursor col 0 ⇒ fails
         let rf = Instant::now();
-        st.tick(&b, &recs, true, true, rf);
+        st.tick(&b, &recs, true, true, false, rf);
         assert_eq!(
             cover_line_for(&st, &b, true, rf),
             None,
@@ -9362,7 +9558,7 @@ mod tests {
         );
         b.advance_live(b"root@box:/# "); // the real fresh prompt
         let rn = Instant::now();
-        st.tick(&b, &recs, true, true, rn);
+        st.tick(&b, &recs, true, true, false, rn);
         assert_eq!(
             cover_line_for(&st, &b, true, rn),
             Some(b.cursor_line()),
@@ -9455,7 +9651,7 @@ mod tests {
         st.draft = "tail".into(); // trailing keys, no Enter yet
 
         b.advance_live(b"\x1b[?1049h"); // the app takes the screen
-        st.tick(&b, &recs, true, false, now + Duration::from_millis(30));
+        st.tick(&b, &recs, true, false, false, now + Duration::from_millis(30));
         assert_eq!(
             st.take_pending_clear().as_deref(),
             Some(b"hi\r\rtail".as_ref()),
@@ -9495,7 +9691,7 @@ mod tests {
         assert!(st.take_pending_clear().is_none());
 
         let t2 = t1 + DEMOTE;
-        st.tick(&b, &recs, true, false, t2);
+        st.tick(&b, &recs, true, false, false, t2);
         assert_eq!(st.mode, ComposerMode::Raw(RawReason::NoPrompt));
         assert_eq!(
             st.take_pending_clear().as_deref(),
@@ -9523,7 +9719,7 @@ mod tests {
         st.queue_draft();
         st.draft = "c-partial".into();
 
-        st.tick(&b, &recs, true, false, now + WINDOW_STALE + Duration::from_millis(1));
+        st.tick(&b, &recs, true, false, false, now + WINDOW_STALE + Duration::from_millis(1));
         assert!(st.take_pending_clear().is_none(), "nothing may fire late");
         assert_eq!(
             st.draft, "b\nc-partial",
@@ -9546,7 +9742,7 @@ mod tests {
         assert_eq!(st.hold_line(&b, now), Some(5));
         b.resize_to(egui::vec2(30.0 * 8.0, 6.0 * 16.0), egui::vec2(8.0, 16.0));
         assert_eq!(st.hold_line(&b, now), None, "resize invalidates the pin");
-        st.tick(&b, &recs, true, false, now);
+        st.tick(&b, &recs, true, false, false, now);
         assert!(st.submit_hold.is_none(), "released");
         assert_eq!(st.take_pending_history_cover(), None, "never converted");
     }
@@ -9639,7 +9835,7 @@ mod tests {
         // hold must survive and keep covering the still-bare prompt row.
         // (h.since is stamped inside submit(), so probe from fresh Instants.)
         let late = Instant::now() + Duration::from_millis(400);
-        st.tick(&b, &recs, true, true, late);
+        st.tick(&b, &recs, true, true, false, late);
         assert!(st.submit_hold.is_some(), "hold survives the hitch");
         assert_eq!(st.hold_line(&b, late), Some(5), "ghost keeps covering");
 
@@ -9647,7 +9843,7 @@ mod tests {
         // conversion forever).
         b.advance_live(b"ls");
         let late2 = late + Duration::from_millis(16);
-        st.tick(&b, &recs, true, true, late2);
+        st.tick(&b, &recs, true, true, false, late2);
         assert!(st.submit_hold.is_none(), "echo landed ⇒ released");
         assert_eq!(
             st.take_pending_history_cover()
