@@ -356,10 +356,19 @@ impl App {
             self.recompute_search(id);
         }
         // C2: one predicate evaluation for this frame's paint decisions —
-        // the same `strip_hidden` question `layout_for` answered for the
+        // the same `collapsed_lane` question `layout_for` answered for the
         // commit/heal resizes above (single source; computed here, before
         // the long-lived search borrow below).
-        let strip_collapsed = strip_on && self.strip_collapsed(id);
+        let collapsed_lane = strip_on.then(|| self.collapsed_lane(id)).flatten();
+        let strip_collapsed = collapsed_lane.is_some();
+        // cli-strip-parity: the band collapsed because an attributed inner
+        // CLI owns the keyboard. The strip is gone (parity with a native CLI
+        // terminal) but the ⌨ escape hatch is NOT — it is the only route back
+        // to the editor while the CLI runs, so it keeps its pre-input
+        // hit-test over the collapsed band and `composer::show` keeps a real
+        // widget on that one 22px corner (which is also what stops the same
+        // click reaching the CLI as a mouse report).
+        let cli_collapsed = collapsed_lane == Some(composer::LaneContent::CliSession);
         let (sre, curm) = match &mut self.search {
             Some(s) => (
                 s.regex.as_mut(),
@@ -439,7 +448,7 @@ impl App {
         // composer strip; hookless terminals keep today's single call
         // byte-for-byte. C2: under a STABLE full-screen app the strip
         // collapses and the grid takes the whole card — `strip_collapsed`
-        // is the same `strip_hidden` predicate `layout_for` consulted for
+        // is the same `collapsed_lane` predicate `layout_for` consulted for
         // the PTY size this frame (single source: paint and grid dims can
         // never disagree; the ±rows resize rode the debounced commit /
         // corrective-heal machinery above).
@@ -475,7 +484,7 @@ impl App {
         // An open modal / popup / rename owns the keyboard (selector D14):
         // the strip's toggle stands down under it, exactly like the editor's
         // focus grab above.
-        if strip_on && !strip_collapsed && !overlay_open {
+        if strip_on && (!strip_collapsed || cli_collapsed) && !overlay_open {
             let kbd = composer::kbd_rect_for(Rect::from_min_max(
                 Pos2::new(full.min.x, full.max.y - composer::STRIP_H),
                 full.max,
@@ -811,7 +820,11 @@ impl App {
         // collapsed the band's rect overlaps the grid's bottom rows —
         // composer::show then paints at most the hover-peek overlay there
         // and registers no interaction (the pixels belong to the grid);
-        // every other state keeps the real reserved band.
+        // every other state keeps the real reserved band. cli-strip-parity
+        // carve-out: a band collapsed for CLI OWNERSHIP keeps ONE live
+        // widget, the ⌨ corner (the only route back to the editor while the
+        // CLI runs), scoped to 22px so the rest of the band still belongs to
+        // the grid.
         if strip_on {
             let strip_rect = Rect::from_min_max(
                 Pos2::new(full.min.x, full.max.y - composer::STRIP_H),

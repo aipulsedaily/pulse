@@ -3875,7 +3875,7 @@ impl App {
     ///
     /// C2 exception — the ONE sanctioned dynamic edge: while the strip is
     /// collapsed under a stable full-screen app (`strip_collapsed`, the same
-    /// `strip_hidden` predicate that gates the strip paint — single source,
+    /// `collapsed_lane` predicate that gates the strip paint — single source,
     /// paint and PTY size can never disagree) the terminal gets the FULL
     /// card: the reclaimed rows reach the TUI through the ordinary debounced
     /// resize paths (commit loop / corrective heal), one +rows resize at
@@ -3890,19 +3890,28 @@ impl App {
     }
 
     /// C2: is this terminal's strip collapsed (rows reclaimed by the grid)
-    /// right now? Thin app-side binding of `composer::strip_hidden` — it
+    /// right now? Thin app-side binding of `composer::collapsed_lane` — it
     /// derives every input live (backend ALT_SCREEN flag, Running status,
     /// open recs, the composer's hysteresis clock) so EVERY caller —
     /// layout_for (and through it all resize sites), central's card split,
     /// the sleep pre-pass — asks the identical question. Terminals without
     /// a composer/backend yet (cold attach, hookless) are never collapsed.
     fn strip_collapsed(&self, id: Uuid) -> bool {
-        let Some(st) = self.composers.get(&id) else {
-            return false;
-        };
-        let Some(b) = self.terms.get(&id) else {
-            return false;
-        };
+        self.collapsed_lane(id).is_some()
+    }
+
+    /// cli-strip-parity: WHICH lane collapsed this terminal's band, or None
+    /// if the band is reserved. `strip_collapsed` is the boolean face of this
+    /// (so geometry keeps its single source); central asks for the lane
+    /// itself because the two collapses differ in ONE respect — under
+    /// `LaneContent::CliSession` the strip is gone but the CLI still holds
+    /// the keyboard, so the pre-input ⌨ hit-test must stay alive over the
+    /// collapsed band (it is the only route back to the editor). Under
+    /// AltScreen the band is dead pixels and the toggle is unavailable
+    /// anyway. Terminals without a composer/backend yet are never collapsed.
+    fn collapsed_lane(&self, id: Uuid) -> Option<composer::LaneContent> {
+        let st = self.composers.get(&id)?;
+        let b = self.terms.get(&id)?;
         let running =
             self.state.terminal(id).map(|t| t.status) == Some(TermStatus::Running);
         let alt = b.mode().contains(TermMode::ALT_SCREEN);
@@ -3910,7 +3919,7 @@ impl App {
             .blocks
             .get(&id)
             .is_some_and(|bl| bl.recs.iter().any(|r| r.end_off.is_none()));
-        composer::strip_hidden(st, running, alt, open_rec, Instant::now())
+        composer::collapsed_lane(st, running, alt, open_rec, Instant::now())
     }
 
     /// C2 sleep pre-pass: the daemon's freeze-frame capture and the asleep
