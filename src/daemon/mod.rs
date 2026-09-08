@@ -1661,18 +1661,19 @@ impl Core {
         // the re-established nested shell, resolving the spec-I1
         // wrong-session-store concern); the launch-time restore arms above
         // keep refusing nested identities (`cli_wants_resume`) unchanged.
-        let nested_resume: Option<(String, String)> = if auto_reestablish {
-            meta.nested_chain
-                .as_ref()
-                .and_then(|chain| {
-                    let cli = meta.inner_cli.as_ref().filter(|c| c.nested)?;
-                    let step = tracker::nested_resume_step(chain, Some(cli))?;
-                    let hint = tracker::nested_resume_abort_hint(&cli.adapter, &step);
-                    Some((step, hint))
-                })
+        let nested_step: Option<(tracker::NestedFinalStep, String)> = if auto_reestablish {
+            meta.nested_chain.as_ref().and_then(|chain| {
+                let cli = meta.inner_cli.as_ref().filter(|c| c.nested)?;
+                let step = tracker::nested_resume_step(chain, Some(cli))?;
+                let hint = tracker::nested_resume_abort_hint(&cli.adapter, &step);
+                Some((step, hint))
+            })
         } else {
             None
         };
+        let nested_resume: Option<(String, String)> = nested_step
+            .as_ref()
+            .map(|(step, hint)| (step.cmd.clone(), hint.clone()));
         let nested_notice: Option<String> = meta.nested_chain.as_ref().map(|chain| {
             // Say what was actually DECIDED (the pre-fix line claimed
             // "shell-only restore" unconditionally — even on the very
@@ -1692,7 +1693,7 @@ impl Core {
                 chain,
                 meta.inner_cli.as_ref().filter(|c| c.nested),
                 auto_reestablish,
-                nested_resume.as_ref().map(|(step, _)| step.as_str()),
+                nested_step.as_ref().map(|(step, _)| step),
             )
         });
 
@@ -2932,7 +2933,7 @@ impl Core {
         // the shell's own $PWD at the moment the CLI started, not a
         // self-report. Still never a GUESS — no exec, no cwd.
         if !scope.is_outer() {
-            self.record_nested_cli(id, inner);
+            self.record_nested_cli(id, inner, cmd);
             return;
         }
         self.set_inner_cli(id, Some(inner));
@@ -2945,7 +2946,7 @@ impl Core {
     /// terminal's own resume step, and any resume the user typed): a bare
     /// `claude` stays token-less and Ambiguous, so the restore preface stays
     /// honest instead of guessing a session id.
-    fn record_nested_cli(&self, id: Uuid, inner: crate::state::InnerCli) {
+    fn record_nested_cli(&self, id: Uuid, inner: crate::state::InnerCli, cmd: &str) {
         let mut cli = inner;
         cli.nested = true;
         let changed = {
@@ -2959,6 +2960,20 @@ impl Core {
                 if chain.cli_cwd.as_ref() != Some(&cli.cwd) {
                     chain.cli_cwd = Some(cli.cwd.clone());
                     changed = true;
+                }
+                // env-prefix-cli: the launch LINE itself, verbatim, is the
+                // replay witness (`tracker::nested_resume_step`) — the
+                // reconnect re-runs what the user ran (env prefix and flags
+                // included) instead of composing a resume that would drop
+                // both and name a session he may never have asked for.
+                // Normalised + gated by `witnessed_launch_line`; a line it
+                // refuses leaves the previous witness standing rather than
+                // half-recording one.
+                if let Some(line) = tracker::witnessed_launch_line(cmd) {
+                    if chain.launch_cmd.as_deref() != Some(line.as_str()) {
+                        chain.launch_cmd = Some(line);
+                        changed = true;
+                    }
                 }
             }
             // A beacon-refined Explicit token must not be clobbered by a

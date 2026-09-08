@@ -475,6 +475,25 @@ pub struct NestedChain {
     /// Wall-clock ms when the episode opened (diagnostics/staleness).
     #[serde(default)]
     pub opened_ms: u64,
+    /// env-prefix-cli: the inner CLI's WITNESSED launch line, verbatim, as
+    /// the injected nested shell's own exec hook reported it — env
+    /// assignments and flags included (`IS_SANDBOX=1 claude
+    /// --dangerously-skip-permissions`), with the `cd '<dir>' &&` head this
+    /// lane itself types stripped back off
+    /// (`tracker::witnessed_launch_line`).
+    ///
+    /// It is the REPLAY witness: a re-establish re-types the line the user
+    /// actually ran instead of composing `<cli> --resume <sid>` from an
+    /// identity. Composing dropped the env prefix and every flag — for a
+    /// `--dangerously-skip-permissions` launch that silently CHANGES the
+    /// security posture of what gets started — and named a session id the
+    /// user may never have asked for (argv lies after an in-TUI `/resume`,
+    /// and the pid-registry correction that fixes that locally does not
+    /// exist on a remote host). Absent ⇒ the composed resume stays the
+    /// fallback, exactly as before. Appended LAST (bincode Snapshot field
+    /// order is wire order, same-exe GUI+daemon rule; no proto bump).
+    #[serde(default)]
+    pub launch_cmd: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1159,6 +1178,7 @@ mod shell_family_tests {
             entered_cwd: PathBuf::from("/home/dev"),
             cli_cwd: Some(PathBuf::from("/")),
             opened_ms: 42,
+            launch_cmd: Some("IS_SANDBOX=1 claude --dangerously-skip-permissions".into()),
         });
         // Round-trip.
         let json = serde_json::to_string(&meta).unwrap();
@@ -1177,6 +1197,7 @@ mod shell_family_tests {
             serde_json::from_str(r#"{"cmds":["sudo su"],"entered_cwd":"/h"}"#).unwrap();
         assert_eq!(partial.cli_cwd, None);
         assert_eq!(partial.opened_ms, 0);
+        assert_eq!(partial.launch_cmd, None);
         // load_from: the boot force-reset touches status/reconnecting ONLY —
         // the breadcrumb and its nested identity survive.
         let d = std::env::temp_dir().join(format!("tc-state-nested-{}", Uuid::new_v4()));

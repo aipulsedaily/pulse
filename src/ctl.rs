@@ -1608,6 +1608,9 @@ pub fn term_json(t: &CtlTerm, is_self: bool) -> serde_json::Value {
             "cmds": n.cmds,
             "entered_cwd": n.entered_cwd.display().to_string(),
             "cli_cwd": n.cli_cwd.as_ref().map(|p| p.display().to_string()),
+            // env-prefix-cli: the verbatim replay witness (the launch line
+            // a re-establish re-types instead of composing a resume).
+            "launch_cmd": n.launch_cmd,
         })),
         "program": t.program,
         "cwd": t.cwd,
