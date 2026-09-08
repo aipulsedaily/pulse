@@ -65,7 +65,7 @@ const REVEAL: Duration = Duration::from_millis(180);
 /// Bug C/C2 (full-screen apps get the whole card): once the alt screen has
 /// been held continuously this long, the strip COLLAPSES — the label +
 /// right cluster stop painting AND the 36px reservation is handed to the
-/// grid (`layout_for` consults the same `strip_hidden` predicate, so the
+/// grid (`layout_for` consults the same `collapsed_lane` predicate, so the
 /// terminal gains the rows and the PTY resizes once). Every affordance is
 /// already inert under alt, so the band is genuinely dead chrome there.
 /// This delay is ALSO the resize debounce: alt flapping (claude shelling
@@ -937,11 +937,21 @@ pub struct ComposerState {
     compose_broken_since: Option<Instant>,
     /// Bug C/C2: rising-edge timestamp of the backend's ALT_SCREEN flag
     /// (stamped/cleared by `tick` on the edges) — the strip-collapse
-    /// hysteresis clock read by `strip_hidden`, which is now the SINGLE
+    /// hysteresis clock read by `collapsed_lane`, which is now the SINGLE
     /// SOURCE for both the strip paint and the grid geometry (`layout_for`):
     /// paint and PTY size can never disagree because they ask the same
     /// question. The 400ms wait doubles as the resize debounce (HIDE_AFTER).
     alt_since: Option<Instant>,
+    /// cli-strip-parity: rising-edge timestamp of ATTRIBUTED-CLI INPUT
+    /// OWNERSHIP (`cli_session && (open_block || exec_busy)` — the very
+    /// predicate the gate and `tick` use), stamped/cleared by `tick` on the
+    /// edges. Second hysteresis clock of the same shape as `alt_since` and
+    /// read by exactly the same consumer (`collapsed_lane`): while a nested
+    /// `claude`/`codex` owns the keyboard the strip collapses and the grid
+    /// takes the band, so the nested case presents EXACTLY like a native
+    /// `TermKind::Claude` terminal (hookless ⇒ no strip at all). The 400ms
+    /// wait is the same resize debounce it is for alt (HIDE_AFTER).
+    cli_since: Option<Instant>,
     /// D2: the live heuristic prompt latch, if any (see `HeurPrompt`).
     /// Minted by `tick` (quiet 300ms + prompt-shape classifier + cursor
     /// anchor), scoped strictly to marker-silent nested-shell episodes.
@@ -1010,6 +1020,7 @@ impl Default for ComposerState {
             last_activity: None,
             compose_broken_since: None,
             alt_since: None,
+            cli_since: None,
             heur: None,
             heur_episode: false,
             heur_cover_gen: None,
@@ -2105,7 +2116,7 @@ impl ComposerState {
     }
 
     /// C2 sleep pre-pass: force the strip visible NOW by restarting the
-    /// hide clock. `strip_hidden` goes false immediately (geometry follows —
+    /// hide clock. `collapsed_lane` goes None immediately (geometry follows —
     /// the caller resizes back before the daemon's freeze-frame capture),
     /// and because `tick` re-stamps the rising edge on its next run, the
     /// strip cannot re-collapse for a full HIDE_AFTER — ample cover for the
@@ -2113,6 +2124,7 @@ impl ComposerState {
     /// strip visible from then on).
     pub fn restart_hide_clock(&mut self) {
         self.alt_since = None;
+        self.cli_since = None;
     }
 
     /// Per-frame signal pump for the SELECTED terminal (cheap: a gate eval).
@@ -2174,10 +2186,22 @@ impl ComposerState {
         }
         // Bug C: strip-hide hysteresis clock — stamp the ALT_SCREEN rising
         // edge, clear on the falling edge (a re-entry restarts the full
-        // HIDE_AFTER wait). Consumed by `strip_hidden` alone.
+        // HIDE_AFTER wait). Consumed by `collapsed_lane` alone.
         match (inputs.alt, self.alt_since) {
             (true, None) => self.alt_since = Some(now),
             (false, Some(_)) => self.alt_since = None,
+            _ => {}
+        }
+        // cli-strip-parity: the SAME hysteresis discipline for attributed-CLI
+        // input ownership. Stamped off the raw ownership predicate (not the
+        // derived mode) exactly as `alt_since` is stamped off raw `inputs.alt`
+        // — `collapsed_lane` gates the rest through `lane_content`, so an
+        // Editor override / alt / death simply stops presenting the CliSession
+        // lane and the strip is back the same tick, clock or no clock.
+        let cli_owns = inputs.cli_session && (inputs.open_block || inputs.exec_busy);
+        match (cli_owns, self.cli_since) {
+            (true, None) => self.cli_since = Some(now),
+            (false, Some(_)) => self.cli_since = None,
             _ => {}
         }
         // SubmitHold release (Bug 3, corrected): grid-observed only. Release
@@ -3077,6 +3101,14 @@ pub(crate) enum LaneContent {
     Quiet,
     /// Open block ≥ REVEAL old: pulsing dot + cmd + elapsed.
     Busy,
+    /// cli-strip-parity: an ATTRIBUTED inner CLI owns the keyboard
+    /// (`Raw(CliSession)`). Renders NOTHING and collapses the band once the
+    /// ownership has held for HIDE_AFTER, so a nested `claude` presents
+    /// exactly like a native `TermKind::Claude` terminal — which is hookless
+    /// and therefore has no strip at all. Distinct from `Busy` on purpose:
+    /// an ordinary `cargo build` keeps its pulsing dot, command and elapsed
+    /// timer byte-for-byte.
+    CliSession,
     /// Steady raw: keyboard glyph + label (+ ❯ Compose when armable).
     Label,
 }
@@ -3114,6 +3146,14 @@ pub(crate) fn lane_content(
     if state.submit_hold.is_some() {
         return LaneContent::Frozen;
     }
+    // cli-strip-parity: attributed-CLI ownership outranks the ordinary Busy
+    // row (the mode is stamped by the same `cli_session && (open_block ||
+    // exec_busy)` gate). Placed AFTER Frozen so the submit handoff keeps its
+    // ghost, and after alt/dead/asleep/reconnecting so every hard lifecycle
+    // lane still wins and still holds the band visible.
+    if reason == RawReason::CliSession {
+        return LaneContent::CliSession;
+    }
     // F7 companion: a scanned pre closes the block locally — the busy row
     // must not linger for the Blocks round-trip.
     if open_rec && !state.at_prompt_latched() {
@@ -3135,33 +3175,53 @@ pub(crate) fn lane_content(
     LaneContent::Label
 }
 
-/// Bug C/C2 — the strip-collapse predicate (pure, table-tested like
-/// `lane_content`), and the SINGLE SOURCE for both paint and geometry: the
-/// strip collapses — stops painting AND hands its 36px reservation to the
-/// grid (`layout_for` + central's card split both call exactly this fn, so
-/// paint and PTY size can never disagree) — iff the lane presents the
-/// alt-screen state (lane_content's precedence already keeps Asleep
-/// `Wake ▸`, Reconnecting `Cancel`, SessionEnded `Restore ▸` and every
-/// non-alt lane visible) and the alt screen has been held continuously for
-/// ≥ HIDE_AFTER (the hysteresis doubles as the resize debounce — alt
-/// flapping can't storm PTY resizes). Hover is deliberately NOT an input:
-/// the hover-peek is a translucent OVERLAY painted over the grid's bottom
-/// band (peek = look, not reflow — a hover must never resize the TUI).
-/// Key-based reveal stays rejected: keys belong to the app under alt by
-/// definition. The alt falling edge un-collapses the SAME tick regardless
-/// of the clock: the lane is no longer AltScreen, the strip returns and the
-/// grid gives the rows back.
-pub(crate) fn strip_hidden(
+/// Bug C/C2 + cli-strip-parity — the strip-collapse verdict (pure,
+/// table-tested like `lane_content`), and the SINGLE SOURCE for both paint
+/// and geometry: the strip collapses — stops painting AND hands its 36px
+/// reservation to the grid (`layout_for` + central's card split both resolve
+/// through exactly this fn, so paint and PTY size can never disagree). It
+/// returns WHICH lane collapsed the band, because the two collapsing lanes
+/// differ in one respect the callers care about (below); `None` means the
+/// band is reserved, ordinary furniture.
+///
+/// TWO collapsing lanes, one shape — the lane must be collapsible AND its
+/// own rising edge ≥ HIDE_AFTER old (the hysteresis doubles as the resize
+/// debounce: flapping can't storm PTY resizes):
+///
+///   * `AltScreen` (Bug C/C2) — a stable full-screen app owns the screen.
+///     The band is dead pixels: `kbd_toggle_available` is false under alt,
+///     so the hover-peek is look-only.
+///   * `CliSession` (cli-strip-parity) — an ATTRIBUTED inner CLI owns the
+///     keyboard. Presenting like a native `TermKind::Claude` terminal means
+///     no strip at all; but unlike alt, the ⌨ escape hatch is still live and
+///     is the ONLY route back to the editor while the CLI runs, so central
+///     keeps its pre-input hit-test alive over the collapsed band and `show`
+///     keeps a real widget on that one corner.
+///
+/// Every OTHER lane holds the band visible by construction — Editor (the ⌨
+/// override), Asleep `Wake ▸`, Reconnecting `Cancel`, SessionEnded
+/// `Restore ▸`, Busy, Frozen, Label — so the strip returns at full size the
+/// SAME tick the TUI exits, the CLI exits, the session dies, or the user
+/// takes the keyboard back, regardless of either clock.
+///
+/// Hover is deliberately NOT an input: the hover-peek is a translucent
+/// OVERLAY painted over the grid's bottom band (peek = look, not reflow — a
+/// hover must never resize the TUI). Key-based reveal stays rejected: keys
+/// belong to the app (or the CLI) in both collapsed states by definition.
+pub(crate) fn collapsed_lane(
     state: &ComposerState,
     running: bool,
     alt: bool,
     open_rec: bool,
     now: Instant,
-) -> bool {
-    lane_content(state, running, alt, open_rec, now) == LaneContent::AltScreen
-        && state
-            .alt_since
-            .is_some_and(|t| now.duration_since(t) >= HIDE_AFTER)
+) -> Option<LaneContent> {
+    let lane = lane_content(state, running, alt, open_rec, now);
+    let since = match lane {
+        LaneContent::AltScreen => state.alt_since,
+        LaneContent::CliSession => state.cli_since,
+        _ => return None,
+    };
+    (since.is_some_and(|t| now.duration_since(t) >= HIDE_AFTER)).then_some(lane)
 }
 
 /// Dead-relaunch fix a — the strip-presence gate (pure, table-tested): a
@@ -3548,7 +3608,7 @@ pub fn show(
     recs: &[BlockRec],
     epoch: u32,
     running: bool,
-    // C2: the caller's verdict from the SAME `strip_hidden` predicate that
+    // C2: the caller's verdict from the SAME `collapsed_lane` predicate that
     // sized the grid this frame (central's card split + layout_for) — when
     // true the band belongs to the grid and this fn paints at most the
     // hover-peek overlay. Passed in rather than recomputed so paint and
@@ -3599,7 +3659,7 @@ pub fn show(
 
     // ── Bug C/C2: under a STABLE full-screen app the strip is COLLAPSED —
     // the caller handed the band to the grid (`collapsed` came from the same
-    // `strip_hidden` predicate that sized the grid and the PTY this frame,
+    // `collapsed_lane` predicate that sized the grid and the PTY this frame,
     // so paint can never disagree with geometry) and this fn paints at most
     // the hover-PEEK: a translucent overlay floating over the grid's bottom
     // rows with the normal lane label + cluster, faded in/out (~120ms).
@@ -3610,12 +3670,37 @@ pub fn show(
     // lane_content, so `Wake ▸`, `Cancel` and `Restore ▸` always paint at
     // full strength on a real reserved band.
     let open_rec_any = recs.iter().any(|r| r.end_off.is_none());
+    // The ⌨ slot's rect is needed before the peek block (the CLI peek zone is
+    // scoped to it) and again by the cluster paint — one derivation, shared.
+    let kbd_rect = kbd_rect_for(strip_rect);
+    let lane_now = lane_content(state, running, inputs.alt, open_rec_any, now);
+    let lane_is_alt = lane_now == LaneContent::AltScreen;
+    // cli-strip-parity: the CLI collapse differs from the alt collapse in one
+    // way that matters for HOVER. Under alt the band is another app's
+    // full-screen canvas and the whole band is a fair peek target. Under CLI
+    // ownership the rows underneath are the CLI's OWN input box on the
+    // PRIMARY screen — a full-width wash would blank claude's composer every
+    // time the pointer drifted along the bottom. So the CLI peek zone is the
+    // ⌨ corner alone (~38px), which is also the only thing the peek shows.
+    let lane_is_cli = lane_now == LaneContent::CliSession;
+    let peek_rect = if lane_is_cli {
+        Rect::from_min_max(
+            Pos2::new(kbd_rect.min.x - 8.0, strip_rect.min.y),
+            strip_rect.max,
+        )
+    } else {
+        strip_rect
+    };
     let strip_hover = ui
         .ctx()
         .pointer_latest_pos()
-        .is_some_and(|p| strip_rect.contains(p));
-    let lane_is_alt =
-        lane_content(state, running, inputs.alt, open_rec_any, now) == LaneContent::AltScreen;
+        .is_some_and(|p| {
+            if collapsed {
+                peek_rect.contains(p)
+            } else {
+                strip_rect.contains(p)
+            }
+        });
     let peek = collapsed && strip_hover;
     out.strip_peek = peek;
     // Band-content alpha: full while the strip is real; the peek animation
@@ -3632,8 +3717,17 @@ pub fn show(
     // still visible (that frame the predicate flips, the corrective heal
     // resizes, and the band hands over to the grid). The peek edges ride
     // the pointer-motion repaints.
-    if lane_is_alt && !collapsed {
-        if let Some(t0) = state.alt_since {
+    if !collapsed {
+        // cli-strip-parity: whichever collapsible lane is live, schedule the
+        // wakeup on ITS clock so the collapse edge lands without input.
+        let clock = if lane_is_alt {
+            state.alt_since
+        } else if lane_is_cli {
+            state.cli_since
+        } else {
+            None
+        };
+        if let Some(t0) = clock {
             let d = (t0 + HIDE_AFTER).saturating_duration_since(now);
             if !d.is_zero() {
                 ui.ctx().request_repaint_after(d);
@@ -3646,8 +3740,15 @@ pub fn show(
     // doctrine; alpha rides the fade).
     if collapsed && reveal > 0.0 {
         painter.rect_filled(
-            strip_rect,
-            CornerRadius::ZERO,
+            peek_rect,
+            // The full-width alt band keeps its square edges (they meet the
+            // card's own); the narrow CLI chip is rounded so it reads as a
+            // floating hover affordance, not a torn hole in the CLI's UI.
+            if lane_is_cli {
+                CornerRadius::same(6)
+            } else {
+                CornerRadius::ZERO
+            },
             super::TERM_BG.gamma_multiply(0.88 * reveal),
         );
     }
@@ -3659,7 +3760,6 @@ pub fn show(
     // geometry, IDENTICAL in every mode (stable chrome, F3): elements may
     // dim, never move or unmount — submitting `ls` changes zero strip pixels
     // except the caret/text.
-    let kbd_rect = kbd_rect_for(strip_rect);
     // The escape hatch's live availability — one predicate, shared with
     // central's pre-input resolution so paint, hit-test and routing can
     // never disagree.
@@ -3767,10 +3867,23 @@ pub fn show(
     // `response.hovered()`). Peek detection uses `pointer_latest_pos` alone;
     // the interact keeps its stable Id on an empty rect so egui state never
     // churns across collapse edges.
+    // cli-strip-parity carve-out: while the band is collapsed FOR CLI
+    // OWNERSHIP the ⌨ slot stays a real widget. It is the only route back to
+    // the editor in that state (the automatic gate is Blocked for the whole
+    // CLI session), and registering it is also what keeps term_view's pump
+    // off that one 22px corner so a single click cannot both toggle
+    // ownership and be reported to the CLI. Everything else in the band still
+    // belongs to the grid. The alt collapse is unchanged: dead pixels, and
+    // `kbd_toggle_available` is false under alt anyway.
+    let (interact_rect, interact_sense) = match (collapsed, lane_is_cli) {
+        (false, _) => (strip_rect, Sense::click()),
+        (true, true) => (kbd_rect, Sense::click()),
+        (true, false) => (Rect::NOTHING, Sense::hover()),
+    };
     let strip_resp = ui.interact(
-        if collapsed { Rect::NOTHING } else { strip_rect },
+        interact_rect,
         Id::new(("composer_strip", terminal_id)),
-        if collapsed { Sense::hover() } else { Sense::click() },
+        interact_sense,
     );
     let hover_pos = ui.ctx().pointer_latest_pos();
     let over_kbd = hover_pos.is_some_and(|p| kbd_rect.contains(p));
@@ -4690,6 +4803,10 @@ pub fn show(
             // cycle killer). The right cluster below never reacts to any of
             // this.
             let open_rec = recs.iter().rev().find(|r| r.end_off.is_none());
+            // Re-evaluated here rather than reusing the frame-top `lane_now`
+            // (which the peek/alpha decisions had to compute before this
+            // match): `state` may have moved since, and the lane paint must
+            // describe the state as of THIS point, exactly as it always has.
             match lane_content(state, running, inputs.alt, open_rec.is_some(), now) {
                 LaneContent::Editor => unreachable!("mode is Raw"),
                 LaneContent::SessionEnded => {
@@ -4751,6 +4868,27 @@ pub fn show(
                         FontId::proportional(12.0),
                         super::TEXT_MUTED,
                     );
+                }
+                LaneContent::CliSession => {
+                    // cli-strip-parity - the lane paints NOTHING, deliberately.
+                    //
+                    // A NATIVE claude terminal (`TermKind::Claude`: the program
+                    // IS claude) is hookless, so `strip_eligible` is false and
+                    // it gets no strip at all - claude's TUI runs to the window
+                    // edge. The same session reached through a nested/ssh shell
+                    // sits on a HOOKED terminal, so it did get a strip: pulsing
+                    // dot, command, elapsed timer and an ownership caption,
+                    // stacked under a CLI that already owns every key. Two
+                    // presentations of one thing; the user sees them side by
+                    // side and the nested one reads as leftover chrome.
+                    //
+                    // So: no dot, no command, no timer, no caption - and once
+                    // the ownership has held for HIDE_AFTER the band collapses
+                    // through the SAME `collapsed_lane` path the alt-screen
+                    // TUIs use, handing its 36px back to the grid. The two
+                    // cases are then identical. Ordinary busy commands are
+                    // untouched (`LaneContent::Busy` below keeps its dot and
+                    // timer); the KBD corner stays live on hover.
                 }
                 LaneContent::AltScreen => {
                     // Bug C/C2: pre-collapse this paints at full alpha; once
@@ -4901,18 +5039,13 @@ pub fn show(
                         let dur = super::term_view::fmt_duration(
                             now_ms().saturating_sub(rec.started_ms),
                         );
-                        // typed-ssh-nested: the Busy lane's contract line.
-                        // For an ordinary command the strip says nothing (the
-                        // editor is one Compose click away); for an
-                        // ATTRIBUTED CLI session it states where the keys go,
-                        // because that is the whole difference — the keyboard
-                        // is already live and pointed at the CLI.
-                        let dur =
-                            if matches!(state.mode, ComposerMode::Raw(RawReason::CliSession)) {
-                                format!("{dur} \u{b7} your keys go straight to it")
-                            } else {
-                                dur
-                            };
+                        // cli-strip-parity: no CLI caption here any more - an
+                        // attributed CLI session no longer reaches this arm at
+                        // all (`LaneContent::CliSession` above collapses the
+                        // whole band, matching a native CLI terminal). What is
+                        // left is the ORDINARY busy row, unchanged: a long
+                        // `cargo build` keeps its pulsing dot, command and
+                        // live elapsed timer exactly as before.
                         painter.text(
                             Pos2::new(lane_x + 24.0 + cw, strip_rect.center().y),
                             Align2::LEFT_CENTER,
@@ -5108,7 +5241,13 @@ pub fn show(
     // never move: alpha only. `cluster_alpha` is 1.0 in every non-alt lane,
     // so `Wake ▸`/`Cancel`/`Restore ▸` paint at full strength the same
     // frame their lane appears.
-    let cluster_alpha = if lane_is_alt { reveal } else { 1.0 };
+    let cluster_alpha = if lane_is_alt || lane_is_cli { reveal } else { 1.0 };
+    // cli-strip-parity: inside a CLI peek the keyboard glyph shows ALONE.
+    // History and Run have no business floating over a live CLI's own input
+    // box, and the whole point of that peek is the one control still live
+    // there. Before the collapse (reveal == 1.0, the band is real furniture)
+    // every slot paints exactly as it always has.
+    let slot_alpha = if lane_is_cli && collapsed { 0.0 } else { cluster_alpha };
     if cluster_alpha > 0.0 {
         let compose = state.mode == ComposerMode::Compose;
         // Run is also live mid-window (it queues) — mouse-first parity with
@@ -5178,7 +5317,7 @@ pub fn show(
             Align2::CENTER_CENTER,
             "Run \u{25b8}",
             FontId::proportional(12.0),
-            run_col.gamma_multiply(cluster_alpha),
+            run_col.gamma_multiply(slot_alpha),
         );
         }
         let hist_active = !inputs.alt;
@@ -5191,7 +5330,7 @@ pub fn show(
             } else {
                 super::TEXT_FAINT
             })
-            .gamma_multiply(cluster_alpha),
+            .gamma_multiply(slot_alpha),
         );
         // KBD: the input-ownership toggle, BOTH directions. Live wherever
         // `kbd_toggle_available` says so - which now includes the busy and
@@ -5227,6 +5366,20 @@ pub fn show(
 mod tests {
     use super::*;
     use crate::gui::term_backend::GridSize;
+
+    /// The boolean face of `collapsed_lane` — the shape the C2 truth tables
+    /// were written against, kept so those tables stay byte-for-byte the
+    /// walk they were. Production asks `collapsed_lane` directly (it needs
+    /// to know WHICH lane collapsed: the CLI band keeps a live ⌨).
+    fn strip_hidden(
+        state: &ComposerState,
+        running: bool,
+        alt: bool,
+        open_rec: bool,
+        now: Instant,
+    ) -> bool {
+        collapsed_lane(state, running, alt, open_rec, now).is_some()
+    }
 
     /// QOL §4.5: dropped text APPENDS into the draft being typed (space
     /// separator only when needed), caret to the end — never the
@@ -5762,6 +5915,239 @@ mod tests {
         assert!(strip_hidden(&st, true, true, false, t3 + HIDE_AFTER));
     }
 
+    /// cli-strip-parity — THE VISIBILITY MATRIX (pure, the whole defect in
+    /// one table). The user's screenshots, side by side: a NATIVE claude
+    /// terminal has a clean bottom edge, the SAME session reached through a
+    /// nested/ssh shell had a Pulse strip under it. The two must present
+    /// identically; everything else must present exactly as it did.
+    ///
+    /// Row by row, what decides each case and where:
+    ///   native CLI       `strip_eligible(hooked=false, ..)` — a
+    ///                    `TermKind::Claude` terminal runs claude AS the
+    ///                    program, so no block-hook bootstrap ever runs and
+    ///                    the terminal never gets a strip at all;
+    ///   nested CLI       hooked (it is a shell) ⇒ eligible, so the parity
+    ///                    has to come from the COLLAPSE instead;
+    ///   ordinary busy    untouched — dot, command and elapsed timer;
+    ///   prompt / dead / reconnecting — untouched, always reserved.
+    #[test]
+    fn cli_strip_parity_visibility_matrix() {
+        let t0 = Instant::now();
+        let now = t0 + HIDE_AFTER;
+
+        // ── NATIVE CLI terminal: hookless and alive ⇒ NO strip, ever. This
+        // is the reference presentation the nested case has to match, and
+        // it is decided before any composer state exists.
+        assert!(!strip_eligible(false, false, false));
+
+        // ── NESTED CLI owning the keyboard: the terminal IS a hooked shell,
+        // so the strip is eligible…
+        assert!(strip_eligible(true, false, false));
+        let mut st = ComposerState {
+            mode: ComposerMode::Raw(RawReason::CliSession),
+            cli_since: Some(t0),
+            ..Default::default()
+        };
+        // …and it is the COLLAPSE that produces the parity: its own lane
+        // (never the Busy row), and the band handed to the grid.
+        assert_eq!(
+            lane_content(&st, true, false, true, now),
+            LaneContent::CliSession,
+            "an attributed CLI session is NOT the ordinary busy row"
+        );
+        assert_eq!(
+            collapsed_lane(&st, true, false, true, now),
+            Some(LaneContent::CliSession),
+            "stable CLI ownership collapses the band — clean, like native"
+        );
+        // Younger than HIDE_AFTER ⇒ still reserved (the flap debounce; a
+        // CLI that starts and dies must not cost two PTY resizes).
+        assert_eq!(
+            collapsed_lane(&st, true, false, true, now - Duration::from_millis(50)),
+            None
+        );
+        // No clock stamped yet (tick hasn't run) ⇒ reserved.
+        st.cli_since = None;
+        assert_eq!(collapsed_lane(&st, true, false, true, now), None);
+        st.cli_since = Some(t0);
+        // The CLI goes full-screen mid-session (claude opening an editor):
+        // AltScreen wins the lane and brings ITS own clock, unstamped here.
+        assert_eq!(
+            lane_content(&st, true, true, true, now),
+            LaneContent::AltScreen
+        );
+        assert_eq!(collapsed_lane(&st, true, true, true, now), None);
+
+        // ── ORDINARY BUSY (`cargo build`): unchanged, with its elapsed
+        // timer, and NEVER collapsed — the strip is where you watch it run
+        // and Enter still queues for the prompt that is coming back.
+        st.mode = ComposerMode::Raw(RawReason::Busy);
+        st.busy_since = Some(t0);
+        assert_eq!(lane_content(&st, true, false, true, now), LaneContent::Busy);
+        assert_eq!(
+            collapsed_lane(&st, true, false, true, now),
+            None,
+            "an ordinary busy command keeps its band (stale CLI clock or not)"
+        );
+        st.busy_since = None;
+
+        // ── AT A PROMPT: the editor. Never collapsed even with the CLI
+        // clock still stamped — this row is also the ⌨ way back, which
+        // promotes the mode to Compose and nothing else.
+        st.mode = ComposerMode::Compose;
+        assert_eq!(
+            lane_content(&st, true, false, false, now),
+            LaneContent::Editor
+        );
+        assert_eq!(collapsed_lane(&st, true, false, false, now), None);
+
+        // ── DEAD / RECONNECTING: eligible even when never hooked (fix a),
+        // and their lanes hold the band so Restore/Cancel stay reachable.
+        assert!(strip_eligible(false, true, false));
+        assert!(strip_eligible(false, false, true));
+        st.mode = ComposerMode::Raw(RawReason::CliSession);
+        assert_eq!(
+            lane_content(&st, false, false, true, now),
+            LaneContent::SessionEnded,
+            "a death during a CLI session presents Restore, not a collapse"
+        );
+        assert_eq!(collapsed_lane(&st, false, false, true, now), None);
+        st.reconnecting = true;
+        assert_eq!(
+            lane_content(&st, false, false, true, now),
+            LaneContent::Reconnecting
+        );
+        assert_eq!(collapsed_lane(&st, false, false, true, now), None);
+        st.reconnecting = false;
+        // Sleep during a CLI session: `Wake ▸` must stay visible, and the
+        // freeze-frame geometry must be the reserved one.
+        st.mode = ComposerMode::Raw(RawReason::Asleep);
+        st.asleep = true;
+        assert_eq!(lane_content(&st, true, false, true, now), LaneContent::Asleep);
+        assert_eq!(collapsed_lane(&st, true, false, true, now), None);
+        st.asleep = false;
+        // And the sleep pre-pass un-collapses a CLI band exactly like an
+        // alt one (both clocks are cleared).
+        st.mode = ComposerMode::Raw(RawReason::CliSession);
+        assert!(collapsed_lane(&st, true, false, true, now).is_some());
+        st.restart_hide_clock();
+        assert_eq!(collapsed_lane(&st, true, false, true, now), None);
+    }
+
+    /// cli-strip-parity — the same matrix driven through the REAL `tick`,
+    /// end to end: a nested `claude` starts, the band collapses once
+    /// ownership is stable, the ⌨ escape hatch brings the whole strip back
+    /// instantly, handing the keys back re-collapses it without a second
+    /// wait, and the instant the CLI exits at a fresh prompt the ordinary
+    /// strip is back — same tick, clock cleared, no leftover row.
+    #[test]
+    fn cli_collapse_round_trip_through_tick() {
+        let now = Instant::now();
+        let mut b = backend_full_screen_prompt();
+        let mut st = ComposerState::default();
+        assert_eq!(sim_frame(&mut st, &mut b, &[], now), Some(5));
+        st.draft = "claude --resume 6271996".into();
+        let _ = st.submit(&b, Some(5), Some("C:\\"));
+        let mut d = hook_bytes("exec", r#"{"c":"claude --resume 6271996"}"#);
+        d.extend_from_slice(b"claude --resume 6271996\r\n");
+        b.advance_live(&d);
+        pump_counters(&mut st, &b, now);
+        let open = vec![open_rec("claude --resume 6271996")];
+
+        // The exec hook attributes the CLI: ownership starts, clock stamped,
+        // band STILL reserved (nothing resizes on the rising edge alone).
+        let t1 = now + POST_SUBMIT_FLUSH + Duration::from_millis(10);
+        st.tick(&b, &open, true, false, true, t1);
+        assert_eq!(st.mode, ComposerMode::Raw(RawReason::CliSession));
+        assert_eq!(st.cli_since, Some(t1), "ownership rising edge stamps once");
+        assert_eq!(collapsed_lane(&st, true, false, true, t1), None);
+
+        // Held: the band collapses and the grid gets its 36px back. The
+        // stamp never slides, so this is ONE +rows resize, not a stream.
+        let t2 = t1 + HIDE_AFTER;
+        st.tick(&b, &open, true, false, true, t2);
+        assert_eq!(st.cli_since, Some(t1), "the stamp never slides");
+        assert_eq!(
+            collapsed_lane(&st, true, false, true, t2),
+            Some(LaneContent::CliSession)
+        );
+
+        // The ⌨ corner — the ONLY route back while the CLI runs. It
+        // promotes the mode to Compose, the lane becomes Editor, and the
+        // full strip is back the SAME tick (no second hysteresis, no dead
+        // space): exactly the un-collapse the alt falling edge gets.
+        st.toggle_keyboard_owner();
+        let t3 = t2 + Duration::from_millis(16);
+        st.tick(&b, &open, true, false, true, t3);
+        assert_eq!(st.mode, ComposerMode::Compose);
+        assert!(st.editor_override());
+        assert_eq!(collapsed_lane(&st, true, false, true, t3), None);
+
+        // Hand the keys back: ownership never actually lapsed, so the clock
+        // still stands and the band re-collapses at once — the user does not
+        // pay another 400ms of leftover strip for changing their mind.
+        st.toggle_keyboard_owner();
+        let t4 = t3 + Duration::from_millis(16);
+        st.tick(&b, &open, true, false, true, t4);
+        assert_eq!(st.mode, ComposerMode::Raw(RawReason::CliSession));
+        assert_eq!(st.cli_since, Some(t1));
+        assert_eq!(
+            collapsed_lane(&st, true, false, true, t4),
+            Some(LaneContent::CliSession)
+        );
+
+        // The CLI exits: a fresh hooked prompt lands and the daemon clears
+        // `inner_cli`. The ordinary strip is back the SAME tick at full
+        // size, the clock is cleared, and the editor re-arms — one −rows
+        // resize, no flicker, no leftover row.
+        let mut d = hook_bytes("pre", r#"{"e":0,"n":2,"d":"C:"}"#);
+        d.extend_from_slice(b"PS C:\\> ");
+        d.extend_from_slice(b"\x1b]133;B\x07");
+        b.advance_live(&d);
+        let t5 = t4 + Duration::from_secs(1);
+        pump_counters(&mut st, &b, t5);
+        st.tick(&b, &[rec("claude --resume 6271996")], true, true, false, t5);
+        assert_eq!(st.mode, ComposerMode::Compose);
+        assert_eq!(st.cli_since, None, "falling edge clears the clock");
+        assert_eq!(collapsed_lane(&st, true, false, false, t5), None);
+    }
+
+    /// cli-strip-parity — the resize-storm guard, the CLI twin of
+    /// `alt_flap_never_collapses`: attributed CLI sessions shorter than
+    /// HIDE_AFTER produce ZERO strip-driven geometry changes, so a shell
+    /// script firing `claude -p ...` in a loop cannot storm PTY resizes.
+    /// A genuinely stable session still collapses (the latch isn't wedged).
+    #[test]
+    fn cli_ownership_flap_never_storms_resizes() {
+        let mut b = TermBackend::new(GridSize::default());
+        b.set_stream_pos(0);
+        let open = vec![open_rec("claude -p hi")];
+        let idle: Vec<BlockRec> = Vec::new();
+        let mut st = ComposerState::default();
+        let mut t = Instant::now();
+        for _ in 0..5 {
+            st.tick(&b, &open, true, false, true, t);
+            assert_eq!(st.mode, ComposerMode::Raw(RawReason::CliSession));
+            t += HIDE_AFTER - Duration::from_millis(20);
+            st.tick(&b, &open, true, false, true, t);
+            assert_eq!(
+                collapsed_lane(&st, true, false, true, t),
+                None,
+                "a sub-HIDE_AFTER CLI episode must never collapse the band"
+            );
+            // The CLI exits: reserved anyway, and the clock is cleared.
+            t += Duration::from_millis(10);
+            st.tick(&b, &idle, true, false, false, t);
+            assert_eq!(st.cli_since, None);
+            t += Duration::from_millis(10);
+        }
+        st.tick(&b, &open, true, false, true, t);
+        assert_eq!(
+            collapsed_lane(&st, true, false, true, t + HIDE_AFTER),
+            Some(LaneContent::CliSession)
+        );
+    }
+
     /// C2 — REAL egui hover round-trip (headless `Context::run` driving
     /// `show` with genuine PointerMoved events) pinning PEEK-IS-LOOK-ONLY:
     /// while collapsed the band exposes NO interaction surface (no history
@@ -5858,6 +6244,122 @@ mod tests {
         assert!(
             out.history_btn.is_some(),
             "un-collapsed strip exposes its controls again, no hover needed"
+        );
+        assert!(!out.strip_peek);
+    }
+
+    /// cli-strip-parity — the HOVER contract for a CLI-collapsed band,
+    /// driven through real egui (`Context::run_ui` with genuine
+    /// PointerMoved events), because this is where it differs from the
+    /// alt-screen collapse on purpose:
+    ///
+    ///   * resting state is CLEAN — nothing paints, nothing is exposed, the
+    ///     grid owns the whole card (parity with a native CLI terminal);
+    ///   * the peek zone is the ⌨ CORNER, not the whole band: under alt the
+    ///     band is another app's canvas, but under CLI ownership those rows
+    ///     are the CLI's OWN input box, and a full-width wash would blank
+    ///     claude's composer on every stray pointer drift;
+    ///   * hovering that corner exposes a REAL widget — the ⌨ toggle is the
+    ///     only route back to the editor while the CLI runs, and registering
+    ///     it is also what keeps the terminal's input pump off those pixels
+    ///     so one click cannot both toggle ownership and reach the CLI;
+    ///   * hover still never resizes (`collapsed` is untouched by it), and
+    ///     History stays absent — the peek shows the one live control alone.
+    #[test]
+    fn cli_collapsed_band_keeps_the_kbd_corner_on_hover() {
+        let mut b = TermBackend::new(GridSize::default());
+        b.set_stream_pos(0);
+        let recs = vec![open_rec("claude --resume 6271996")];
+        let mut st = ComposerState::default();
+        st.tick(&b, &recs, true, false, true, Instant::now());
+        assert_eq!(st.mode, ComposerMode::Raw(RawReason::CliSession));
+        // Backdate the ownership latch (show() reads Instant::now()).
+        st.cli_since = Some(Instant::now() - (HIDE_AFTER + Duration::from_millis(200)));
+
+        let ctx = egui::Context::default();
+        let strip = Rect::from_min_max(Pos2::new(0.0, 564.0), Pos2::new(800.0, 600.0));
+        let grid = Rect::from_min_max(Pos2::ZERO, Pos2::new(800.0, 600.0));
+        let sid = Id::new(("composer_strip", Uuid::nil()));
+        let frame = |st: &mut ComposerState,
+                     b: &TermBackend,
+                     recs: &[BlockRec],
+                     collapsed: bool,
+                     pointer: Pos2| {
+            let mut raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_max(
+                    Pos2::ZERO,
+                    Pos2::new(800.0, 600.0),
+                )),
+                ..Default::default()
+            };
+            raw.events.push(egui::Event::PointerMoved(pointer));
+            let mut out = None;
+            let _ = ctx.run_ui(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    out = Some(show(
+                        ui,
+                        strip,
+                        grid,
+                        Uuid::nil(),
+                        st,
+                        b,
+                        recs,
+                        1,
+                        true,
+                        collapsed,
+                        false,
+                        FontId::monospace(13.0),
+                        None,
+                        None,
+                    ));
+                });
+            });
+            out.unwrap()
+        };
+
+        let collapsed = strip_hidden(&st, true, false, true, Instant::now());
+        assert!(collapsed, "stable CLI ownership ⇒ the grid owns the band");
+        let kbd = kbd_rect_for(strip);
+
+        // Pointer in the grid: clean bottom edge, exactly like native.
+        let out = frame(&mut st, &b, &recs, collapsed, Pos2::new(400.0, 300.0));
+        assert!(!out.strip_peek, "resting CLI band is clean");
+        assert!(out.history_btn.is_none(), "collapsed ⇒ no exemption rect");
+
+        // Pointer in the MIDDLE of the band — where the CLI's own input box
+        // lives. No peek: nothing washes over claude's composer.
+        let out = frame(&mut st, &b, &recs, collapsed, Pos2::new(400.0, 582.0));
+        assert!(
+            !out.strip_peek,
+            "the CLI peek zone is the corner, never the CLI's own input row"
+        );
+
+        // Pointer on the ⌨ corner: the peek rises and the toggle is a real,
+        // hit-testable widget sized to that corner alone.
+        let out = frame(&mut st, &b, &recs, collapsed, kbd.center());
+        assert!(out.strip_peek, "hover the corner ⇒ the ⌨ peeks");
+        assert!(out.history_btn.is_none(), "the peek shows the ⌨ alone");
+        let r = ctx.read_response(sid).expect("the ⌨ stays a live widget");
+        assert_eq!(r.rect, kbd, "…and it is scoped to the corner, not the band");
+        assert!(
+            strip_hidden(&st, true, false, true, Instant::now()),
+            "hover must not un-collapse — peek never resizes the CLI"
+        );
+
+        // Un-hover: back to clean.
+        let out = frame(&mut st, &b, &recs, collapsed, Pos2::new(400.0, 300.0));
+        assert!(!out.strip_peek);
+
+        // The CLI exits at a fresh prompt: the ordinary strip is back at
+        // full size with all of its controls, no hover needed.
+        let idle: Vec<BlockRec> = Vec::new();
+        st.tick(&b, &idle, true, false, false, Instant::now());
+        let collapsed = strip_hidden(&st, true, false, false, Instant::now());
+        assert!(!collapsed, "CLI exit ⇒ reserved band back, same tick");
+        let out = frame(&mut st, &b, &idle, collapsed, Pos2::new(400.0, 300.0));
+        assert!(
+            out.history_btn.is_some(),
+            "un-collapsed strip exposes its controls again"
         );
         assert!(!out.strip_peek);
     }
