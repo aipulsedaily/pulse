@@ -344,6 +344,11 @@ pub fn analyze(
                         })
                     })
                     .flatten();
+                // env-prefix-cli: the registry branch is claude's OWN
+                // report of the session it is in; the extract branch reads
+                // argv (or correlates). That difference is the whole
+                // provenance distinction — record it, do not re-derive it.
+                let self_reported = registry_sid.is_some();
                 let (token, confidence) = match registry_sid {
                     Some(sid) => {
                         claude_live = Some(sid);
@@ -357,6 +362,7 @@ pub fn analyze(
                     confidence,
                     cwd,
                     nested: false,
+                    token_self_reported: self_reported,
                 });
                 break 'outer;
             }
@@ -511,6 +517,9 @@ pub fn analyze_cmdline(cmd: &str, cwd: &Path) -> Option<InnerCli> {
                 confidence,
                 cwd: cwd.to_path_buf(),
                 nested: false,
+                // env-prefix-cli: this path reads ARGV. Whatever the D11
+                // sanitize leaves standing, the tool never spoke here.
+                token_self_reported: false,
             });
         }
     }
@@ -1005,6 +1014,40 @@ pub fn witnessed_launch_line(cmd: &str) -> Option<String> {
     Some(line.to_string())
 }
 
+/// env-prefix-cli: the resume SUFFIX that may be APPENDED to a witnessed
+/// launch line — `--resume <sid>` for claude — derived from the adapter's
+/// own `restore` trailing, so there is ONE source of truth for what a resume
+/// looks like and the r3-S1 charset gate inside `restore_trailing` runs on
+/// the token exactly as it does for every other restore.
+///
+/// Three things must hold, else None:
+///  - the trailing must begin with the adapter's own name followed by a
+///    SPACE. `cursor-agent --resume <id>` under the key `cursor` is not this
+///    adapter's literal name and must never be sliced apart;
+///  - the remainder must be a FLAG, not a SUBCOMMAND. `codex resume <id>`,
+///    `goose session --resume <EM>` and `amp threads continue <id>` all put a
+///    subcommand first, so appending them builds a line that does not parse
+///    ⇒ those adapters replay bare, which is still the honest outcome;
+///  - the remainder must actually CARRY the token. `aider
+///    --restore-chat-history` and `gemini --resume` re-enter "the last
+///    conversation", not a NAMED one ⇒ appending them would let the notice
+///    claim a session it is not actually re-entering.
+fn appendable_resume_suffix(adapter: &str, token: &str) -> Option<String> {
+    let full = restore_trailing(adapter, Some(token))?;
+    let suffix = full.strip_prefix(adapter)?.strip_prefix(' ')?;
+    (suffix.starts_with('-') && suffix.contains(token)).then(|| suffix.to_string())
+}
+
+/// env-prefix-cli: is this witnessed line a SIMPLE command, i.e. is its end
+/// also the end of the CLI's own argv? A shell operator anywhere — a pipe,
+/// a chain, a redirect, a substitution, a comment — means it is not, and an
+/// appended `--resume <sid>` would land on `tee`, on whatever the chain runs
+/// next, or inside a comment. Only the APPEND needs this gate: replaying the
+/// line bare is what the user ran, operators and all.
+fn appendable_line(line: &str) -> bool {
+    !line.contains(['|', '&', ';', '<', '>', '(', ')', '$', '`', '#'])
+}
+
 /// Nested-cli-resume: the final auto-typed re-establish step, TYPED by the
 /// engine strictly after the chain's last command confirmed (reestablish.rs
 /// Done edge), so it always executes INSIDE the re-established nested shell
@@ -1032,6 +1075,21 @@ pub fn witnessed_launch_line(cmd: &str) -> Option<String> {
 ///     (`restore_trailing`). This is now the NO-WITNESS fallback — a v2
 ///     beacon identity with no exec hook inside the nested shell.
 ///
+/// THE APPEND (the case between 1 and 2): a replayed line that names no
+/// session may still carry ` --resume <sid>` APPENDED to it — added to the
+/// user's line, never in place of it, so his env prefix and every flag ride
+/// along. That is what keeps v0.1.13's nested auto-resume alive through the
+/// replay. FOUR gates, all required, and any one short falls back to the
+/// bare replay of 1, honestly labelled a re-launch: (a) PROVENANCE,
+/// `cli.token_self_reported` — only the CLI's OWN report of the session it
+/// is currently in (pid registry, SessionStart hook, tcbeacon) qualifies,
+/// never an argv id, for the staleness reason above; (b) the line must not
+/// already name a session, judged by the adapter's own extractor (the
+/// `re.resume_token` branch), so no line can carry the flag twice; (c) the
+/// adapter's resume must be an appendable flag that carries the token
+/// (`appendable_resume_suffix`); (d) the line must be a simple command
+/// (`appendable_line`).
+///
 /// Both need the hook/beacon-witnessed `chain.cli_cwd` (single-quoted via
 /// `bootstrap::sh_single_quote`). Any half missing ⇒ None: never guess a
 /// session, never guess a directory, and never replay a line that no longer
@@ -1051,9 +1109,40 @@ pub fn nested_resume_step(chain: &NestedChain, cli: Option<&InnerCli>) -> Option
     //    it is not evidence about this CLI.
     if let Some(line) = chain.launch_cmd.as_deref().and_then(witnessed_launch_line) {
         if let Some(re) = analyze_cmdline(&line, cwd).filter(|re| re.adapter == cli.adapter) {
+            // (b) The line ALREADY names a session — replay it untouched.
+            // The check is the adapter's own extractor, not a search for the
+            // string "--resume", so every shape it knows (`--resume=<id>`,
+            // `--session-id`, a resume subcommand) counts and no line can
+            // end up carrying the flag twice.
+            if re.resume_token.is_some() {
+                return Some(NestedFinalStep {
+                    cmd: format!("cd {q} && {line}"),
+                    resumes: true,
+                });
+            }
+            // (a) + (c) A bare launch whose identity is TRUSTWORTHY — the
+            // CLI's own self-report, never argv — gets the resume appended
+            // to the user's line rather than replacing it: v0.1.13's
+            // auto-resume survives, and the env prefix and every flag he
+            // typed survive with it. An argv-derived id is deliberately not
+            // enough (stale after an in-TUI `/resume`, with no remote
+            // correction), and the adapter must have an appendable resume
+            // flag on a line simple enough to append to.
+            if cli.token_self_reported && appendable_line(&line) {
+                if let Some(suffix) = cli
+                    .resume_token
+                    .as_deref()
+                    .and_then(|t| appendable_resume_suffix(&cli.adapter, t))
+                {
+                    return Some(NestedFinalStep {
+                        cmd: format!("cd {q} && {line} {suffix}"),
+                        resumes: true,
+                    });
+                }
+            }
             return Some(NestedFinalStep {
                 cmd: format!("cd {q} && {line}"),
-                resumes: re.resume_token.is_some(),
+                resumes: false,
             });
         }
     }
@@ -1971,6 +2060,18 @@ mod tests {
             confidence: CliConfidence::Explicit,
             cwd: PathBuf::from("/"),
             nested: true,
+            // Argv provenance by default: the conservative half.
+            token_self_reported: false,
+        }
+    }
+
+    /// A nested identity whose token is the CLI's OWN report (tcbeacon /
+    /// SessionStart hook / pid registry) — the only provenance that may
+    /// append a resume to a replayed launch line.
+    fn beacon_cli(adapter: &str, token: &str) -> InnerCli {
+        InnerCli {
+            token_self_reported: true,
+            ..nested_cli(adapter, Some(token))
         }
     }
 
@@ -2206,6 +2307,135 @@ mod tests {
         );
     }
 
+    /// env-prefix-cli — PROVENANCE decides whether a replayed BARE launch
+    /// also carries a resume. The witnessed line is replayed verbatim in
+    /// every row (his env prefix and `--dangerously-skip-permissions` never
+    /// move); the only question is whether ` --resume <sid>` is appended to
+    /// it, and the answer is "only when the CLI ITSELF named the session".
+    ///
+    /// This is what keeps v0.1.13's nested auto-resume alive for identities
+    /// that are real, without ever resuming from an argv id that goes stale
+    /// the moment the user runs `/resume` inside the TUI.
+    #[test]
+    fn nested_replay_resume_provenance_matrix() {
+        let u = Uuid::new_v4().to_string();
+        let bare = |launch: &str| chain_launched("/srv/app", Some(launch));
+
+        // 1. BEACON provenance + a bare witnessed line ⇒ replay + append.
+        let beacon = beacon_cli("claude", &u);
+        let step = nested_resume_step(&bare("claude"), Some(&beacon)).unwrap();
+        assert_eq!(step.cmd, format!("cd '/srv/app' && claude --resume {u}"));
+        assert!(step.resumes);
+        // ...and the env prefix + flags of the FIELD line survive the append.
+        let step = nested_resume_step(
+            &bare("IS_SANDBOX=1 claude --dangerously-skip-permissions"),
+            Some(&beacon),
+        )
+        .unwrap();
+        assert_eq!(
+            step.cmd,
+            format!(
+                "cd '/srv/app' && IS_SANDBOX=1 claude --dangerously-skip-permissions --resume {u}"
+            )
+        );
+        assert!(step.resumes);
+
+        // 2. ARGV provenance + a bare line ⇒ bare replay, NO append. (An
+        //    argv id is stale after an in-TUI `/resume`, and no remote host
+        //    has the pid-registry correction that repairs that locally.)
+        let argv = nested_cli("claude", Some(&u));
+        assert!(!argv.token_self_reported);
+        let step = nested_resume_step(&bare("claude"), Some(&argv)).unwrap();
+        assert_eq!(step.cmd, "cd '/srv/app' && claude");
+        assert!(!step.resumes);
+        // The user's own field line, argv provenance: byte-identical replay.
+        let step = nested_resume_step(
+            &bare("IS_SANDBOX=1 claude --dangerously-skip-permissions"),
+            Some(&argv),
+        )
+        .unwrap();
+        assert_eq!(
+            step.cmd,
+            "cd '/srv/app' && IS_SANDBOX=1 claude --dangerously-skip-permissions"
+        );
+        assert!(!step.resumes);
+
+        // 3. The witnessed line ALREADY names a session ⇒ verbatim, never a
+        //    second flag — whichever provenance the identity carries, and
+        //    even when its own token differs.
+        let other = Uuid::new_v4().to_string();
+        for cli in [beacon_cli("claude", &other), nested_cli("claude", Some(&other))] {
+            for launch in [
+                format!("claude --resume {u}"),
+                format!("claude --resume={u}"),
+                format!("IS_SANDBOX=1 claude --session-id {u} --dangerously-skip-permissions"),
+            ] {
+                let step = nested_resume_step(&bare(&launch), Some(&cli)).unwrap();
+                assert_eq!(step.cmd, format!("cd '/srv/app' && {launch}"));
+                assert!(step.resumes, "{launch:?}");
+                assert_eq!(step.cmd.matches("--resume").count() + step.cmd.matches("--session-id").count(), 1);
+            }
+        }
+
+        // 4. NO witnessed line + a beacon token ⇒ the composed form, exactly
+        //    as before this branch existed.
+        let mut none = bare("claude");
+        none.launch_cmd = None;
+        let step = nested_resume_step(&none, Some(&beacon)).unwrap();
+        assert_eq!(step.cmd, format!("cd '/srv/app' && claude --resume {u}"));
+        assert!(step.resumes);
+
+        // 5. Gate (c): the adapter must have an APPENDABLE resume flag. codex
+        //    resumes by SUBCOMMAND (`codex resume <id>`), which cannot follow
+        //    the user's flags ⇒ bare replay even with beacon provenance.
+        assert_eq!(appendable_resume_suffix("claude", &u), Some(format!("--resume {u}")));
+        assert_eq!(appendable_resume_suffix("codex", &u), None);
+        assert_eq!(appendable_resume_suffix("goose", &u), None);
+        assert_eq!(appendable_resume_suffix("crush", &u), Some(format!("--session {u}")));
+        // Not this adapter's literal name (`cursor` -> `cursor-agent …`),
+        // and a "resume the last one" trailing that carries no token.
+        assert_eq!(appendable_resume_suffix("cursor", &u), None);
+        assert_eq!(appendable_resume_suffix("aider", &u), None);
+        assert_eq!(appendable_resume_suffix("gemini", &u), None);
+        assert_eq!(appendable_resume_suffix("frobnicator", &u), None);
+        // An unsafe token dies at the shared r3-S1 choke point.
+        assert_eq!(appendable_resume_suffix("claude", "x; rm -rf /"), None);
+        let step = nested_resume_step(&bare("codex"), Some(&beacon_cli("codex", &u))).unwrap();
+        assert_eq!(step.cmd, "cd '/srv/app' && codex");
+        assert!(!step.resumes);
+
+        // 6. Gate: the line's end must be the end of the CLI's own argv.
+        for line in [
+            "claude | tee out.log",
+            "claude && echo done",
+            "claude > out.log",
+            "claude # note to self",
+            "claude $EXTRA",
+        ] {
+            assert!(!appendable_line(line), "{line:?}");
+            let step = nested_resume_step(&bare(line), Some(&beacon)).unwrap();
+            assert_eq!(step.cmd, format!("cd '/srv/app' && {line}"), "{line:?}");
+            assert!(!step.resumes, "{line:?}");
+        }
+        assert!(appendable_line("IS_SANDBOX=1 claude --dangerously-skip-permissions"));
+
+        // 7. The notice + hint follow the STEP, so an appended resume says
+        //    "resuming" and a bare replay says "re-launching".
+        let appended = nested_resume_step(
+            &bare("IS_SANDBOX=1 claude --dangerously-skip-permissions"),
+            Some(&beacon),
+        )
+        .unwrap();
+        let n = nested_restore_notice(&bare("x"), Some(&beacon), true, Some(&appended));
+        assert!(
+            n.contains("resuming its claude session automatically")
+                && n.contains(&format!("--dangerously-skip-permissions --resume {u}")),
+            "{n}"
+        );
+        assert!(nested_resume_abort_hint("claude", &appended)
+            .contains("session was not auto-resumed"));
+    }
+
     /// env-prefix-cli — a re-LAUNCH is announced as one. The pre-existing
     /// "resuming its <a> session" wording stays byte-exact for steps that
     /// really do name a session (asserted in
@@ -2345,6 +2575,7 @@ mod tests {
                     confidence: conf,
                     cwd: PathBuf::from("/"),
                     nested,
+                    token_self_reported: false,
                 };
                 let want = !nested && !matches!(conf, CliConfidence::Ambiguous);
                 assert_eq!(

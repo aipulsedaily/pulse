@@ -2475,6 +2475,10 @@ impl Core {
                 let sid_s = sid.to_string();
                 if cli.resume_token.as_deref() == Some(sid_s.as_str())
                     && cli.confidence == CliConfidence::Explicit
+                    // env-prefix-cli: an argv-provenance token that happens
+                    // to equal the reported sid must still be UPGRADED to
+                    // self-reported — the id is the same, the trust is not.
+                    && cli.token_self_reported
                 {
                     return false;
                 }
@@ -2482,6 +2486,10 @@ impl Core {
                 let mut cli = cli.clone();
                 cli.resume_token = Some(sid_s);
                 cli.confidence = CliConfidence::Explicit;
+                // This fn's whole contract is "a CLI SELF-REPORTED session
+                // id" (see the doc above) — every caller is a registry read,
+                // a hook report or a tcbeacon.
+                cli.token_self_reported = true;
                 t.inner_cli = Some(cli);
             }
         }
@@ -2649,6 +2657,10 @@ impl Core {
                 confidence: CliConfidence::Explicit,
                 cwd,
                 nested: true,
+                // env-prefix-cli: the tcbeacon IS the CLI's own report —
+                // this is the provenance that lets a re-establish append
+                // `--resume <sid>` to the user's replayed launch line.
+                token_self_reported: true,
             };
             if t.inner_cli.as_ref() != Some(&cli) {
                 t.inner_cli = Some(cli);
@@ -2987,6 +2999,11 @@ impl Core {
                 {
                     cli.resume_token = cur.resume_token.clone();
                     cli.confidence = CliConfidence::Explicit;
+                    // env-prefix-cli: the token's PROVENANCE travels with
+                    // the token. Dropping it here would silently demote a
+                    // beacon identity to argv trust on the next exec hook —
+                    // and with it the appended resume this exec re-enables.
+                    cli.token_self_reported = cur.token_self_reported;
                 }
             }
             if t.inner_cli.as_ref() != Some(&cli) {

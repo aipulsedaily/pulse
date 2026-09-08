@@ -1598,6 +1598,9 @@ pub fn term_json(t: &CtlTerm, is_self: bool) -> serde_json::Value {
         "inner_cli": t.inner_cli.as_ref().map(|c| serde_json::json!({
             "adapter": c.adapter,
             "resume_token": c.resume_token,
+            // env-prefix-cli: token PROVENANCE — true = the CLI's own
+            // report, the only kind a replayed launch line may append.
+            "token_self_reported": c.token_self_reported,
             "cwd": c.cwd.display().to_string(),
             // F1: attribution-only marker — automation must never compose a
             // resume for a nested identity (spec I1).
