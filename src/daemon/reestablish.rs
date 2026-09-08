@@ -292,6 +292,9 @@ impl Core {
             steps.join("; "),
             if resume.is_some() { "; then the inner-CLI resume" } else { "" }
         );
+        // `SPAWN_GEN` starts at 1, so 0 is never a live generation: an arm
+        // with no session in the map (impossible today — launch inserts
+        // first) fails CLOSED, aborting rather than typing blind.
         let spawn_gen = self.sessions.lock().get(&id).map(|s| s.gen).unwrap_or(0);
         self.reestablish.lock().insert(
             id,
