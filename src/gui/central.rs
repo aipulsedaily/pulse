@@ -323,13 +323,12 @@ impl App {
         // the prompt episode (P3 §3 extended by P4 §3.6 and selector D14:
         // modal > launcher > search > blocks panel = history popup >
         // composer > grid).
-        let focused = self.modal.is_none()
+        let no_surface = self.modal.is_none()
             && self.search.is_none()
             && self.blocks_panel.is_none()
             && self.history.is_none()
             && self.launcher.is_none()
-            && self.renaming.is_none()
-            && !comp_active;
+            && self.renaming.is_none();
         self.glyphs.sync(font.clone(), ppp);
         // Borrow order: evaluate the Re-run gate first (immutable, ends),
         // then hold `search`, `blocks` and `terms` together — disjoint fields.
@@ -453,6 +452,70 @@ impl App {
         } else {
             full
         };
+        // ── THE ESCAPE HATCH, RESOLVED BEFORE INPUT DISPATCH ────────────
+        // The strip is painted AFTER the grid, so a ⌨ click handled in
+        // `composer::show` cannot rescue the keys this same frame already
+        // handed to the loser of the handoff. Hit-test the (fixed, shared)
+        // ⌨ slot here instead — before term_view's input pump — and apply
+        // the ownership change now; `show` sees `kbd_click_resolved` and
+        // does not toggle a second time on the same click.
+        //
+        // The press ORIGIN must be inside the slot too: a drag-select that
+        // began on the grid and released over the strip is not a click on
+        // this control.
+        if strip_on {
+            // The flag is one-frame and must be cleared even when the band
+            // is collapsed (no pre-resolution happens there — the pixels
+            // belong to the grid), or a stale `true` would swallow the next
+            // real click inside `show`.
+            if let Some(st) = self.composers.get_mut(&id) {
+                st.kbd_click_resolved = false;
+            }
+        }
+        // An open modal / popup / rename owns the keyboard (selector D14):
+        // the strip's toggle stands down under it, exactly like the editor's
+        // focus grab above.
+        if strip_on && !strip_collapsed && !overlay_open {
+            let kbd = composer::kbd_rect_for(Rect::from_min_max(
+                Pos2::new(full.min.x, full.max.y - composer::STRIP_H),
+                full.max,
+            ));
+            let hit = ui.ctx().input(|i| {
+                i.pointer.primary_released()
+                    && i.pointer.press_origin().is_some_and(|p| kbd.contains(p))
+                    && i.pointer
+                        .latest_pos()
+                        .or_else(|| i.pointer.interact_pos())
+                        .is_some_and(|p| kbd.contains(p))
+            });
+            let toggled = match (self.composers.get_mut(&id), self.terms.get(&id)) {
+                (Some(st), Some(b)) if hit && composer::kbd_toggle_available(st, b, running) => {
+                    st.toggle_keyboard_owner();
+                    true
+                }
+                _ => false,
+            };
+            if let Some(st) = self.composers.get_mut(&id) {
+                st.kbd_click_resolved = toggled;
+            }
+            if toggled {
+                // The editor may have just been promoted past a Blocked
+                // gate: recompute this frame's routing so the grid stands
+                // down and the editor's focus request below is honored.
+                comp_active =
+                    self.composers.get(&id).map(|c| c.mode) == Some(ComposerMode::Compose);
+                if comp_active {
+                    let ed_id = Id::new(("composer", id));
+                    ui.ctx().memory_mut(|m| m.request_focus(ed_id));
+                } else {
+                    ui.ctx().memory_mut(|m| m.surrender_focus(Id::new(("composer", id))));
+                }
+            }
+        }
+        // Re-derive after the pre-input handoff above (it can move ownership
+        // in EITHER direction, and this frame's grid pump must see the
+        // result, not last frame's).
+        let focused = no_surface && !comp_active;
         {
             let bctx = self.blocks.get(&id).and_then(|b| {
                 (!b.recs.is_empty()).then_some(term_view::BlockViewCtx {

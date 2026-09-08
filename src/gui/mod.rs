@@ -2643,20 +2643,17 @@ impl App {
                         // Replay stays advance() — a reconstruction contains
                         // hook OSCs but is NOT journal bytes.
                         backend.advance_live(&bytes);
-                        backend
-                            .block_feed
-                            .as_ref()
-                            .map(|f| (f.pre_seen, f.exec_seen))
+                        Some(backend.hook_counters())
                     } else {
                         continue;
                     };
                     // Composer latch pump (P3): counter diffs drive the
                     // prompt latch / dismissal for EVERY terminal, selected
-                    // or not — O(events), not per-frame.
-                    if let (Some((pre, exec)), Some(st)) =
-                        (counters, self.composers.get_mut(&id))
-                    {
-                        st.on_stream_events(pre, exec, Instant::now());
+                    // or not — O(events), not per-frame. The counters carry
+                    // the ORDER of the two verbs, so a chunk holding both
+                    // resolves to the state its LAST event describes.
+                    if let (Some(c), Some(st)) = (counters, self.composers.get_mut(&id)) {
+                        st.on_stream_events(c, Instant::now());
                     }
                     // V-A / unread ack: live output on an unwatched terminal
                     // only QUEUES an unread check — update_activity runs the

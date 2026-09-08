@@ -47,6 +47,14 @@ pub(super) struct Reestablish {
     /// The manual-resume fallback line pushed to the preface when the
     /// sequence stops before `resume` ran (`nested_resume_abort_hint`).
     hint: Option<String>,
+    /// The `Session::gen` this sequence was armed for — GENERATION BINDING.
+    /// A flapping link relaunches the terminal under a new generation while
+    /// the old engine's timers are still armed; without this an entry from
+    /// the previous spawn could type its next step (or its resume) into the
+    /// NEW session, stacking chain entries and restarting a CLI while the
+    /// previous remote process may still be alive. Every typing path checks
+    /// it and abandons the stale generation instead.
+    spawn_gen: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -212,6 +220,45 @@ pub(crate) fn resume_may_send(nest: NestState) -> bool {
     !matches!(nest, NestState::Pending)
 }
 
+/// What a step-growth tick means (pure). Re-basing the quiescence clock on
+/// journal growth used to `continue` PAST `watch_action`, so STEP_TIMEOUT —
+/// the only thing bounding a step that never settles — was never evaluated
+/// while output kept arriving. The absolute deadline is asked FIRST now, with
+/// `quiet_for = 0`, which can only answer Wait or AbortTimeout.
+pub(crate) fn growth_watch(since_sent: Duration, has_more_steps: bool) -> WatchAction {
+    watch_action(since_sent, Duration::ZERO, false, has_more_steps)
+}
+
+/// What to do with a line that is HELD for a previous hop's hook injection
+/// (pure). One rule, shared by both hold phases:
+///
+///   - the injection resolved (`Hooked`, or `Absent` = nothing to inject /
+///     honestly gave up) ⇒ SEND: the hop is settled either way;
+///   - still `Pending` inside the wait ⇒ WAIT;
+///   - still `Pending` AT the deadline ⇒ ABORT.
+///
+/// That last arm is the containment. It used to type on ("the previous step
+/// never reported hooks; typing on" / "resuming unattributed") — i.e. it
+/// typed the next chain step, or a session-restoring resume, into a shell
+/// whose identity was never positively confirmed. A chain that cannot prove
+/// where it is stops and leaves the user the manual line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HoldAction {
+    Wait,
+    Send,
+    Abort,
+}
+
+pub(crate) fn hold_action(expired: bool, nest: NestState) -> HoldAction {
+    if resume_may_send(nest) {
+        HoldAction::Send
+    } else if expired {
+        HoldAction::Abort
+    } else {
+        HoldAction::Wait
+    }
+}
+
 /// Pure resume-step gate (nested-cli-resume): the ONLY watch action that
 /// may type the final resume step is `Done` — a partial chain (`Next`),
 /// any abort, or an unsettled step must never reach it. The Done arm in
@@ -245,6 +292,7 @@ impl Core {
             steps.join("; "),
             if resume.is_some() { "; then the inner-CLI resume" } else { "" }
         );
+        let spawn_gen = self.sessions.lock().get(&id).map(|s| s.gen).unwrap_or(0);
         self.reestablish.lock().insert(
             id,
             Reestablish {
@@ -253,8 +301,25 @@ impl Core {
                 phase: Phase::AwaitPrompt,
                 resume,
                 hint,
+                spawn_gen,
             },
         );
+    }
+
+    /// GENERATION BINDING: is the armed sequence still talking to the spawn
+    /// it was armed for? A relaunch (a flapping ssh link is the field shape)
+    /// bumps `Session::gen`; anything still armed for the previous one must
+    /// never type into the successor.
+    fn reestablish_gen_ok(&self, id: Uuid) -> bool {
+        let armed = self.reestablish.lock().get(&id).map(|e| e.spawn_gen);
+        let live = self.sessions.lock().get(&id).map(|s| s.gen);
+        match (armed, live) {
+            (Some(a), Some(l)) => a == l,
+            // No entry left (already finished/cancelled) is not a stale
+            // generation; no session at all is handled by the write path.
+            (None, _) => true,
+            (Some(_), None) => false,
+        }
     }
 
     /// Drop any supervision. `why` is logged only when an entry existed
@@ -363,6 +428,14 @@ impl Core {
 
     /// Type the parked/settled inner-CLI resume, or leave the manual hint.
     fn finish_resume(&self, id: Uuid, e: &Reestablish, why: &str) {
+        let live = self.sessions.lock().get(&id).map(|s| s.gen);
+        if live != Some(e.spawn_gen) {
+            log::info!(
+                "terminal {id}: nested chain re-establish abandoned — the session was relaunched under a new generation; the inner-CLI resume is not typed"
+            );
+            self.push_resume_hint(id, e);
+            return;
+        }
         let n = e.steps.len();
         match &e.resume {
             Some(cmd) if self.type_reestablish_line(id, cmd) => {
@@ -390,15 +463,33 @@ impl Core {
         let Some(w) = writer else { return false };
         use std::io::Write;
         let mut w = w.lock();
-        let _ = w.write_all(cmd.as_bytes());
-        let _ = w.write_all(b"\r");
-        let _ = w.flush();
-        true
+        // EVERY leg is load-bearing. Discarding these errors and returning
+        // `true` reported a send that never reached the PTY - the caller
+        // then advanced the chain (or declared the resume typed) on a write
+        // that failed, which is the "sends after uncertainty" class in its
+        // purest form. A half-written line is worse than none, so the caller
+        // abandons this generation.
+        let ok = w.write_all(cmd.as_bytes()).is_ok()
+            && w.write_all(b"\r").is_ok()
+            && w.flush().is_ok();
+        if !ok {
+            log::warn!(
+                "terminal {id}: the PTY write failed mid-line - this re-establish generation is abandoned"
+            );
+        }
+        ok
     }
 
     /// Type steps[idx], then move the entry to Watch with the CURRENT
     /// journal length as the quiescence base.
     fn send_reestablish_step(&self, id: Uuid, idx: usize) {
+        if !self.reestablish_gen_ok(id) {
+            self.cancel_reestablish(
+                id,
+                "the session was relaunched under a new generation — the stale chain is abandoned rather than typed into the new one",
+            );
+            return;
+        }
         let cmd = match self.reestablish.lock().get(&id) {
             Some(e) => match e.steps.get(idx) {
                 Some(c) => c.clone(),
@@ -438,20 +529,26 @@ impl Core {
         /// A Watch-phase row: (id, sent, last_len, last_change, has_more).
         type WatchRow = (Uuid, Instant, u64, Instant, bool);
         let now = Instant::now();
-        let parked: Vec<Uuid>;
+        let parked: Vec<(Uuid, Instant)>;
         let step_holds: Vec<(Uuid, usize, Instant)>;
         let (due_sends, watching): (Vec<(Uuid, usize)>, Vec<WatchRow>) = {
             let map = self.reestablish.lock();
             if map.is_empty() {
                 return;
             }
-            // nested-shell-hooks: a park that outlived the injection's own
-            // honest give-up types the resume anyway — an unhookable nested
-            // shell must still get its CLI back, just unattributed.
+            // CONTAINMENT (was: "types the resume anyway"). A park that
+            // outlived NESTED_HOOK_WAIT means the injection into the shell
+            // the resume would run in NEVER resolved — neither hooked nor
+            // honestly given up (a give-up flips the state to Absent, which
+            // releases the park through the ordinary `resume_may_send`
+            // path below and still types). An unresolved wait is exactly
+            // "the previous hop is not positively confirmed": stop, and
+            // leave the user the manual resume line instead of typing a
+            // session-restoring command into a shell of unknown identity.
             parked = map
                 .iter()
                 .filter_map(|(id, e)| match e.phase {
-                    Phase::AwaitNestedPrompt { since } if now.duration_since(since) >= NESTED_HOOK_WAIT => Some(*id),
+                    Phase::AwaitNestedPrompt { since } => Some((*id, since)),
                     _ => None,
                 })
                 .collect();
@@ -483,14 +580,22 @@ impl Core {
                 .collect();
             (sends, watches)
         };
-        for id in parked {
-            let entry = self.reestablish.lock().remove(&id);
-            if let Some(e) = entry {
-                self.finish_resume(
+        for (id, since) in parked {
+            match hold_action(
+                now.duration_since(since) >= NESTED_HOOK_WAIT,
+                self.nesthook_state(id),
+            ) {
+                HoldAction::Wait => {}
+                HoldAction::Send => {
+                    let entry = self.reestablish.lock().remove(&id);
+                    if let Some(e) = entry {
+                        self.finish_resume(id, &e, "the nested shell's hook injection resolved");
+                    }
+                }
+                HoldAction::Abort => self.cancel_reestablish(
                     id,
-                    &e,
-                    "the nested shell never reported hooks — resuming unattributed",
-                );
+                    "the nested shell never resolved its hooks within the wait — the resume is not typed into an unconfirmed shell (the manual line is in the preface)",
+                ),
             }
         }
         // typed-ssh-nested: release a held step the moment the previous
@@ -498,16 +603,21 @@ impl Core {
         // release it anyway once the hold outlives that give-up, so an
         // unhookable link never costs the rest of the chain.
         for (id, next, since) in step_holds {
-            let expired = now.duration_since(since) >= NESTED_HOOK_WAIT;
-            if !expired && !resume_may_send(self.nesthook_state(id)) {
-                continue;
+            match hold_action(
+                now.duration_since(since) >= NESTED_HOOK_WAIT,
+                self.nesthook_state(id),
+            ) {
+                HoldAction::Wait => {}
+                HoldAction::Send => self.send_reestablish_step(id, next),
+                // CONTAINMENT (was: "typing on"): the previous hop was never
+                // positively confirmed, so the next step would be typed into
+                // whatever shell actually holds the line. A partially-entered
+                // chain is not a place to keep typing.
+                HoldAction::Abort => self.cancel_reestablish(
+                    id,
+                    "the previous chain step never resolved its hooks — the rest of the chain is not typed into an unconfirmed shell",
+                ),
             }
-            if expired {
-                log::info!(
-                    "terminal {id}: nested chain re-establish — the previous step never reported hooks; typing on"
-                );
-            }
-            self.send_reestablish_step(id, next);
         }
         for (id, step) in due_sends {
             self.send_reestablish_step(id, step);
@@ -530,6 +640,18 @@ impl Core {
                 .map(|j| j.lock().absolute_len())
                 .unwrap_or(last_len);
             if len != last_len {
+                // ABSOLUTE DEADLINE FIRST: re-basing the quiescence clock
+                // and `continue`ing skipped `watch_action` entirely, so a
+                // step whose output never stops (a chatty login, a stuck
+                // progress bar) could hold the chain open indefinitely -
+                // STEP_TIMEOUT is evaluated inside the call the `continue`
+                // jumped over. Ask with quiet_for = 0: the only reachable
+                // answers are Wait and AbortTimeout.
+                if growth_watch(now.duration_since(sent), has_more) == WatchAction::AbortTimeout
+                {
+                    self.cancel_reestablish(id, "step never settled within 30s");
+                    continue;
+                }
                 if let Some(e) = self.reestablish.lock().get_mut(&id) {
                     if let Phase::Watch {
                         last_len: ll,
@@ -747,6 +869,55 @@ mod tests {
     /// F2 — the launch-time arm gate: breadcrumb + hooked + opt-in, all
     /// three or nothing (a hookless spawn has no prompt witness; the honest
     /// preface alone covers it — pre-F2 behavior).
+    /// astra fix 4a (reconnect half): a step whose output never stops used
+    /// to skip `watch_action` entirely on every growth tick, so STEP_TIMEOUT
+    /// - the only bound on a step that never settles - was never evaluated.
+    #[test]
+    fn growth_ticks_still_enforce_the_step_deadline() {
+        let ms = Duration::from_millis;
+        assert_eq!(growth_watch(ms(0), true), WatchAction::Wait);
+        assert_eq!(growth_watch(STEP_TIMEOUT - ms(1), true), WatchAction::Wait);
+        assert_eq!(growth_watch(STEP_TIMEOUT, true), WatchAction::AbortTimeout);
+        assert_eq!(
+            growth_watch(STEP_TIMEOUT, false),
+            WatchAction::AbortTimeout,
+            "the last step is bounded too"
+        );
+        // A growth tick can never be mistaken for a settled step.
+        assert_ne!(growth_watch(ms(10), true), WatchAction::Next);
+        assert_ne!(growth_watch(ms(10), false), WatchAction::Done);
+    }
+
+    /// astra fix 5 - RECONNECT CONTAINMENT: the engine must refuse to type
+    /// the next line while the previous hop is not positively confirmed.
+    ///
+    /// A hop resolves either way - `Hooked` (it announced itself) or
+    /// `Absent` (nothing to inject / the injection honestly gave up) - and
+    /// then the chain continues. Still `Pending` at the deadline is the
+    /// unconfirmed case, and it used to "type on" / "resume unattributed":
+    /// a chain step, or a session-restoring resume, typed into a shell whose
+    /// identity was never established. Now it aborts and leaves the manual
+    /// line.
+    #[test]
+    fn hold_action_refuses_to_type_after_an_unconfirmed_hop() {
+        // Resolved: send, deadline or not.
+        for expired in [false, true] {
+            assert_eq!(hold_action(expired, NestState::Hooked), HoldAction::Send);
+            assert_eq!(hold_action(expired, NestState::Absent), HoldAction::Send);
+        }
+        // Unresolved inside the wait: hold the line.
+        assert_eq!(hold_action(false, NestState::Pending), HoldAction::Wait);
+        // Unresolved AT the deadline: abort - never type on.
+        assert_eq!(hold_action(true, NestState::Pending), HoldAction::Abort);
+        // The predicate agrees with the resume gate it shares (one rule).
+        for nest in [NestState::Hooked, NestState::Absent, NestState::Pending] {
+            assert_eq!(
+                hold_action(false, nest) == HoldAction::Send,
+                resume_may_send(nest)
+            );
+        }
+    }
+
     #[test]
     fn reestablish_arm_gate() {
         assert!(reestablish_should_arm(true, true, true));

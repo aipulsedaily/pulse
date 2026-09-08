@@ -25,7 +25,7 @@ use egui::{
 use uuid::Uuid;
 
 use super::complete;
-use super::term_backend::{Reclaim, TermBackend};
+use super::term_backend::{HookCounters, Reclaim, TermBackend};
 use crate::state::BlockRec;
 
 /// Constant bottom-strip reservation per hooked terminal (D1).
@@ -169,6 +169,32 @@ pub enum RawReason {
     Asleep,
 }
 
+/// The MANUAL input-ownership override — the escape hatch, explicit and
+/// reversible in both directions.
+///
+/// Before this existed the ⌨ slot only had a handler in the Compose arm, and
+/// the way back (`arm_available`) was false for the whole of any open block:
+/// during a busy command or a live CLI session there was NO route back to
+/// the editor at all. And the way OUT could not be made sticky either — the
+/// gate re-derives the mode every tick, so clearing `UserRaw` alone just hits
+/// the open-block rejection again on the next frame.
+///
+/// Scope: one execution. A genuine prompt transition (`apply_pre_edge`)
+/// returns routing to the automatic gate, so this is never a stale permanent
+/// claim. The hard raw states — alt-screen passthrough, dead, asleep — always
+/// win over it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InputOverride {
+    /// "Send keyboard to the terminal": the user left the editor deliberately
+    /// (⌨ from Compose). Suppresses the automatic re-arm for this episode.
+    Terminal,
+    /// "Take the keyboard back": the user wants the editor even though the
+    /// gate is blocking (busy command, live CLI session, no prompt latch).
+    /// NEVER ships a clear chord — a running program must not receive a ^C
+    /// it did not ask for.
+    Editor,
+}
+
 /// Everything the gate looks at, all existing or feed-time observable (§2.1).
 pub struct GateInputs {
     pub hooked: bool,
@@ -188,9 +214,20 @@ pub struct GateInputs {
     /// CLEARED when its block closes (`Core::clear_cli_block_on_close`), so
     /// while it is `Some` an interactive CLI really is running right now —
     /// the same predicate the sidebar's activity dot uses
-    /// (`gui::activity_for`). Paired with `open_block` it is the one case
-    /// where the permanent editor must NOT own the keyboard.
+    /// (`gui::activity_for`). Paired with an ACTIVE EXECUTION it is the one
+    /// case where the permanent editor must NOT own the keyboard.
     pub cli_session: bool,
+    /// The FEED-TIME execution span: `busy_since` is live, i.e. the latest
+    /// hook event in the stream was an `exec` and no prompt has come back.
+    ///
+    /// `open_block` alone is a Blocks/Snapshot round-trip behind the stream,
+    /// so a CLI's own exec hook can fire a whole frame or more before the
+    /// GUI has a record to attribute it to — and until then keystrokes were
+    /// still landing in the draft. Pairing `cli_session` with
+    /// `open_block || exec_busy` makes CLI ownership execution-scoped
+    /// without ever treating a persisted `inner_cli` as permanent keyboard
+    /// ownership (which would misroute at restored prompts).
+    pub exec_busy: bool,
 }
 
 #[derive(PartialEq, Debug)]
@@ -226,7 +263,7 @@ pub fn gate(i: &GateInputs) -> GateVerdict {
     // keys belong to a live session rather than queueing them for a prompt
     // that will not come back until the CLI exits. Ordinary commands (a long
     // `cargo build`) keep the Busy/queue contract byte-for-byte.
-    if i.cli_session && i.open_block {
+    if i.cli_session && (i.open_block || i.exec_busy) {
         return GateVerdict::Blocked(RawReason::CliSession);
     }
     if i.open_block {
@@ -472,13 +509,30 @@ pub(crate) enum EnterAction {
     /// queued spacer when empty), dispatched one-per-prompt-cycle by
     /// `pump_pending`.
     Queue,
+    /// The explicit Editor override is standing over a LIVE EXECUTION: the
+    /// line goes to the running PROGRAM's stdin right now, not into the
+    /// shell queue. Queue-for-the-shell and send-to-the-program are distinct
+    /// operations with distinct destinations, and only a deliberate manual
+    /// override selects this one — automatic busy still queues, so an
+    /// ordinary `cargo build` behaves exactly as it always has.
+    SendToProgram,
     InsertNewline,
     Swallow,
 }
 
-pub(crate) fn enter_action(can_submit: bool, has_draft: bool, buffering: bool) -> EnterAction {
+pub(crate) fn enter_action(
+    can_submit: bool,
+    has_draft: bool,
+    buffering: bool,
+    to_program: bool,
+) -> EnterAction {
     if can_submit {
+        // Unreachable together with `to_program` (which requires an active
+        // execution, and `can_submit` requires none) — ordered defensively
+        // so the sacred zero-delay submit path can never be diverted.
         EnterAction::Submit
+    } else if to_program {
+        EnterAction::SendToProgram
     } else if buffering {
         EnterAction::Queue
     } else if has_draft {
@@ -805,6 +859,15 @@ pub struct ComposerState {
     /// Last-seen BlockFeed counters, for edge detection.
     last_pre: u64,
     last_exec: u64,
+    /// The manual input-ownership override (§ InputOverride), None =
+    /// automatic. Expires at the next genuine prompt transition, at any
+    /// hard raw state, and on reset/exit.
+    input_override: Option<InputOverride>,
+    /// One-frame flag: central already resolved this frame's ⌨ click BEFORE
+    /// the grid input pump (it must, or the frame's keys go to the loser of
+    /// the handoff), so `show`'s own click handler must not toggle a second
+    /// time on the same click.
+    pub kbd_click_resolved: bool,
     /// `pre_seen` at the last activation clear chord (v0.1.1): at most ONE
     /// `^C` may ship per prompt epoch — a systematically-wrong prompt-end
     /// capture used to loop click → chord → fresh prompt → wrong capture →
@@ -929,6 +992,8 @@ impl Default for ComposerState {
             episode_used: false,
             last_pre: 0,
             last_exec: 0,
+            input_override: None,
+            kbd_click_resolved: false,
             chord_pre: None,
             recall: None,
             search: None,
@@ -1162,56 +1227,91 @@ impl ComposerState {
 
     /// Counter-diff pump, called from drain_ipc for EVERY terminal on live
     /// Output (selected or not) — keeps unselected composers truthful.
-    /// exec is applied before pre: that is their stream order whenever both
-    /// land in one chunk (accept → command → next prompt).
-    pub fn on_stream_events(&mut self, pre_seen: u64, exec_seen: u64, now: Instant) {
-        // NOTE: a live SubmitHold is deliberately NOT released here. Hook
-        // counters are stream truth, not grid truth: ConPTY delivers the exec
-        // OSC ahead of the asynchronously-rendered echo text (P2 reorder), so
-        // releasing on the counter drops the cover onto a still-bare prompt
-        // row — the confirmed submit-flicker root cause. Release is grid-
-        // observed in `tick` (echo_landed) with the 250ms cap as backstop.
-        if exec_seen != self.last_exec {
-            self.last_exec = exec_seen;
-            // Instant disarm signal, feed-time — beats the Blocks round-trip.
-            self.at_prompt_since = None;
-            // D2: a tokened marker means integration is alive — the
-            // heuristic episode (if any) is over.
-            self.heur = None;
-            self.heur_episode = false;
-            // Stable-chrome edges: the busy hysteresis clock starts here
-            // (GUI-side, never rec.started_ms) and the quiet window opens.
-            self.busy_since = Some(now);
-            self.last_activity = Some(now);
-            match self.mode {
-                // PERMANENT EDITOR: an exec edge never demotes an existing
-                // Compose — the editor is stationary furniture through the
-                // whole busy span (submit is gate-disabled, Enter queues,
-                // the busy chip narrates). An external SubmitCommand under
-                // an armed composer keeps the box too; a grid-typed exec
-                // already went Raw via `on_raw_input` before its bytes
-                // shipped, so no armed box can shadow raw typing here.
-                ComposerMode::Compose => {}
-                ComposerMode::Raw(_) => self.mode = ComposerMode::Raw(RawReason::Busy),
-            }
+    ///
+    /// THE EDGES ARE APPLIED IN TRUE STREAM ORDER. `HookCounters` carries
+    /// ordinals precisely so this function no longer has to guess: applying
+    /// exec-before-pre unconditionally made a chunk holding `pre` then
+    /// `exec` come to rest "at a prompt" while a command was running — the
+    /// false prompt latch that masks `open_block` in `gate_inputs` and so
+    /// defeats BOTH the CLI-session block and the ordinary Busy block. The
+    /// opposite fixed ordering breaks the mirror case, so order is data.
+    pub fn on_stream_events(&mut self, c: HookCounters, now: Instant) {
+        let exec_edge = c.exec_seen != self.last_exec;
+        let pre_edge = c.pre_seen != self.last_pre;
+        if !exec_edge && !pre_edge {
+            return;
         }
-        if pre_seen != self.last_pre {
-            self.last_pre = pre_seen;
-            self.at_prompt_since = Some(now);
-            self.episode_used = false;
-            // D2 hand-back: the returning tokened pre ends the heuristic
-            // episode — the real latch takes over the same event (seamless
-            // re-integration, pinned by nested_shell_reattach/heur_handback).
-            self.heur = None;
-            self.heur_episode = false;
-            // The prompt edge closes the busy clock and opens a quiet window
-            // so the pre→133;B transient never switches strip content.
-            self.busy_since = None;
-            self.last_activity = Some(now);
-            // Any Raw reason becomes armable; tick's gate decides auto-arm.
-            if matches!(self.mode, ComposerMode::Raw(_)) {
-                self.mode = ComposerMode::Raw(RawReason::NoPrompt);
-            }
+        if pre_edge && exec_edge && !c.exec_is_latest() {
+            // …pre landed LAST in this chunk: exec first, prompt second.
+            self.apply_exec_edge(c.exec_seen, now);
+            self.apply_pre_edge(c.pre_seen, now);
+        } else if pre_edge && exec_edge {
+            // …exec landed LAST: the prompt came back and a new command is
+            // already running. Resting state MUST be busy.
+            self.apply_pre_edge(c.pre_seen, now);
+            self.apply_exec_edge(c.exec_seen, now);
+        } else if exec_edge {
+            self.apply_exec_edge(c.exec_seen, now);
+        } else {
+            self.apply_pre_edge(c.pre_seen, now);
+        }
+    }
+
+    /// One `exec` edge (a command started).
+    ///
+    /// NOTE: a live SubmitHold is deliberately NOT released here. Hook
+    /// counters are stream truth, not grid truth: ConPTY delivers the exec
+    /// OSC ahead of the asynchronously-rendered echo text (P2 reorder), so
+    /// releasing on the counter drops the cover onto a still-bare prompt
+    /// row — the confirmed submit-flicker root cause. Release is grid-
+    /// observed in `tick` (echo_landed) with the 250ms cap as backstop.
+    fn apply_exec_edge(&mut self, exec_seen: u64, now: Instant) {
+        self.last_exec = exec_seen;
+        // Instant disarm signal, feed-time — beats the Blocks round-trip.
+        self.at_prompt_since = None;
+        // D2: a tokened marker means integration is alive — the
+        // heuristic episode (if any) is over.
+        self.heur = None;
+        self.heur_episode = false;
+        // Stable-chrome edges: the busy hysteresis clock starts here
+        // (GUI-side, never rec.started_ms) and the quiet window opens.
+        self.busy_since = Some(now);
+        self.last_activity = Some(now);
+        match self.mode {
+            // PERMANENT EDITOR: an exec edge never demotes an existing
+            // Compose — the editor is stationary furniture through the
+            // whole busy span (submit is gate-disabled, Enter queues,
+            // the busy chip narrates). An external SubmitCommand under
+            // an armed composer keeps the box too; a grid-typed exec
+            // already went Raw via `on_raw_input` before its bytes
+            // shipped, so no armed box can shadow raw typing here.
+            ComposerMode::Compose => {}
+            ComposerMode::Raw(_) => self.mode = ComposerMode::Raw(RawReason::Busy),
+        }
+    }
+
+    /// One `pre` edge (a fresh shell prompt) — a GENUINE prompt transition,
+    /// which is also where the manual input-ownership override expires.
+    fn apply_pre_edge(&mut self, pre_seen: u64, now: Instant) {
+        self.last_pre = pre_seen;
+        self.at_prompt_since = Some(now);
+        self.episode_used = false;
+        // The manual escape hatch is scoped to the execution it was taken
+        // during: a real prompt hand-back returns routing to the automatic
+        // gate (never a permanent, stale ownership claim).
+        self.input_override = None;
+        // D2 hand-back: the returning tokened pre ends the heuristic
+        // episode — the real latch takes over the same event (seamless
+        // re-integration, pinned by nested_shell_reattach/heur_handback).
+        self.heur = None;
+        self.heur_episode = false;
+        // The prompt edge closes the busy clock and opens a quiet window
+        // so the pre→133;B transient never switches strip content.
+        self.busy_since = None;
+        self.last_activity = Some(now);
+        // Any Raw reason becomes armable; tick's gate decides auto-arm.
+        if matches!(self.mode, ComposerMode::Raw(_)) {
+            self.mode = ComposerMode::Raw(RawReason::NoPrompt);
         }
     }
 
@@ -1227,6 +1327,11 @@ impl ComposerState {
         }
         self.at_prompt_since = Some(now);
         self.episode_used = false;
+        // A certified prompt is the end of any execution span: the CLI
+        // exception keys off `busy_since`, so a stale one from the previous
+        // lifetime must never survive a cold attach.
+        self.busy_since = None;
+        self.input_override = None;
         self.mode = ComposerMode::Raw(RawReason::NoPrompt);
     }
 
@@ -1249,6 +1354,8 @@ impl ComposerState {
         self.mode = ComposerMode::Raw(RawReason::NoPrompt);
         self.at_prompt_since = None;
         self.episode_used = false;
+        self.input_override = None;
+        self.busy_since = None;
         self.last_pre = 0;
         self.last_exec = 0;
         self.chord_pre = None;
@@ -1273,6 +1380,8 @@ impl ComposerState {
             RawReason::Dead
         });
         self.at_prompt_since = None;
+        self.input_override = None;
+        self.busy_since = None;
         // Counter-baseline resync, symmetric with on_reset (v0.1.1): the
         // next lifetime's backend starts its counters at 0 — stale baselines
         // from this lifetime must never fake a prompt edge on its first
@@ -1569,6 +1678,77 @@ impl ComposerState {
     /// `C2D::SubmitCommand{write:true}` (P6b §5.2). Same frame as dispatch.
     pub fn take_submit_cmd(&mut self) -> Option<String> {
         self.pending_submit_cmd.take()
+    }
+
+    /// The manual escape hatch, BOTH directions, in one gesture: the ⌨ slot.
+    ///
+    /// Compose ⇒ hand the keyboard to the terminal. Raw ⇒ take it back into
+    /// the editor even while a block is open or a CLI session owns the shell
+    /// — the states where `arm_available` is false and there was previously
+    /// no route back at all.
+    ///
+    /// Two things it deliberately does NOT do:
+    ///   - it never calls `activate()`, so no clear chord is ever sent into a
+    ///     running program (`activate` ships `^C` at a dirty prompt);
+    ///   - it never folds or flushes the queue. Queued submissions keep their
+    ///     destination (the shell, at the next provably-clean prompt —
+    ///     `pump_pending` refuses to dispatch outside Compose, so nothing can
+    ///     blind-fire into the running program while the keyboard is away),
+    ///     and the visible draft survives both directions untouched.
+    ///
+    /// Callers must gate on `kbd_toggle_available` — the hard raw states and
+    /// the pre-shell ssh-auth conversation keep the slot inert.
+    pub fn toggle_keyboard_owner(&mut self) {
+        match self.mode {
+            ComposerMode::Compose => {
+                self.input_override = Some(InputOverride::Terminal);
+                self.search_close_quiet();
+                self.mode = ComposerMode::Raw(RawReason::UserRaw);
+                // Same episode bookkeeping as `blur_to_grid`: without it the
+                // gate would auto-re-arm next frame and fight for focus.
+                if self.at_prompt_since.is_some() || self.heur.is_some() {
+                    self.episode_used = true;
+                }
+                self.want_focus = false;
+                self.has_focus = false;
+            }
+            ComposerMode::Raw(_) => {
+                self.input_override = Some(InputOverride::Editor);
+                self.mode = ComposerMode::Compose;
+                self.want_focus = true;
+                self.has_focus = false;
+                self.caret_to_end = true;
+            }
+        }
+    }
+
+    /// Is an explicit Editor override live right now?
+    pub(crate) fn editor_override(&self) -> bool {
+        self.input_override == Some(InputOverride::Editor)
+    }
+
+    /// The escape hatch's live state (test observer; production code reads
+    /// the narrower `editor_override`).
+    #[cfg(test)]
+    pub(crate) fn input_override(&self) -> Option<InputOverride> {
+        self.input_override
+    }
+
+    /// The Editor override is standing over a LIVE EXECUTION — i.e. the
+    /// editor is a staging surface above a running program, not a shell
+    /// prompt. This is the one state where Enter means "send this line to
+    /// the program" rather than "queue it for the shell": the two remain
+    /// distinct operations with distinct destinations.
+    pub(crate) fn sends_to_program(&self, inputs: &GateInputs) -> bool {
+        self.editor_override() && (inputs.open_block || inputs.exec_busy)
+    }
+
+    /// Take the draft as the raw keystrokes it represents and empty it —
+    /// the "send to the program" payload (never bracketed: this emulates
+    /// typing, and the trailing Enter is added by the caller).
+    pub(crate) fn take_draft_for_program(&mut self) -> String {
+        self.recall = None;
+        keystroke_bytes(&std::mem::take(&mut self.draft))
     }
 
     /// The user yielded an armed composer to the grid (grid click, Esc, the
@@ -1917,6 +2097,10 @@ impl ComposerState {
             episode_used: self.episode_used,
             asleep: self.asleep,
             cli_session: self.cli_session,
+            // Feed-time execution truth — ahead of the Blocks round-trip,
+            // and (since the ordered-edge fix) never latched by a chunk
+            // whose events arrived pre-then-exec.
+            exec_busy: self.busy_since.is_some(),
         }
     }
 
@@ -1980,6 +2164,14 @@ impl ComposerState {
         // batch that bumped feed_gen, which repaints on its own).
         self.maintain_heur_cover(backend, running);
         let inputs = self.gate_inputs(backend, recs, running, now);
+        // The manual override is scoped to ordinary life: a full-screen app
+        // owning the screen, a dead session and a sleeping one all outrank
+        // it (alt-screen passthrough is untouchable, and there is no editor
+        // over a dead PTY). A genuine prompt transition expires it too —
+        // that edge lives in `apply_pre_edge`, on the stream.
+        if inputs.alt || !running || inputs.asleep {
+            self.input_override = None;
+        }
         // Bug C: strip-hide hysteresis clock — stamp the ALT_SCREEN rising
         // edge, clear on the falling edge (a re-entry restarts the full
         // HIDE_AFTER wait). Consumed by `strip_hidden` alone.
@@ -2086,7 +2278,16 @@ impl ComposerState {
                     });
                     self.want_focus = false;
                     self.has_focus = false;
-                } else if inputs.cli_session && inputs.open_block {
+                } else if self.editor_override() {
+                    // MANUAL OVERRIDE: the user explicitly took the keyboard
+                    // back for this execution. The automatic yields below
+                    // (CLI session, inline interactive prompt) are exactly
+                    // what they overrode, so they stand down; the hard states
+                    // above already cleared the override before this match.
+                    // Nothing fires and nothing folds — the draft and the
+                    // queue keep their destinations.
+                    self.compose_broken_since = None;
+                } else if inputs.cli_session && (inputs.open_block || inputs.exec_busy) {
                     // CLI SESSION (the permanent editor's exception TWO,
                     // typed-ssh-nested). An attributed inner CLI —
                     // claude/codex/... — is not a command that will finish and
@@ -2215,6 +2416,15 @@ impl ComposerState {
             }
             ComposerMode::Raw(_) => {
                 let verdict = gate(&inputs);
+                // MANUAL OVERRIDE (belt for the promotion the ⌨ click
+                // already made): the gate re-derives the mode every frame,
+                // so an Editor override must survive `Blocked` here or the
+                // very next tick would step the editor back down — exactly
+                // the open-block rejection that made a naive retake() fail.
+                if self.editor_override() {
+                    self.mode = ComposerMode::Compose;
+                    return self.tick_wakeup(now, heur_wake);
+                }
                 // Only the arm-relevant window (at a prompt) is logged, so a
                 // diagnosing user sees exactly why a fresh prompt did or
                 // didn't arm without drowning in idle Blocked(NoPrompt).
@@ -2250,6 +2460,11 @@ impl ComposerState {
                 }
             }
         }
+        self.tick_wakeup(now, heur_wake)
+    }
+
+    /// The self-scheduled repaint deadline for whatever `tick` left pending.
+    fn tick_wakeup(&mut self, now: Instant, heur_wake: Option<Instant>) -> Option<Instant> {
         // Self-scheduled wakeups (§0.7): the settle window's trailing edge
         // (ZERO now, so inert) and the SubmitHold safety cap so the ghost is
         // torn down on time even if no output/exec arrives to release it.
@@ -3271,6 +3486,43 @@ pub(crate) fn paint_prompt_prefix_sigil(
     x
 }
 
+/// The fixed ⌨ slot inside a strip rect. ONE geometry source: `show` paints
+/// and hit-tests it here, and central hit-tests the SAME rect one step
+/// earlier — before the grid's input pump — because the strip is painted
+/// after the grid, and a click resolved only at paint time cannot rescue the
+/// keys that frame already handed to the loser of the handoff.
+pub fn kbd_rect_for(strip_rect: Rect) -> Rect {
+    Rect::from_center_size(
+        Pos2::new(strip_rect.max.x - 22.0, strip_rect.center().y),
+        Vec2::splat(22.0),
+    )
+}
+
+/// May the ⌨ slot move input ownership right now?
+///
+/// Leaving the editor is always allowed. Coming BACK is allowed in every
+/// ordinary state — including a busy block and a live CLI session, the two
+/// the automatic gate blocks — and refused only where the editor has no
+/// business existing:
+///   - a full-screen app owns the screen (alt-screen passthrough is sacred);
+///   - the session is dead or asleep;
+///   - PRE-SHELL: no hook event this lifetime and no latch, i.e. ssh auth is
+///     talking. Never offer a visible editor over a password prompt.
+pub fn kbd_toggle_available(st: &ComposerState, backend: &TermBackend, running: bool) -> bool {
+    if st.mode == ComposerMode::Compose {
+        return true;
+    }
+    if !running || st.asleep {
+        return false;
+    }
+    let alt = backend.mode().contains(TermMode::ALT_SCREEN);
+    if alt {
+        return false;
+    }
+    let c = backend.hook_counters();
+    !pre_shell(running, alt, c.pre_seen, c.exec_seen, st.at_prompt_latched())
+}
+
 /// Draw the composer and route its input. Returns bytes to ship and whether
 /// the composer holds egui focus this frame.
 ///
@@ -3407,10 +3659,11 @@ pub fn show(
     // geometry, IDENTICAL in every mode (stable chrome, F3): elements may
     // dim, never move or unmount — submitting `ls` changes zero strip pixels
     // except the caret/text.
-    let kbd_rect = Rect::from_center_size(
-        Pos2::new(strip_rect.max.x - 22.0, strip_rect.center().y),
-        Vec2::splat(22.0),
-    );
+    let kbd_rect = kbd_rect_for(strip_rect);
+    // The escape hatch's live availability — one predicate, shared with
+    // central's pre-input resolution so paint, hit-test and routing can
+    // never disagree.
+    let kbd_on = kbd_toggle_available(state, backend, running);
     // Dead lane: the slot carries `↻ Restore  ⏎` (verb + silent keyboard
     // accelerator) — wider than every other occupant. Widened only on the
     // death edge (a real lifecycle change, not per-submit chrome motion);
@@ -3723,7 +3976,12 @@ pub fn show(
                 // whole busy span (permanent editor): Enter during a running
                 // command queues the draft as a blind submission that fires
                 // at the prompt-byte — faster than any human could re-type.
-                match enter_action(can_submit, has_draft, (buffering || busy_hold) && !cmd_multiline) {
+                match enter_action(
+                    can_submit,
+                    has_draft,
+                    (buffering || busy_hold) && !cmd_multiline,
+                    state.sends_to_program(&inputs),
+                ) {
                     EnterAction::Submit => {
                         let n = consume_all_enters(ui);
                         if n > 0 {
@@ -3768,6 +4026,18 @@ pub fn show(
                             }
                         } else if !has_draft {
                             let _ = consume_all_enters(ui);
+                        }
+                    }
+                    // The escape hatch's Enter: straight to the running
+                    // program's stdin, byte for byte, this frame. Key
+                    // repeats past the first send bare `\r` (the draft is
+                    // already empty) — exactly what typing raw would do.
+                    EnterAction::SendToProgram => {
+                        let n = consume_all_enters(ui);
+                        for _ in 0..n {
+                            let line = state.take_draft_for_program();
+                            out.write.extend_from_slice(line.as_bytes());
+                            out.write.push(b'\r');
                         }
                     }
                     EnterAction::Swallow => {
@@ -4139,6 +4409,22 @@ pub fn show(
                 && !cmd_multiline
                 && !searching)
                 .then(|| {
+                    // MANUAL OVERRIDE: the contract line must not lie. While
+                    // the user has explicitly taken the keyboard back over a
+                    // live execution, Enter does NOT queue - it goes to the
+                    // program.
+                    if state.sends_to_program(&inputs) {
+                        return match recs.iter().rev().find(|r| r.end_off.is_none()) {
+                            Some(r) => format!(
+                                "{} \u{2014} Enter sends to the program",
+                                super::middle_ellipsize(
+                                    &r.cmd.replace(['\r', '\n'], " "),
+                                    24
+                                ),
+                            ),
+                            None => "Enter sends to the program".to_string(),
+                        };
+                    }
                     match recs.iter().rev().find(|r| r.end_off.is_none()) {
                         Some(r) => format!(
                             "{} \u{b7} {} \u{2014} Enter queues",
@@ -4218,7 +4504,12 @@ pub fn show(
             if strip_resp.clicked() {
                 if let Some(p) = strip_resp.interact_pointer_pos() {
                     if kbd_rect.contains(p) {
-                        state.blur_to_grid();
+                        // Central normally resolves this click one step
+                        // earlier (before the grid input pump); this arm is
+                        // the fallback for any host that does not.
+                        if !state.kbd_click_resolved {
+                            state.toggle_keyboard_owner();
+                        }
                         resp.surrender_focus();
                     } else if hist_rect.contains(p) {
                         // Opening the history panel closes the inline
@@ -4239,6 +4530,14 @@ pub fn show(
                             // Focus stays in the editor (typeahead window).
                             let (bytes, _) = state.submit(backend, cover_line, sub_cwd);
                             out.write = bytes;
+                        } else if state.sends_to_program(&inputs) && has_draft {
+                            // Mouse-first parity with the override's Enter:
+                            // the line goes to the running program, not the
+                            // shell queue (distinct destinations, both
+                            // reachable by mouse alone).
+                            let line = state.take_draft_for_program();
+                            out.write.extend_from_slice(line.as_bytes());
+                            out.write.push(b'\r');
                         } else if (buffering || busy_hold)
                             && has_draft
                             && !cmd_multiline
@@ -4742,7 +5041,19 @@ pub fn show(
             // for synthetic Responses; band clicks belong to the grid.
             if strip_resp.clicked() && !collapsed {
                 if let Some(p) = strip_resp.interact_pointer_pos() {
-                    if hist_rect.contains(p) {
+                    if kbd_rect.contains(p) {
+                        // THE MISSING HALF (the confirmed escape-hatch
+                        // defect): the Raw arm had no kbd branch at all, and
+                        // `arm_available` is false for the whole of any open
+                        // block - so during a busy command or a live CLI
+                        // session there was no way back to the editor.
+                        // Deliberately NOT `activate()`: that ships a clear
+                        // chord, and ^C into a running program is exactly the
+                        // hazard the review warned about.
+                        if kbd_on && !state.kbd_click_resolved {
+                            state.toggle_keyboard_owner();
+                        }
+                    } else if hist_rect.contains(p) {
                         if !inputs.alt {
                             out.toggle_history = true;
                         }
@@ -4778,10 +5089,11 @@ pub fn show(
                 }
             }
             if arm_available
+                || (kbd_on && over_kbd)
                 || ((asleep_lane || recon_lane) && over_run)
                 || (dead_lane && !over_hist)
             {
-                strip_resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                strip_resp.clone().on_hover_cursor(egui::CursorIcon::PointingHand);
             }
         }
     }
@@ -4850,7 +5162,10 @@ pub fn show(
                 painter.galley(rr.min, g, col);
             }
         } else {
-        let run_on = compose && has_draft && (can_submit || buffering) && !cmd_multiline;
+        let run_on = compose
+            && has_draft
+            && (can_submit || buffering || state.sends_to_program(&inputs))
+            && !cmd_multiline;
         let run_col = if !run_on {
             super::TEXT_FAINT
         } else if over_run {
@@ -4878,18 +5193,31 @@ pub fn show(
             })
             .gamma_multiply(cluster_alpha),
         );
-        // ⌨: the to-raw toggle while composing; already-raw states keep the
-        // glyph faint and inert (dim, never vanish).
+        // KBD: the input-ownership toggle, BOTH directions. Live wherever
+        // `kbd_toggle_available` says so - which now includes the busy and
+        // CLI-session Raw states, the ones with no other route back. The
+        // hard raw states (alt/dead/asleep) keep the glyph faint and inert
+        // (dim, never vanish). An active Editor override paints it accented:
+        // the strip must say the routing is manual right now.
         draw_keyboard(
             &painter,
             kbd_rect.center(),
-            (if compose && over_kbd {
+            (if state.editor_override() {
+                super::ACCENT
+            } else if kbd_on && over_kbd {
                 super::TEXT
             } else {
                 super::TEXT_FAINT
             })
             .gamma_multiply(cluster_alpha),
         );
+        if kbd_on && over_kbd {
+            let _ = strip_resp.clone().on_hover_text(if compose {
+                "Send the keyboard to the terminal"
+            } else {
+                "Type here instead \u{2014} take the keyboard back"
+            });
+        }
     }
 
     out
@@ -4993,6 +5321,7 @@ mod tests {
 
     fn raw_inputs() -> GateInputs {
         GateInputs {
+            exec_busy: false,
             hooked: true,
             running: true,
             alt: false,
@@ -5548,7 +5877,7 @@ mod tests {
         assert!(!st.episode_used);
 
         // pre latches; raw typing at the armed prompt wins the episode (D7).
-        st.on_stream_events(1, 0, now);
+        st.on_stream_events(HookCounters::prompt_last(1, 0), now);
         assert!(st.at_prompt_latched());
         st.mode = ComposerMode::Compose;
         st.on_raw_input(now);
@@ -5559,7 +5888,7 @@ mod tests {
         // kept with the typeahead window open.
         let backend = TermBackend::new(GridSize::default());
         let mut st = ComposerState::default();
-        st.on_stream_events(1, 0, now);
+        st.on_stream_events(HookCounters::prompt_last(1, 0), now);
         st.mode = ComposerMode::Compose;
         st.draft = "echo hi".into();
         let (bytes, spacer) = st.submit(&backend, None, None);
@@ -5572,21 +5901,21 @@ mod tests {
 
         // exec clears the latch but the typeahead window HOLDS Compose (the
         // exec edge is the normal first event of every submit window)…
-        st.on_stream_events(1, 1, now);
+        st.on_stream_events(HookCounters::prompt_last(1, 1), now);
         assert!(!st.at_prompt_latched());
         assert_eq!(st.mode, ComposerMode::Compose);
         // …and the closing pre resets the episode and re-arms the latch.
-        st.on_stream_events(2, 1, now);
+        st.on_stream_events(HookCounters::prompt_last(2, 1), now);
         assert!(st.at_prompt_latched());
         assert!(!st.episode_used);
         assert_eq!(st.mode, ComposerMode::Compose);
 
         // A focused composer is never yanked by an external exec (inv. 4).
         let mut st = ComposerState::default();
-        st.on_stream_events(1, 0, now);
+        st.on_stream_events(HookCounters::prompt_last(1, 0), now);
         st.mode = ComposerMode::Compose;
         st.has_focus = true;
-        st.on_stream_events(1, 1, now);
+        st.on_stream_events(HookCounters::prompt_last(1, 1), now);
         assert_eq!(st.mode, ComposerMode::Compose);
         // REWRITTEN DELIBERATELY (permanent editor): the exec edge never
         // demotes an existing Compose — unfocused/empty included (this leg
@@ -5595,9 +5924,9 @@ mod tests {
         // under an armed composer keeps the box; busy-Compose is a healthy
         // steady state and Enter queues.
         let mut st = ComposerState::default();
-        st.on_stream_events(1, 0, now);
+        st.on_stream_events(HookCounters::prompt_last(1, 0), now);
         st.mode = ComposerMode::Compose;
-        st.on_stream_events(1, 1, now);
+        st.on_stream_events(HookCounters::prompt_last(1, 1), now);
         assert_eq!(st.mode, ComposerMode::Compose, "exec edge never demotes Compose");
     }
 
@@ -5629,8 +5958,7 @@ mod tests {
         let b = backend_at_clean_prompt();
         let mut st = ComposerState::default();
         let now = Instant::now();
-        let f = b.block_feed.as_ref().unwrap();
-        st.on_stream_events(f.pre_seen, f.exec_seen, now);
+        st.on_stream_events(b.hook_counters(), now);
         // Same instant as the latch — must arm (grid had focus ⇒ want_focus).
         let recs: Vec<BlockRec> = Vec::new();
         st.tick(&b, &recs, true, true, false, now);
@@ -5660,24 +5988,24 @@ mod tests {
         let now = Instant::now();
         let mut st = ComposerState::default();
         // The old lifetime saw real hook traffic.
-        st.on_stream_events(3, 2, now);
+        st.on_stream_events(HookCounters::prompt_last(3, 2), now);
         assert!(st.at_prompt_latched());
         st.on_reset();
         assert!(!st.at_prompt_latched());
         // Fresh backend, fresh counters: (0,0) is the ORIGIN, not an edge.
-        st.on_stream_events(0, 0, now);
+        st.on_stream_events(HookCounters::prompt_last(0, 0), now);
         assert!(
             !st.at_prompt_latched(),
             "the post-reset counter origin must never latch at_prompt"
         );
         // Symmetric on the exit path.
         let mut st = ComposerState::default();
-        st.on_stream_events(5, 5, now);
+        st.on_stream_events(HookCounters::prompt_last(5, 5), now);
         st.on_exited();
-        st.on_stream_events(0, 0, now);
+        st.on_stream_events(HookCounters::prompt_last(0, 0), now);
         assert!(!st.at_prompt_latched());
         // A REAL first pre of the new lifetime still latches.
-        st.on_stream_events(1, 0, now);
+        st.on_stream_events(HookCounters::prompt_last(1, 0), now);
         assert!(st.at_prompt_latched());
     }
 
@@ -5770,6 +6098,7 @@ mod tests {
         let mut st = ComposerState::default();
         // Mirror gate_inputs' F7 formula: a live latch overrules an open rec.
         let gi = |st: &ComposerState, open_rec: bool| GateInputs {
+            exec_busy: false,
             hooked: true,
             running: true,
             alt: false,
@@ -5783,25 +6112,25 @@ mod tests {
             cli_session: false,
         };
         // Hooked prompt: pre edge latches, gate arms.
-        st.on_stream_events(1, 0, now);
+        st.on_stream_events(HookCounters::prompt_last(1, 0), now);
         assert!(st.at_prompt_latched());
         assert_eq!(gate(&gi(&st, false)), GateVerdict::AutoArm);
         // `sudo su` submitted: exec edge — latch drops, mode Raw(Busy).
-        st.on_stream_events(1, 1, now);
+        st.on_stream_events(HookCounters::prompt_last(1, 1), now);
         assert!(!st.at_prompt_latched());
         assert_eq!(st.mode, ComposerMode::Raw(RawReason::Busy));
         // The nested-shell episode: output flows but the hook counters never
         // move (no hooks in that shell) and the rec stays open — the gate
         // must hold Blocked(Busy) for the whole visit (typing goes raw).
         for _ in 0..10 {
-            st.on_stream_events(1, 1, now); // unchanged counters: no edges
+            st.on_stream_events(HookCounters::prompt_last(1, 1), now); // unchanged counters: no edges
             assert!(!st.at_prompt_latched());
             assert_eq!(gate(&gi(&st, true)), GateVerdict::Blocked(RawReason::Busy));
         }
         // `exit`: the login shell repaints its prompt → tokened pre edge.
         // Latch live; the F7 override unblocks the gate the same frame even
         // though the rec still reads open (Blocks round-trip in flight).
-        st.on_stream_events(2, 1, now);
+        st.on_stream_events(HookCounters::prompt_last(2, 1), now);
         assert!(st.at_prompt_latched());
         assert!(!st.episode_used, "pre edge resets the episode");
         assert_eq!(gate(&gi(&st, true)), GateVerdict::AutoArm);
@@ -5966,7 +6295,7 @@ mod tests {
         assert!(st.heur_live(&b), "fresh clean prompt re-mints");
         // A tokened marker edge (the returning pre) ends the EPISODE, not
         // just the latch — integration owns the prompt again.
-        st.on_stream_events(2, 1, t3);
+        st.on_stream_events(HookCounters::prompt_last(2, 1), t3);
         assert!(!st.heur_live(&b));
         assert!(!st.heur_episode, "marker edge closes the episode");
         assert!(st.at_prompt_latched(), "the real latch takes over");
@@ -6515,8 +6844,7 @@ mod tests {
 
     /// Latch the composer's counters from the backend's live feed state.
     fn pump_counters(st: &mut ComposerState, b: &TermBackend, now: Instant) {
-        let f = b.block_feed.as_ref().unwrap();
-        st.on_stream_events(f.pre_seen, f.exec_seen, now);
+        st.on_stream_events(b.hook_counters(), now);
     }
 
     /// THE submit-flicker regression (user-reported twice): ConPTY delivers
@@ -6590,7 +6918,7 @@ mod tests {
         });
         b.advance(b"a\r\nb\r\nc\r\nPS> "); // cursor on row 3 (bottom)
         let mut st = ComposerState::default();
-        st.on_stream_events(1, 0, now);
+        st.on_stream_events(HookCounters::prompt_last(1, 0), now);
         st.mode = ComposerMode::Compose;
         st.draft = "quux".into();
         let _ = st.submit(&b, Some(3), None);
@@ -6616,7 +6944,7 @@ mod tests {
         // no cover ⇒ no hold (fallback lane submit doesn't flicker).
         let bb = TermBackend::new(GridSize::default());
         let mut st = ComposerState::default();
-        st.on_stream_events(1, 0, now);
+        st.on_stream_events(HookCounters::prompt_last(1, 0), now);
         st.mode = ComposerMode::Compose;
         st.draft = "x".into();
         let _ = st.submit(&bb, None, None);
@@ -7011,7 +7339,7 @@ mod tests {
         let mut st = ComposerState::default();
         let f = b.block_feed.as_ref().unwrap();
         let (pre0, exec0) = (f.pre_seen, f.exec_seen);
-        st.on_stream_events(pre0, exec0, now);
+        st.on_stream_events(HookCounters::prompt_last(pre0, exec0), now);
         st.tick(&b, &recs, true, true, false, now);
         assert_eq!(st.mode, ComposerMode::Compose);
         st.draft = "half-written".into();
@@ -7032,7 +7360,7 @@ mod tests {
         assert_eq!(st.mode, ComposerMode::Raw(RawReason::UserRaw));
         assert_eq!(st.draft, "half-written", "draft survives the blur");
         // …until the next pre re-opens it and the gate re-arms.
-        st.on_stream_events(pre0 + 1, exec0, now);
+        st.on_stream_events(HookCounters::prompt_last(pre0 + 1, exec0), now);
         st.tick(&b, &recs, true, true, false, now);
         assert_eq!(st.mode, ComposerMode::Compose);
     }
@@ -7192,8 +7520,8 @@ mod tests {
             ..rec("sleep")
         }];
         let mut busy = ComposerState::default();
-        busy.on_stream_events(1, 0, now); // prompt…
-        busy.on_stream_events(1, 1, now); // …then exec: latch cleared
+        busy.on_stream_events(HookCounters::prompt_last(1, 0), now); // prompt…
+        busy.on_stream_events(HookCounters::prompt_last(1, 1), now); // …then exec: latch cleared
         assert!(!busy.history_run_allowed(&b, &open, true, now));
         busy.mode = ComposerMode::Compose;
         assert!(!busy.history_run_allowed(&b, &open, true, now));
@@ -7437,8 +7765,7 @@ mod tests {
         let b = backend_at_clean_prompt();
         let mut st = ComposerState::default();
         let now = Instant::now();
-        let f = b.block_feed.as_ref().unwrap();
-        st.on_stream_events(f.pre_seen, f.exec_seen, now);
+        st.on_stream_events(b.hook_counters(), now);
         // Same-cwd history entry, so the ghost IS eligible and visible.
         let recs = vec![rec_at("cd Users\\proj", Some(&cwd))];
         st.tick(&b, &recs, true, true, false, now);
@@ -7745,8 +8072,7 @@ mod tests {
         let b = backend_at_clean_prompt();
         let mut st = ComposerState::default();
         let now = Instant::now();
-        let f = b.block_feed.as_ref().unwrap();
-        st.on_stream_events(f.pre_seen, f.exec_seen, now);
+        st.on_stream_events(b.hook_counters(), now);
         let recs: Vec<BlockRec> = ["git status", "cargo build", "git commit -m x"]
             .iter()
             .map(|c| rec(c))
@@ -7988,9 +8314,7 @@ mod tests {
         recs: &[BlockRec],
         now: Instant,
     ) -> Option<i32> {
-        let f = b.block_feed.as_ref().unwrap();
-        let (pre, exec) = (f.pre_seen, f.exec_seen);
-        st.on_stream_events(pre, exec, now);
+        st.on_stream_events(b.hook_counters(), now);
         st.tick(b, recs, true, true, false, now);
         if let Some((l, c, cwd, cmd)) = st.take_pending_history_cover() {
             b.add_history_cover(l, c, cwd, cmd);
@@ -8267,12 +8591,12 @@ mod tests {
     fn enter_fusion_guard() {
         // The Enter routing table (typeahead: `buffering` = post-submit
         // window open or blind submissions queued; it implies !can_submit).
-        assert_eq!(enter_action(true, true, false), EnterAction::Submit);
-        assert_eq!(enter_action(true, false, false), EnterAction::Submit); // spacer gesture
-        assert_eq!(enter_action(false, true, true), EnterAction::Queue); // blind cmd⏎
-        assert_eq!(enter_action(false, false, true), EnterAction::Queue); // blind spacer
-        assert_eq!(enter_action(false, true, false), EnterAction::InsertNewline);
-        assert_eq!(enter_action(false, false, false), EnterAction::Swallow);
+        assert_eq!(enter_action(true, true, false, false), EnterAction::Submit);
+        assert_eq!(enter_action(true, false, false, false), EnterAction::Submit); // spacer gesture
+        assert_eq!(enter_action(false, true, true, false), EnterAction::Queue); // blind cmd⏎
+        assert_eq!(enter_action(false, false, true, false), EnterAction::Queue); // blind spacer
+        assert_eq!(enter_action(false, true, false, false), EnterAction::InsertNewline);
+        assert_eq!(enter_action(false, false, false, false), EnterAction::Swallow);
         // The lsechols narrative: "ls" + Enter(dead window ⇒ newline) +
         // "echo hi" + Enter(armed) must submit two separate commands.
         let plain = TermBackend::new(GridSize::default());
@@ -8308,18 +8632,18 @@ mod tests {
 
         // exec edge (rec opens): still the editor (buffering holds Compose);
         // through release and the pre edge nothing changes either.
-        st.on_stream_events(1, 1, now);
+        st.on_stream_events(HookCounters::prompt_last(1, 1), now);
         assert_eq!(lane_content(&st, true, false, true, now), LaneContent::Editor);
         st.submit_hold = None; // released (echo landed; tick path)
         st.last_activity = Some(now);
         assert_eq!(lane_content(&st, true, false, true, now), LaneContent::Editor);
-        st.on_stream_events(2, 1, now);
+        st.on_stream_events(HookCounters::prompt_last(2, 1), now);
         assert_eq!(lane_content(&st, true, false, true, now), LaneContent::Editor);
 
         // Esc mid-hold (deliberate yield): Raw with a live hold ⇒ Frozen —
         // the submitted text stays put with no caret until release.
         let mut st = ComposerState::default();
-        st.on_stream_events(1, 0, now);
+        st.on_stream_events(HookCounters::prompt_last(1, 0), now);
         st.mode = ComposerMode::Compose;
         st.draft = "ls".into();
         let _ = st.submit(&b, Some(0), Some("C:\\"));
@@ -8335,8 +8659,8 @@ mod tests {
 
         // Slow command: Busy reveals only past REVEAL.
         let mut st = ComposerState::default();
-        st.on_stream_events(1, 0, now);
-        st.on_stream_events(1, 1, now); // exec: busy_since = now
+        st.on_stream_events(HookCounters::prompt_last(1, 0), now);
+        st.on_stream_events(HookCounters::prompt_last(1, 1), now); // exec: busy_since = now
         st.mode = ComposerMode::Raw(RawReason::Busy);
         assert_eq!(lane_content(&st, true, false, true, now), LaneContent::Quiet);
         let later = now + REVEAL + Duration::from_millis(1);
@@ -8640,6 +8964,430 @@ mod tests {
             ComposerMode::Compose,
             "the editor comes back the moment the CLI is gone"
         );
+    }
+
+
+    // ── astra fixes 1+2: ordered hook edges & execution-scoped CLI ────────
+    //
+    // The false prompt latch. `on_stream_events` used to receive only
+    // cumulative counters and always apply exec BEFORE pre, so a chunk
+    // carrying `pre` then `exec` came to rest "at a prompt" while a command
+    // was genuinely running. `gate_inputs` then masks `open_block` on that
+    // latch, so BOTH the CLI-session block and the ordinary Busy block lose
+    // and the editor keeps the keyboard mid-execution.
+
+    /// A single open rec (a command running right now).
+    fn open_rec(cmd: &str) -> BlockRec {
+        BlockRec {
+            epoch: 1,
+            n: 0,
+            cmd: cmd.into(),
+            cwd: None,
+            exit: None,
+            started_ms: 0,
+            ended_ms: None,
+            start_off: 0,
+            end_off: None,
+            truncated: false,
+        }
+    }
+
+    /// THE ORDERING MATRIX, one chunk. Both interleaves of the same counter
+    /// pair must come to rest in OPPOSITE states — which is exactly what the
+    /// counter pair alone cannot express.
+    #[test]
+    fn hook_edges_rest_on_the_last_event_in_the_chunk() {
+        let now = Instant::now();
+
+        // exec → pre in one chunk: the command finished, the prompt is back.
+        let mut st = ComposerState::default();
+        st.on_stream_events(HookCounters::prompt_last(1, 1), now);
+        assert!(st.at_prompt_latched(), "exec-then-pre rests at the prompt");
+        assert!(st.busy_since.is_none(), "the prompt edge closes the busy clock");
+
+        // pre → exec in one chunk: the prompt came back and the NEXT command
+        // is already running. This is the case the old code got backwards.
+        let mut st = ComposerState::default();
+        st.on_stream_events(HookCounters::exec_last(1, 1), now);
+        assert!(
+            !st.at_prompt_latched(),
+            "pre-then-exec must NOT rest at a prompt: a command is running"
+        );
+        assert!(
+            st.busy_since.is_some(),
+            "pre-then-exec rests busy — the exec is the latest event"
+        );
+
+        // …and it is not simply inverted: several of each still rest on the
+        // last one, in both directions.
+        let mut st = ComposerState::default();
+        st.on_stream_events(HookCounters::prompt_last(3, 3), now);
+        assert!(st.at_prompt_latched());
+        let mut st = ComposerState::default();
+        st.on_stream_events(HookCounters::exec_last(3, 3), now);
+        assert!(!st.at_prompt_latched() && st.busy_since.is_some());
+    }
+
+    /// ACROSS CHUNK SPLITS: the same two events delivered one per chunk must
+    /// reach the same resting state as when they share a chunk.
+    #[test]
+    fn hook_edges_split_across_chunks_match_the_single_chunk_result() {
+        let now = Instant::now();
+        // exec, then (next chunk) pre.
+        let mut split = ComposerState::default();
+        split.on_stream_events(HookCounters::exec_last(0, 1), now);
+        assert!(split.busy_since.is_some());
+        split.on_stream_events(HookCounters::prompt_last(1, 1), now);
+        assert!(split.at_prompt_latched() && split.busy_since.is_none());
+
+        // pre, then (next chunk) exec.
+        let mut split = ComposerState::default();
+        split.on_stream_events(HookCounters::prompt_last(1, 0), now);
+        assert!(split.at_prompt_latched());
+        split.on_stream_events(HookCounters::exec_last(1, 1), now);
+        assert!(
+            !split.at_prompt_latched() && split.busy_since.is_some(),
+            "a later chunk's exec must clear the latch"
+        );
+
+        // A chunk with NO new edges changes nothing in either direction.
+        let before = (split.at_prompt_latched(), split.busy_since.is_some());
+        split.on_stream_events(HookCounters::exec_last(1, 1), now);
+        assert_eq!(
+            (split.at_prompt_latched(), split.busy_since.is_some()),
+            before
+        );
+    }
+
+    /// The feed itself must carry the order: two real hook OSCs in ONE
+    /// `advance_live` are distinguishable by `hook_counters()`.
+    #[test]
+    fn feed_records_hook_order_within_one_chunk() {
+        let mut b = TermBackend::new(GridSize::default());
+        b.set_stream_pos(0);
+        b.enable_block_scan();
+        let mut d = hook_bytes("pre", r#"{"e":0,"n":1,"d":"C:"}"#);
+        d.extend_from_slice(b"PS C:\\> ");
+        d.extend_from_slice(&hook_bytes("exec", r#"{"c":"cargo build"}"#));
+        b.advance_live(&d);
+        let c = b.hook_counters();
+        assert_eq!((c.pre_seen, c.exec_seen), (1, 1));
+        assert!(
+            c.exec_is_latest(),
+            "pre-then-exec in one chunk must read as exec-latest"
+        );
+
+        // The mirror ordering in one chunk.
+        let mut b = TermBackend::new(GridSize::default());
+        b.set_stream_pos(0);
+        b.enable_block_scan();
+        let mut d = hook_bytes("exec", r#"{"c":"ls"}"#);
+        d.extend_from_slice(b"a b c\r\n");
+        d.extend_from_slice(&hook_bytes("pre", r#"{"e":0,"n":2,"d":"C:"}"#));
+        b.advance_live(&d);
+        assert!(!b.hook_counters().exec_is_latest());
+    }
+
+    /// THE FIELD BUG, end to end: a CLI session whose chunk carried
+    /// pre-then-exec used to defeat the v0.1.15 CLI-ownership fix outright —
+    /// the false latch masked the open rec, so the gate saw neither
+    /// CliSession nor Busy and the editor kept the keyboard. Both the gate
+    /// verdict and the Compose demotion are pinned here, for a CLI attributed
+    /// and not.
+    #[test]
+    fn false_prompt_latch_can_no_longer_unmask_a_live_execution() {
+        let now = Instant::now();
+        let b = backend_at_clean_prompt();
+        let recs = vec![open_rec("claude")];
+
+        // CLI attributed: the keys belong to the session, not to a queue.
+        let mut st = ComposerState {
+            mode: ComposerMode::Compose,
+            ..Default::default()
+        };
+        // The rest of the chunk: prompt back, then the CLI's own exec.
+        st.on_stream_events(HookCounters::exec_last(1, 1), now);
+        let gi = st.gate_inputs(&b, &recs, true, now);
+        assert!(gi.open_block, "the open rec must not be masked");
+        assert!(gi.exec_busy, "the feed-time execution span is live");
+        assert_eq!(
+            gate(&GateInputs { cli_session: true, ..gi }),
+            GateVerdict::Blocked(RawReason::CliSession)
+        );
+        st.tick(&b, &recs, true, true, true, now);
+        assert_eq!(
+            st.mode,
+            ComposerMode::Raw(RawReason::CliSession),
+            "Compose must yield to the attributed CLI"
+        );
+
+        // NOT attributed (an ordinary busy command): still blocked, and still
+        // the queue contract — Busy, never CliSession.
+        let mut st = ComposerState {
+            mode: ComposerMode::Compose,
+            ..Default::default()
+        };
+        st.on_stream_events(HookCounters::exec_last(1, 1), now);
+        let gi = st.gate_inputs(&b, &[open_rec("cargo build")], true, now);
+        assert_eq!(gate(&gi), GateVerdict::Blocked(RawReason::Busy));
+        st.tick(&b, &[open_rec("cargo build")], true, true, false, now);
+        assert_eq!(
+            st.mode,
+            ComposerMode::Compose,
+            "PRIME LAW: an ordinary busy command keeps the permanent editor \
+             (Enter queues) — this fix must not change that"
+        );
+    }
+
+    /// astra fix 2: CLI ownership is EXECUTION-scoped and covers the
+    /// feed-time busy interval, so the Blocks/Snapshot round-trip can no
+    /// longer leak keystrokes into the draft — and it still releases at the
+    /// prompt instead of becoming a permanent claim on a persisted identity.
+    #[test]
+    fn cli_ownership_covers_the_feed_time_busy_interval() {
+        let now = Instant::now();
+        let b = backend_at_clean_prompt();
+        let no_recs: Vec<BlockRec> = Vec::new();
+
+        let mut st = ComposerState {
+            mode: ComposerMode::Compose,
+            ..Default::default()
+        };
+        // The CLI's exec hook landed; Blocks has NOT caught up (no rec yet).
+        st.on_stream_events(HookCounters::exec_last(0, 1), now);
+        let gi = st.gate_inputs(&b, &no_recs, true, now);
+        assert!(!gi.open_block, "no rec has arrived yet");
+        assert!(gi.exec_busy);
+        assert_eq!(
+            gate(&GateInputs { cli_session: true, ..gi }),
+            GateVerdict::Blocked(RawReason::CliSession),
+            "the CLI owns the keyboard from its exec edge, not from its rec"
+        );
+        st.tick(&b, &no_recs, true, true, true, now);
+        assert_eq!(st.mode, ComposerMode::Raw(RawReason::CliSession));
+
+        // The prompt comes back (the CLI exited): ownership RELEASES even
+        // though the caller still reports cli_session (a persisted
+        // `inner_cli` must never be permanent keyboard ownership).
+        st.on_stream_events(HookCounters::prompt_last(1, 1), now);
+        let gi = st.gate_inputs(&b, &no_recs, true, now);
+        assert!(!gi.exec_busy && !gi.open_block);
+        assert_eq!(
+            gate(&GateInputs { cli_session: true, ..gi }),
+            GateVerdict::AutoArm
+        );
+    }
+
+    // ── astra fix 3: the manual escape hatch ─────────────────────────────
+
+    /// The hatch is reversible in BOTH directions and survives the states
+    /// that used to have no way back: an open block and a live CLI session.
+    /// The draft and the queue keep their destinations across each switch,
+    /// and nothing is ever written to the PTY by the toggle itself.
+    #[test]
+    fn keyboard_override_is_reversible_and_lossless() {
+        let now = Instant::now();
+        let b = backend_at_clean_prompt();
+        let recs = vec![open_rec("npm install")];
+
+        let mut st = ComposerState {
+            mode: ComposerMode::Compose,
+            draft: "y".into(),
+            ..Default::default()
+        };
+        st.queue_draft(); // one queued submission, destined for the SHELL
+        st.draft = "half typed".into();
+        st.on_stream_events(HookCounters::exec_last(0, 1), now);
+        st.tick(&b, &recs, true, true, false, now);
+        assert_eq!(
+            st.mode,
+            ComposerMode::Compose,
+            "an ordinary busy command holds the permanent editor"
+        );
+
+        // ⌨ once: keyboard to the terminal, sticky.
+        st.toggle_keyboard_owner();
+        assert_eq!(st.mode, ComposerMode::Raw(RawReason::UserRaw));
+        assert_eq!(st.input_override(), Some(InputOverride::Terminal));
+        assert_eq!(st.draft, "half typed", "the draft survives the switch");
+        assert_eq!(st.pending.len(), 1, "the queue keeps its destination");
+        st.tick(&b, &recs, true, true, false, now);
+        assert!(
+            matches!(st.mode, ComposerMode::Raw(_)),
+            "the gate must not drag the editor back while the user is typing raw"
+        );
+
+        // ⌨ again: keyboard back to the editor, THROUGH the open block —
+        // this is the direction that had no handler at all.
+        st.toggle_keyboard_owner();
+        assert_eq!(st.mode, ComposerMode::Compose);
+        assert_eq!(st.input_override(), Some(InputOverride::Editor));
+        assert_eq!(st.draft, "half typed");
+        assert_eq!(st.pending.len(), 1);
+        // …and it SURVIVES the tick, where a naive retake re-hits the
+        // open-block rejection at the gate and is stepped straight back down.
+        st.tick(&b, &recs, true, true, false, now);
+        assert_eq!(st.mode, ComposerMode::Compose, "the override must persist");
+
+        // Same, with an attributed CLI owning the block.
+        st.tick(&b, &recs, true, true, true, now);
+        assert_eq!(
+            st.mode,
+            ComposerMode::Compose,
+            "an explicit override outranks the automatic CLI yield"
+        );
+    }
+
+    /// The override expires at a GENUINE prompt transition, and the hard raw
+    /// states always outrank it.
+    #[test]
+    fn keyboard_override_expires_honestly() {
+        let now = Instant::now();
+        let b = backend_at_clean_prompt();
+        let recs = vec![open_rec("claude")];
+
+        let mut st = ComposerState::default();
+        st.on_stream_events(HookCounters::exec_last(0, 1), now);
+        st.toggle_keyboard_owner();
+        assert!(st.editor_override());
+        // The command finished: the prompt hand-back returns routing to the
+        // automatic gate.
+        st.on_stream_events(HookCounters::prompt_last(1, 1), now);
+        assert_eq!(st.input_override(), None, "a real prompt expires the override");
+
+        // Alt-screen clears it (passthrough is sacred).
+        let mut alt = TermBackend::new(GridSize::default());
+        alt.set_stream_pos(0);
+        alt.enable_block_scan();
+        alt.advance_live(b"\x1b[?1049h");
+        let mut st = ComposerState::default();
+        st.on_stream_events(HookCounters::exec_last(0, 1), now);
+        st.toggle_keyboard_owner();
+        assert!(st.editor_override());
+        st.tick(&alt, &recs, true, true, false, now);
+        assert_eq!(st.input_override(), None);
+        assert_eq!(st.mode, ComposerMode::Raw(RawReason::AltScreen));
+
+        // Death clears it too.
+        let mut st = ComposerState::default();
+        st.on_stream_events(HookCounters::exec_last(0, 1), now);
+        st.toggle_keyboard_owner();
+        st.tick(&b, &recs, false, true, false, now);
+        assert_eq!(st.input_override(), None);
+        assert_eq!(st.mode, ComposerMode::Raw(RawReason::Dead));
+
+        // …and a reset drops it with the rest of the world.
+        let mut st = ComposerState::default();
+        st.on_stream_events(HookCounters::exec_last(0, 1), now);
+        st.toggle_keyboard_owner();
+        st.on_reset();
+        assert_eq!(st.input_override(), None);
+    }
+
+    /// `kbd_toggle_available`: the slot is live in the states that had no
+    /// route back, and inert exactly where an editor has no business
+    /// existing — most importantly over an ssh password prompt.
+    #[test]
+    fn kbd_toggle_availability_table() {
+        let now = Instant::now();
+        let b = backend_at_clean_prompt();
+        let mut st = ComposerState::default();
+        st.on_stream_events(b.hook_counters(), now);
+
+        // Raw at a prompt / busy / CLI session: available.
+        st.mode = ComposerMode::Raw(RawReason::Busy);
+        assert!(kbd_toggle_available(&st, &b, true));
+        st.mode = ComposerMode::Raw(RawReason::CliSession);
+        assert!(kbd_toggle_available(&st, &b, true));
+        // Leaving the editor is always possible.
+        st.mode = ComposerMode::Compose;
+        assert!(kbd_toggle_available(&st, &b, true));
+
+        // Dead / asleep: inert.
+        st.mode = ComposerMode::Raw(RawReason::Dead);
+        assert!(!kbd_toggle_available(&st, &b, false));
+        st.mode = ComposerMode::Raw(RawReason::Busy);
+        st.asleep = true;
+        assert!(!kbd_toggle_available(&st, &b, true));
+        st.asleep = false;
+
+        // Alt-screen: inert (passthrough unchanged).
+        let mut alt = TermBackend::new(GridSize::default());
+        alt.set_stream_pos(0);
+        alt.enable_block_scan();
+        alt.advance_live(b"\x1b[?1049h");
+        assert!(!kbd_toggle_available(&st, &alt, true));
+
+        // PRE-SHELL (ssh auth, no hook event this lifetime, no latch):
+        // inert — never offer a visible editor over a password prompt.
+        let mut fresh = TermBackend::new(GridSize::default());
+        fresh.set_stream_pos(0);
+        fresh.enable_block_scan();
+        fresh.advance_live(b"tester@host's password: ");
+        let st = ComposerState {
+            mode: ComposerMode::Raw(RawReason::NoPrompt),
+            ..Default::default()
+        };
+        assert!(!kbd_toggle_available(&st, &fresh, true));
+    }
+
+    /// "Queue for the shell" and "send to the program" are DISTINCT
+    /// operations with retained destinations: only a deliberate override over
+    /// a live execution selects the program, and the sacred submit path is
+    /// never diverted.
+    #[test]
+    fn enter_routing_keeps_the_two_destinations_distinct() {
+        // Automatic busy: Enter QUEUES (prime law — `cargo build` unchanged).
+        assert_eq!(
+            enter_action(false, true, true, false),
+            EnterAction::Queue
+        );
+        // Explicit override over a live execution: Enter goes to the program.
+        assert_eq!(
+            enter_action(false, true, true, true),
+            EnterAction::SendToProgram
+        );
+        assert_eq!(
+            enter_action(false, false, false, true),
+            EnterAction::SendToProgram,
+            "an empty draft still sends the bare Enter the reader is waiting for"
+        );
+        // A live prompt always submits: the zero-delay path is untouchable.
+        assert_eq!(enter_action(true, true, false, true), EnterAction::Submit);
+
+        // …and `sends_to_program` is exactly "explicit override + live
+        // execution", never an idle prompt.
+        let now = Instant::now();
+        let b = backend_at_clean_prompt();
+        let recs = vec![open_rec("npm install")];
+        let mut st = ComposerState::default();
+        st.on_stream_events(HookCounters::exec_last(0, 1), now);
+        assert!(!st.sends_to_program(&st.gate_inputs(&b, &recs, true, now)));
+        st.toggle_keyboard_owner();
+        assert!(st.sends_to_program(&st.gate_inputs(&b, &recs, true, now)));
+        // Back at a prompt, the same override (if it somehow survived) is
+        // not a program destination.
+        st.on_stream_events(HookCounters::prompt_last(1, 1), now);
+        let empty: Vec<BlockRec> = Vec::new();
+        assert!(!st.sends_to_program(&st.gate_inputs(&b, &empty, true, now)));
+    }
+
+    /// The toggle never emits bytes — in particular never the `activate()`
+    /// clear chord, which would fire ^C into whatever is running.
+    #[test]
+    fn keyboard_override_never_sends_a_chord() {
+        let now = Instant::now();
+        let mut b = backend_at_clean_prompt();
+        b.advance_live(b"half-typed"); // a DIRTY prompt: activate() would chord
+        let mut st = ComposerState::default();
+        st.on_stream_events(HookCounters::exec_last(0, 1), now);
+        st.toggle_keyboard_owner();
+        assert_eq!(st.mode, ComposerMode::Compose);
+        assert!(
+            st.take_pending_clear().is_none(),
+            "the escape hatch must never write to the PTY"
+        );
+        assert_eq!(st.draft, "", "and never reclaims text it did not ask for");
     }
 
     /// The gate row for the same rule, in isolation: only the PAIR
@@ -9165,9 +9913,7 @@ mod tests {
         // Mirror central.rs order: resolve a pending prompt-end upgrade
         // (:220) BEFORE the tick/gate/pump read it.
         let _ = b.poll_pending_prompt_end(now);
-        let f = b.block_feed.as_ref().unwrap();
-        let (pre, exec) = (f.pre_seen, f.exec_seen);
-        st.on_stream_events(pre, exec, now);
+        st.on_stream_events(b.hook_counters(), now);
         st.tick(b, recs, true, true, false, now);
         if let Some((l, c, cwd, cmd)) = st.take_pending_history_cover() {
             b.add_history_cover(l, c, cwd, cmd);

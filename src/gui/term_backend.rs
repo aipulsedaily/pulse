@@ -170,6 +170,15 @@ pub struct BlockFeed {
     /// stream truth, not grid truth).
     pub pre_seen: u64,
     pub exec_seen: u64,
+    /// ORDER, which the two cumulative counters above cannot carry: a chunk
+    /// holding `pre` then `exec` diffs identically to one holding `exec`
+    /// then `pre`, yet the resting truth is opposite (busy vs. at a prompt).
+    /// `hook_ord` is one sequence over BOTH verbs; `pre_ord`/`exec_ord`
+    /// stamp the last of each, so `pre_ord < exec_ord` ⇔ the latest event in
+    /// this feed was an exec. Never reset except with the counters.
+    hook_ord: u64,
+    pre_ord: u64,
+    exec_ord: u64,
     /// Cursor cell captured at the last `PromptEnd` (OSC 133;B), in the same
     /// grid space as anchors: (line, col). Shifted with history like anchors;
     /// dropped (never remapped) on reflow/saturation/alt-resize — a wrong
@@ -275,6 +284,59 @@ pub struct PresCover {
     pub sig: Option<String>,
 }
 
+/// The composer's per-frame view of the hook stream: how many `pre`/`exec`
+/// hooks this feed has seen, and WHICH OF THE TWO CAME LAST.
+///
+/// The order field is the whole point. The counter pair alone is ambiguous
+/// inside a single Output chunk — `[pre][exec]` and `[exec][pre]` produce
+/// identical diffs — and the composer used to resolve that ambiguity by
+/// always applying exec before pre. A chunk carrying `pre` then `exec` (a
+/// prompt returning and the next command starting: queued submissions, a
+/// `&&` chain, any fast sequence) therefore came to REST at
+/// `at_prompt_since = Some(..)` with `busy_since = None` while a command was
+/// genuinely running — a false prompt latch that masks the open block and
+/// hands the editor the keyboard mid-execution. Ordinals fix it without
+/// inverting the bug (which would break the opposite ordering).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HookCounters {
+    pub pre_seen: u64,
+    pub exec_seen: u64,
+    /// Position of the last `pre` / `exec` in one shared monotonic sequence.
+    /// `pre_ord < exec_ord` ⇔ the latest hook event was an exec.
+    pub pre_ord: u64,
+    pub exec_ord: u64,
+}
+
+impl HookCounters {
+    /// Cumulative counts whose LAST stream event was the prompt (`pre`) —
+    /// the exec-then-pre interleave.
+    pub fn prompt_last(pre_seen: u64, exec_seen: u64) -> Self {
+        Self {
+            pre_seen,
+            exec_seen,
+            pre_ord: pre_seen + exec_seen,
+            exec_ord: exec_seen,
+        }
+    }
+
+    /// The opposite interleave: the LAST stream event was an `exec`, so a
+    /// command is running no matter how many prompts preceded it in the
+    /// same chunk.
+    pub fn exec_last(pre_seen: u64, exec_seen: u64) -> Self {
+        Self {
+            pre_seen,
+            exec_seen,
+            pre_ord: pre_seen,
+            exec_ord: pre_seen + exec_seen,
+        }
+    }
+
+    /// Is the newest hook event an `exec`? (Both at the origin ⇒ false.)
+    pub fn exec_is_latest(&self) -> bool {
+        self.exec_ord > self.pre_ord
+    }
+}
+
 impl BlockFeed {
     fn new(history: usize) -> Self {
         Self {
@@ -287,6 +349,9 @@ impl BlockFeed {
             stale: false,
             pre_seen: 0,
             exec_seen: 0,
+            hook_ord: 0,
+            pre_ord: 0,
+            exec_ord: 0,
             prompt_end: None,
             pending_prompt_end: false,
             covers: Vec::new(),
@@ -647,13 +712,19 @@ impl TermBackend {
                 match &ev.verb {
                     HookVerb::Pre { cwd, .. } => {
                         bf.pre_seen += 1;
+                        bf.hook_ord += 1;
+                        bf.pre_ord = bf.hook_ord;
                         // Feed-time cwd for the lane label (stream truth —
                         // like the counters, valid even under sync deferral).
                         if !cwd.is_empty() {
                             bf.live_cwd = Some(cwd.clone());
                         }
                     }
-                    HookVerb::Exec { .. } => bf.exec_seen += 1,
+                    HookVerb::Exec { .. } => {
+                        bf.exec_seen += 1;
+                        bf.hook_ord += 1;
+                        bf.exec_ord = bf.hook_ord;
+                    }
                     _ => {}
                 }
             }
@@ -1079,6 +1150,21 @@ impl TermBackend {
     /// (`advance`) deliberately don't stamp it: quiet is a LIVE property.
     pub fn last_output_at(&self) -> Option<std::time::Instant> {
         self.last_output_at
+    }
+
+    /// This feed's hook edges AND their order — the composer's whole
+    /// stream-truth input. Hookless/None feeds read as the origin (no
+    /// events), which is exactly what `pre_shell` wants.
+    pub fn hook_counters(&self) -> HookCounters {
+        match &self.block_feed {
+            Some(f) => HookCounters {
+                pre_seen: f.pre_seen,
+                exec_seen: f.exec_seen,
+                pre_ord: f.pre_ord,
+                exec_ord: f.exec_ord,
+            },
+            None => HookCounters::default(),
+        }
     }
 
     /// Freshest feed-time cwd (the last `pre` hook payload that carried

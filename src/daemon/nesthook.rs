@@ -234,6 +234,16 @@ pub(crate) fn open_action(
     OpenAction::Send
 }
 
+/// What an injection-growth tick means (pure). `AwaitQuiet` used to re-base
+/// the quiescence clock and `continue` PAST `open_action`, so OPEN_TIMEOUT —
+/// the only bound on a nested world that never settles — was never evaluated
+/// while output kept arriving. The absolute deadline is asked FIRST now, with
+/// `quiet_for = 0` and every settled-edge signal false, which can only answer
+/// Wait or AbortTimeout.
+pub(crate) fn growth_action(since_armed: Duration) -> OpenAction {
+    open_action(since_armed, Duration::ZERO, false, false, false, false)
+}
+
 /// The phase-2 decision (pure): write the payload once the reader's echo has
 /// settled, and ALWAYS by the deadline — a shell parked in `read` must never
 /// be left waiting.
@@ -554,7 +564,23 @@ impl Core {
                 Phase::AwaitQuiet { armed, last_len, last_change } => {
                     let len = self.journal_len(id).unwrap_or(last_len);
                     if len != last_len {
+                        // ABSOLUTE DEADLINE FIRST. Re-basing the quiescence
+                        // clock and `continue`ing skipped `open_action`
+                        // entirely, so a shell that never stops printing
+                        // (a tail -f, a chatty MOTD loop, a progress bar)
+                        // parked the injection forever: OPEN_TIMEOUT is
+                        // evaluated inside the very call the `continue`
+                        // jumped over. Rebase, then still ask — with
+                        // quiet_for = 0, which can only ever return
+                        // Wait or AbortTimeout.
                         self.rebase_nesthook(id, len, now);
+                        if growth_action(now.duration_since(armed)) == OpenAction::AbortTimeout
+                        {
+                            self.cancel_nesthook(
+                                id,
+                                "the nested shell never settled at a shell prompt",
+                            );
+                        }
                         continue;
                     }
                     let quiet_for = now.duration_since(last_change);
@@ -607,7 +633,15 @@ impl Core {
                 Phase::AwaitEcho { sent, last_len, last_change } => {
                     let len = self.journal_len(id).unwrap_or(last_len);
                     if len != last_len {
+                        // ABSOLUTE DEADLINE FIRST — same defect, same shape:
+                        // `echo_ready`'s ECHO_DEADLINE arm is documented to
+                        // "fire even while output is still streaming", and
+                        // the `continue` was the reason it never did. A shell
+                        // parked in our `read` must never be left waiting.
                         self.rebase_nesthook(id, len, now);
+                        if echo_ready(now.duration_since(sent), Duration::ZERO) {
+                            self.send_nesthook_payload(id);
+                        }
                         continue;
                     }
                     if echo_ready(now.duration_since(sent), now.duration_since(last_change)) {
@@ -986,6 +1020,28 @@ mod tests {
     /// waiting (its output re-bases the settle clock and the next prompt is
     /// still safe); PARTIAL typing abandons it (our line would be appended
     /// to the user's half-typed command).
+    /// astra fix 4a: TIMEOUTS MUST NOT FAIL OPEN UNDER CONTINUOUS OUTPUT.
+    /// Both injection phases used to re-base their quiescence clock on
+    /// journal growth and `continue` PAST the decision that owns the
+    /// absolute deadline - so a nested world that never stops printing could
+    /// hold the injection open indefinitely. The growth path now asks the
+    /// deadline FIRST, with quiet_for = 0.
+    #[test]
+    fn growth_ticks_still_enforce_the_absolute_deadline() {
+        let ms = Duration::from_millis;
+        // Inside the window a growth tick just waits (nothing else can fire:
+        // every settled-edge signal is false while output is still moving).
+        assert_eq!(growth_action(ms(0)), OpenAction::Wait);
+        assert_eq!(growth_action(OPEN_TIMEOUT - ms(1)), OpenAction::Wait);
+        // At the deadline it aborts, no matter how loud the output is.
+        assert_eq!(growth_action(OPEN_TIMEOUT), OpenAction::AbortTimeout);
+        assert_eq!(growth_action(OPEN_TIMEOUT + ms(5000)), OpenAction::AbortTimeout);
+        // Phase 2's companion: the payload deadline fires while output
+        // streams, so a shell parked in our `read` is never left waiting.
+        assert!(!echo_ready(ECHO_DEADLINE - ms(1), Duration::ZERO));
+        assert!(echo_ready(ECHO_DEADLINE, Duration::ZERO));
+    }
+
     #[test]
     fn input_gating() {
         assert!(input_keeps_waiting(true), "a submitted line must not abandon");
