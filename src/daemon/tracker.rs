@@ -450,10 +450,7 @@ fn strip_env_prefix<S: AsRef<str>>(argv: &[S]) -> Option<&[S]> {
             break;
         }
         rest = &rest[1..];
-        loop {
-            let Some(a) = rest.first().map(|t| t.as_ref()) else {
-                break;
-            };
+        while let Some(a) = rest.first().map(|t| t.as_ref()) {
             match a {
                 "-" | "-i" | "--ignore-environment" => rest = &rest[1..],
                 // Value-consuming: the NAME must actually be there.
