@@ -955,6 +955,9 @@ pub(super) fn upgrade_before_launch(
             let mut inner = cli.clone();
             inner.resume_token = Some(new_tok);
             inner.confidence = CliConfidence::Correlated;
+            // env-prefix-cli: a store diff is OUR inference, not the CLI's
+            // word — the clone must not carry the old token's provenance.
+            inner.token_self_reported = false;
             meta.inner_cli = Some(inner.clone());
             core.set_inner_cli(id, Some(inner));
         }
@@ -971,6 +974,7 @@ pub(super) fn upgrade_before_launch(
             let mut inner = cli.clone();
             inner.resume_token = Some(tok);
             inner.confidence = CliConfidence::Correlated;
+            inner.token_self_reported = false;
             meta.inner_cli = Some(inner.clone());
             core.set_inner_cli(id, Some(inner));
             None
@@ -1453,6 +1457,7 @@ mod tests {
             confidence: CliConfidence::Ambiguous,
             cwd: PathBuf::from("/home/alice/proj"),
             nested: false,
+            token_self_reported: false,
         };
         assert!(sidecar_matches(&s, &cli));
         let mut wrong = cli.clone();

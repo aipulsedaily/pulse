@@ -438,6 +438,26 @@ pub struct InnerCli {
     /// proto bump).
     #[serde(default)]
     pub nested: bool,
+    /// env-prefix-cli: the PROVENANCE of `resume_token` — true only when
+    /// the CLI ITSELF named the session it is CURRENTLY in (claude's pid
+    /// registry, an injected SessionStart hook report, the remote tcbeacon).
+    /// False for an ARGV-derived id and for every correlation.
+    ///
+    /// `CliConfidence::Explicit` deliberately does NOT carry this: its own
+    /// doc puts argv and the self-report in "the same trust class", and
+    /// every gate in the daemon that reads `Explicit` means exactly that.
+    /// For ONE decision the two are not the same class, so the distinction
+    /// lives here instead of being smuggled into that enum: appending
+    /// `--resume <sid>` to a replayed launch line
+    /// (`tracker::nested_resume_step`). An argv id is stale the moment the
+    /// user runs `/resume` inside the TUI — `tracker::analyze` says so —
+    /// and on a remote host the pid-registry correction that repairs that
+    /// locally does not exist; a self-report is claude's own answer to
+    /// "which session am I in", refreshed within ~100ms of a `/clear` or
+    /// `/resume`. Appended LAST, serde-default, same wire-order rule as
+    /// `nested` (no proto bump).
+    #[serde(default)]
+    pub token_self_reported: bool,
 }
 
 /// F1 nested-shell breadcrumb: the chain a user built through a privilege /
@@ -475,6 +495,25 @@ pub struct NestedChain {
     /// Wall-clock ms when the episode opened (diagnostics/staleness).
     #[serde(default)]
     pub opened_ms: u64,
+    /// env-prefix-cli: the inner CLI's WITNESSED launch line, verbatim, as
+    /// the injected nested shell's own exec hook reported it — env
+    /// assignments and flags included (`IS_SANDBOX=1 claude
+    /// --dangerously-skip-permissions`), with the `cd '<dir>' &&` head this
+    /// lane itself types stripped back off
+    /// (`tracker::witnessed_launch_line`).
+    ///
+    /// It is the REPLAY witness: a re-establish re-types the line the user
+    /// actually ran instead of composing `<cli> --resume <sid>` from an
+    /// identity. Composing dropped the env prefix and every flag — for a
+    /// `--dangerously-skip-permissions` launch that silently CHANGES the
+    /// security posture of what gets started — and named a session id the
+    /// user may never have asked for (argv lies after an in-TUI `/resume`,
+    /// and the pid-registry correction that fixes that locally does not
+    /// exist on a remote host). Absent ⇒ the composed resume stays the
+    /// fallback, exactly as before. Appended LAST (bincode Snapshot field
+    /// order is wire order, same-exe GUI+daemon rule; no proto bump).
+    #[serde(default)]
+    pub launch_cmd: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1144,6 +1183,7 @@ mod shell_family_tests {
                 confidence: CliConfidence::Explicit,
                 cwd: PathBuf::from("/"),
                 nested: true,
+                token_self_reported: true,
             }),
             hooked: true,
             shell_cfg: None,
@@ -1159,6 +1199,7 @@ mod shell_family_tests {
             entered_cwd: PathBuf::from("/home/dev"),
             cli_cwd: Some(PathBuf::from("/")),
             opened_ms: 42,
+            launch_cmd: Some("IS_SANDBOX=1 claude --dangerously-skip-permissions".into()),
         });
         // Round-trip.
         let json = serde_json::to_string(&meta).unwrap();
@@ -1169,14 +1210,23 @@ mod shell_family_tests {
         let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
         v.as_object_mut().unwrap().remove("nested_chain");
         v["inner_cli"].as_object_mut().unwrap().remove("nested");
+        v["inner_cli"]
+            .as_object_mut()
+            .unwrap()
+            .remove("token_self_reported");
         let old: TerminalMeta = serde_json::from_value(v).unwrap();
         assert!(old.nested_chain.is_none());
-        assert!(!old.inner_cli.unwrap().nested);
+        let old_cli = old.inner_cli.unwrap();
+        assert!(!old_cli.nested);
+        // Pre-existing files carry no provenance: default false = "argv or
+        // worse", the conservative half (no appended resume).
+        assert!(!old_cli.token_self_reported);
         // NestedChain itself is append-tolerant (partial objects load).
         let partial: NestedChain =
             serde_json::from_str(r#"{"cmds":["sudo su"],"entered_cwd":"/h"}"#).unwrap();
         assert_eq!(partial.cli_cwd, None);
         assert_eq!(partial.opened_ms, 0);
+        assert_eq!(partial.launch_cmd, None);
         // load_from: the boot force-reset touches status/reconnecting ONLY —
         // the breadcrumb and its nested identity survive.
         let d = std::env::temp_dir().join(format!("tc-state-nested-{}", Uuid::new_v4()));
