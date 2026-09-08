@@ -7072,7 +7072,7 @@ fn case_pwsh_typed_nested_hooks() -> anyhow::Result<()> {
     // ITEM 4 — the composer consequence. The opener rec CLOSES at the crossed
     // shell's own hooked prompt (the field bug rendered it as a
     // forever-counting Busy span, "Enter queues"), and a prompt certifies.
-    let recs = c.await_blocks(id, 25, |recs| {
+    let recs = c.await_blocks(id, 23, |recs| {
         recs.iter()
             .any(|r| r.cmd.trim() == opener && r.end_off.is_some())
     })?;
@@ -7091,29 +7091,38 @@ fn case_pwsh_typed_nested_hooks() -> anyhow::Result<()> {
     // ...and the strip's cwd is the INNER one. The Win32 tracker ticks about
     // once a second with the LOCAL pwsh PEB in hand, so sampling twice a
     // couple of seconds apart pins the suppression, not just the first report.
-    let posix_cwd = |s: &SharedState| -> Option<String> {
-        s.terminals
-            .iter()
-            .find(|t| t.id == id)
-            .and_then(|t| t.live_cwd.clone())
+    // POLLED, not snapshot-driven: `live_cwd` settles while the injection
+    // runs, and a quiet terminal broadcasts no further Snapshot to wake a
+    // `snapshot_until` predicate. A fresh connection's first Snapshot is
+    // always the CURRENT state.
+    let posix_cwd = || -> String {
+        Conn::open()
+            .ok()
+            .and_then(|mut cc| cc.first_snapshot().ok())
+            .and_then(|st| {
+                st.terminals
+                    .iter()
+                    .find(|t| t.id == id)
+                    .and_then(|t| t.live_cwd.clone())
+            })
             .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
     };
-    let snap = c.snapshot_until(25, |s| {
-        s.terminals.iter().any(|t| {
-            t.id == id
-                && t.live_cwd
-                    .as_ref()
-                    .is_some_and(|p| p.to_string_lossy().starts_with('/'))
-        })
-    })?;
-    let first = posix_cwd(&snap).unwrap_or_default();
-    anyhow::ensure!(
-        first.starts_with('/'),
-        "the strip must show the INNER cwd, got {first:?}"
-    );
-    std::thread::sleep(Duration::from_millis(2500));
-    let snap = c.snapshot_until(10, |_| true)?;
-    let second = posix_cwd(&snap).unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let mut first = posix_cwd();
+    while !first.starts_with('/') {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "the strip must show the INNER cwd, got {first:?}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        first = posix_cwd();
+    }
+    // ...and it STAYS the inner one across Win32 tracker ticks (~1s each):
+    // that is the regression pin for the suppression, not just for the first
+    // report.
+    std::thread::sleep(Duration::from_millis(3500));
+    let second = posix_cwd();
     anyhow::ensure!(
         second.starts_with('/'),
         "the Win32 tracker stamped the LOCAL cwd back over the inner one: {second:?}"
@@ -7169,7 +7178,7 @@ fn case_pwsh_typed_nested_hooks() -> anyhow::Result<()> {
         );
         std::thread::sleep(Duration::from_millis(500));
     }
-    let snap = c.snapshot_until(20, |s| {
+    let snap = c.snapshot_until(21, |s| {
         s.terminals.iter().any(|t| {
             t.id == id
                 && t.nested_chain

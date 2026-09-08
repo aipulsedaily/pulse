@@ -77,6 +77,20 @@ enum Phase {
     /// field bug this closes. `since` bounds the wait: an unhookable shell
     /// (dash/fish, no base64) still gets its resume, just unattributed.
     AwaitNestedPrompt { since: Instant },
+    /// typed-ssh-nested: a chain step settled, and a hook injection into the
+    /// shell THAT STEP just opened is still in flight — the NEXT step is held
+    /// here until that shell reports its own hooked prompt.
+    ///
+    /// Same ordering rule as `AwaitNestedPrompt`, one link earlier. It only
+    /// became load-bearing with typed remote shells, because they are the
+    /// first common MULTI-step chain (`ssh <host>` then `sudo su`; v0.1.14's
+    /// field chains were all one step). Typing step 2 into the shell step 1
+    /// opened, while Pulse is mid-injection into it, lands the reader line in
+    /// the WRONG shell: the injection then hooks the innermost world but
+    /// labels it depth 1, and the shell in between is left unhooked.
+    /// `since` bounds the hold (`NESTED_HOOK_WAIT`) so an unhookable step
+    /// still gets the rest of its chain, just unhooked at that link.
+    AwaitStepHooked { since: Instant, next: usize },
 }
 
 /// How long after the prompt witness before the step is typed (one pump
@@ -188,6 +202,12 @@ fn pre_consumes(phase: &Phase) -> bool {
 /// that is one tick away from being hooked would run UNWITNESSED and leave
 /// the breadcrumb incomplete for the next reconnect — the exact loop this
 /// feature closes.
+///
+/// typed-ssh-nested: the SAME gate now governs one more edge — the NEXT
+/// CHAIN STEP (`Phase::AwaitStepHooked`). The rule is identical ("do not type
+/// into a shell that is one tick from being hooked"); only the line being
+/// typed differs, so the two edges share this predicate rather than growing a
+/// second, driftable copy.
 pub(crate) fn resume_may_send(nest: NestState) -> bool {
     !matches!(nest, NestState::Pending)
 }
@@ -307,6 +327,11 @@ impl Core {
                 // and the OUTER prompt spoke instead — the nested shell is
                 // gone; the resume must not be typed at the login shell.
                 Phase::AwaitNestedPrompt { .. } => map.remove(&id),
+                // typed-ssh-nested: same rule one link earlier — the outer
+                // prompt returning while a step's hooks were landing means
+                // that step collapsed; the rest of the chain must not be
+                // typed at the login shell.
+                Phase::AwaitStepHooked { .. } => map.remove(&id),
             };
             (consumed, aborted)
         };
@@ -414,6 +439,7 @@ impl Core {
         type WatchRow = (Uuid, Instant, u64, Instant, bool);
         let now = Instant::now();
         let parked: Vec<Uuid>;
+        let step_holds: Vec<(Uuid, usize, Instant)>;
         let (due_sends, watching): (Vec<(Uuid, usize)>, Vec<WatchRow>) = {
             let map = self.reestablish.lock();
             if map.is_empty() {
@@ -426,6 +452,14 @@ impl Core {
                 .iter()
                 .filter_map(|(id, e)| match e.phase {
                     Phase::AwaitNestedPrompt { since } if now.duration_since(since) >= NESTED_HOOK_WAIT => Some(*id),
+                    _ => None,
+                })
+                .collect();
+            // typed-ssh-nested: steps held for the previous step's injection.
+            step_holds = map
+                .iter()
+                .filter_map(|(id, e)| match e.phase {
+                    Phase::AwaitStepHooked { since, next } => Some((*id, next, since)),
                     _ => None,
                 })
                 .collect();
@@ -458,6 +492,22 @@ impl Core {
                     "the nested shell never reported hooks — resuming unattributed",
                 );
             }
+        }
+        // typed-ssh-nested: release a held step the moment the previous
+        // step's injection resolves — hooked, or honestly given up — and
+        // release it anyway once the hold outlives that give-up, so an
+        // unhookable link never costs the rest of the chain.
+        for (id, next, since) in step_holds {
+            let expired = now.duration_since(since) >= NESTED_HOOK_WAIT;
+            if !expired && !resume_may_send(self.nesthook_state(id)) {
+                continue;
+            }
+            if expired {
+                log::info!(
+                    "terminal {id}: nested chain re-establish — the previous step never reported hooks; typing on"
+                );
+            }
+            self.send_reestablish_step(id, next);
         }
         for (id, step) in due_sends {
             self.send_reestablish_step(id, step);
@@ -528,6 +578,21 @@ impl Core {
                 WatchAction::Next => {
                     let next = self.reestablish.lock().get(&id).map(|e| e.idx + 1);
                     if let Some(next) = next {
+                        // typed-ssh-nested: the step settled, but Pulse may
+                        // be mid-injection into the shell it just opened.
+                        // Typing the next step now would push the reader
+                        // line into the wrong shell — park instead (the
+                        // `AwaitNestedPrompt` rule, one link earlier).
+                        if !resume_may_send(self.nesthook_state(id)) {
+                            if let Some(e) = self.reestablish.lock().get_mut(&id) {
+                                e.phase = Phase::AwaitStepHooked { since: now, next };
+                            }
+                            log::debug!(
+                                "terminal {id}: holding chain step {} for the previous step's hooks",
+                                next + 1
+                            );
+                            continue;
+                        }
                         self.send_reestablish_step(id, next);
                     }
                 }

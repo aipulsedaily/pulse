@@ -1022,5 +1022,19 @@ mod tests {
             !reestablish::resume_may_send(NestState::Pending),
             "an in-flight injection must park the resume"
         );
+        // typed-ssh-nested: the same predicate now gates the NEXT CHAIN STEP
+        // too (`Phase::AwaitStepHooked`). Typed remote shells are the first
+        // common multi-step chain (`ssh <host>` then `sudo su`), and typing
+        // step 2 mid-injection put the reader line in the WRONG shell — the
+        // innermost world hooked but labelled depth 1, the shell in between
+        // left unhooked. Both edges must read the identical rule, which is
+        // what sharing this function guarantees.
+        for nest in [NestState::Absent, NestState::Pending, NestState::Hooked] {
+            assert_eq!(
+                reestablish::resume_may_send(nest),
+                nest != NestState::Pending,
+                "the step edge and the resume edge must agree for {nest:?}"
+            );
+        }
     }
 }
