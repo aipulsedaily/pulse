@@ -38,8 +38,38 @@ const RECONNECT_BACKOFF: [Duration; 3] = [
     Duration::from_secs(30),
 ];
 /// F1: the manual ladder's backoff ceiling — every rung past the table
-/// repeats at this pace, forever, until success or Cancel.
+/// repeats at this pace, forever, until success or Cancel. The user asked
+/// for this one explicitly ("keep trying until my server is back") and is
+/// watching it, so it stays fast.
 const MANUAL_BACKOFF_CEILING: Duration = Duration::from_secs(30);
+
+/// The AUTOMATIC ladder's tail, past `RECONNECT_BACKOFF`.
+///
+/// Field report: the auto ladder used to give up after those three rungs —
+/// about 42 seconds — and then the terminal just sat Dead. One user's log
+/// shows four ssh terminals giving up within the same second during a single
+/// network outage; a second user's laptop sleeps overnight and his sessions
+/// are simply gone in the morning, so he retypes every ssh by hand. Forty-two
+/// seconds answers a hiccup, not an outage, and "reinstate when the
+/// connection comes back" is the actual ask.
+///
+/// So the automatic ladder no longer gives up either. It does back OFF
+/// harder than the manual one, because nobody is watching it: re-dialling an
+/// unreachable host every 30s all night is ~2,900 attempts, each a process
+/// spawn and a DNS/TCP timeout. This tail reaches the ceiling in about 20
+/// minutes and then costs ~96 attempts a day, while still restoring a
+/// sleeping laptop's sessions within a quarter of an hour of it waking.
+const AUTO_BACKOFF_TAIL: [Duration; 4] = [
+    Duration::from_secs(60),
+    Duration::from_secs(120),
+    Duration::from_secs(300),
+    Duration::from_secs(600),
+];
+/// Where the automatic tail settles, repeating forever until success or
+/// Cancel. Fifteen minutes is the compromise between "my machine woke up and
+/// my sessions came back on their own" and "do not hammer a host that is
+/// genuinely gone".
+const AUTO_BACKOFF_CEILING: Duration = Duration::from_secs(900);
 /// How long a spawned reconnect attempt may run without its hooks arming
 /// before supervision stops (the attempt itself is LEFT RUNNING — it may be
 /// sitting at an interactive auth prompt, which is a usable terminal).
@@ -57,18 +87,26 @@ fn reconnect_backoff_after(attempts_done: u32, manual: bool) -> Option<Duration>
     if let Ok(ms) = std::env::var("TC_RETRY_BACKOFF_MS") {
         if crate::state::data_dir_overridden() {
             if let Ok(ms) = ms.parse::<u64>() {
-                let flat = Duration::from_millis(ms.clamp(50, 60_000));
-                return (manual || (attempts_done as usize) < RECONNECT_BACKOFF.len())
-                    .then_some(flat);
+                // Both ladders are unlimited now, so the staging override is
+                // too — a probe can drive any rung in seconds.
+                return Some(Duration::from_millis(ms.clamp(50, 60_000)));
             }
         }
     }
-    let table = RECONNECT_BACKOFF.get(attempts_done as usize).copied();
-    if manual {
-        Some(table.unwrap_or(MANUAL_BACKOFF_CEILING))
-    } else {
-        table
+    let i = attempts_done as usize;
+    if let Some(d) = RECONNECT_BACKOFF.get(i).copied() {
+        return Some(d);
     }
+    if manual {
+        return Some(MANUAL_BACKOFF_CEILING);
+    }
+    // Automatic: the slower tail, then its own ceiling, forever.
+    Some(
+        AUTO_BACKOFF_TAIL
+            .get(i - RECONNECT_BACKOFF.len())
+            .copied()
+            .unwrap_or(AUTO_BACKOFF_CEILING),
+    )
 }
 
 /// nested-death reinstate: the delay before replaying a nested opener after
@@ -242,10 +280,17 @@ impl Core {
         Ok(())
     }
 
-    /// After `attempts_done` failed attempts: schedule the next backoff step
-    /// or give up (terminal stays Dead; the ordinary Restore affordances and
-    /// boot-restore semantics apply from here). A manual ladder never gives
-    /// up — `reconnect_backoff_after` returns the 30s ceiling forever.
+    /// After `attempts_done` failed attempts: schedule the next backoff step.
+    ///
+    /// NEITHER ladder gives up any more. The manual one never did; the
+    /// automatic one used to stop after three rungs (~42s) and leave the
+    /// terminal Dead, which is what made a single network outage lose four of
+    /// a user's sessions at once and an overnight laptop sleep lose all of
+    /// them. It now climbs the slower `AUTO_BACKOFF_TAIL` to a 15-minute
+    /// ceiling and keeps going until it succeeds, the user cancels, or the
+    /// per-attempt auth-wall stop fires. The `None` arm is kept as the
+    /// defensive path: a ladder that somehow yields no delay must stop
+    /// cleanly rather than spin.
     pub(super) fn advance_reconnect(&self, id: Uuid, attempts_done: u32, manual: bool) {
         let Some(delay) = reconnect_backoff_after(attempts_done, manual) else {
             log::info!(
@@ -253,6 +298,7 @@ impl Core {
             );
             self.reconnects.lock().remove(&id);
             self.set_reconnecting_flag(id, false);
+            self.set_retry_progress(id, 0, 0);
             return;
         };
         log::info!("terminal {id}: ssh reconnect attempt {attempts_done} failed — next in {delay:?}");
@@ -265,10 +311,11 @@ impl Core {
                 manual,
             },
         );
-        if manual {
-            // Honest lane: `retrying — attempt N · next in Ss`.
-            self.set_retry_progress(id, attempts_done, delay.as_secs() as u32);
-        }
+        // Honest lane: `retrying — attempt N · next in Ss`. The AUTOMATIC
+        // ladder reports too, now that it no longer gives up: an unbounded
+        // supervision the user cannot see would be worse than the old
+        // give-up, and this is also what puts Cancel in front of them.
+        self.set_retry_progress(id, attempts_done, delay.as_secs() as u32);
     }
 
     /// The backoff engine, riding the 250ms flush tick. Fires due attempts
@@ -340,8 +387,7 @@ impl Core {
                         );
                     } else {
                         log::info!(
-                            "terminal {id}: ssh reconnect attempt {attempt}/{}",
-                            RECONNECT_BACKOFF.len()
+                            "terminal {id}: ssh reconnect attempt {attempt} (auto, unlimited)"
                         );
                     }
                     self.reconnects.lock().insert(
@@ -353,10 +399,9 @@ impl Core {
                             manual: rc.manual,
                         },
                     );
-                    if rc.manual {
-                        // In flight: `retrying — attempt N…` (next_s = 0).
-                        self.set_retry_progress(id, attempt, 0);
-                    }
+                    // In flight: `retrying — attempt N…` (next_s = 0). Both
+                    // ladders report; see `advance_reconnect`.
+                    self.set_retry_progress(id, attempt, 0);
                     // This pump rides the 250ms journal-fsync tick, and the
                     // launch may run a remote CLI-resume probe (a blocking
                     // sftp leg, 10-25s against an unreachable host — exactly
@@ -484,21 +529,56 @@ impl Core {
 mod tests {
     use super::*;
 
-    /// SSH auto-reconnect: the backoff table (2s/10s/30s then give up for
-    /// the AUTO lane; 30s-ceiling UNLIMITED for the MANUAL lane — F1, the
-    /// user's "keep retrying until my server is back") and the qualification
-    /// truth table. The state machine's transitions ride these pure
-    /// functions; the live paths are probes `ssh_reconnect` and
-    /// `dead_retry_manual`.
+    /// SSH auto-reconnect: the backoff table and the qualification truth
+    /// table. The state machine's transitions ride these pure functions; the
+    /// live paths are probes `ssh_reconnect` and `dead_retry_manual`.
+    ///
+    /// FIELD BUG: the AUTO lane used to be 2s/10s/30s and then GIVE UP —
+    /// about 42 seconds. One user's daemon.log shows four ssh terminals
+    /// giving up inside the same second during one outage; another user's
+    /// laptop sleeps overnight and every session is gone by morning. Both
+    /// ladders are unlimited now; the auto one climbs a slower tail so an
+    /// unattended retry against a genuinely dead host costs ~96 attempts a
+    /// day instead of ~2,900.
     #[test]
     fn reconnect_backoff_and_qualification() {
         assert_eq!(reconnect_backoff_after(0, false), Some(Duration::from_secs(2)));
         assert_eq!(reconnect_backoff_after(1, false), Some(Duration::from_secs(10)));
         assert_eq!(reconnect_backoff_after(2, false), Some(Duration::from_secs(30)));
+        // THE REGRESSION: this was `None` (give up) and must never be again.
         assert_eq!(
             reconnect_backoff_after(3, false),
-            None,
-            "auto: 3 attempts then give up"
+            Some(Duration::from_secs(60)),
+            "auto must NOT give up after the table"
+        );
+        assert_eq!(reconnect_backoff_after(4, false), Some(Duration::from_secs(120)));
+        assert_eq!(reconnect_backoff_after(5, false), Some(Duration::from_secs(300)));
+        assert_eq!(reconnect_backoff_after(6, false), Some(Duration::from_secs(600)));
+        for n in [7u32, 8, 100, 10_000] {
+            assert_eq!(
+                reconnect_backoff_after(n, false),
+                Some(Duration::from_secs(900)),
+                "auto attempt {n} rests at the 15min ceiling — unlimited, not give-up"
+            );
+        }
+        // The ladder is monotonic and reaches its ceiling in a sane time: a
+        // laptop that wakes gets its sessions back within ~15 minutes, and
+        // the first 20 minutes of an outage cost only a handful of dials.
+        let mut prev = Duration::ZERO;
+        let mut total = Duration::ZERO;
+        for n in 0..7u32 {
+            let d = reconnect_backoff_after(n, false).unwrap();
+            assert!(d >= prev, "rung {n} must not go backwards");
+            prev = d;
+            total += d;
+        }
+        assert!(
+            total <= Duration::from_secs(20 * 60),
+            "the ramp must reach its ceiling within ~20min, got {total:?}"
+        );
+        assert!(
+            reconnect_backoff_after(50, false).unwrap() >= MANUAL_BACKOFF_CEILING,
+            "an unattended ladder must back off at least as hard as a watched one"
         );
 
         // F1 — the manual ladder shares the table's ramp, then NEVER gives

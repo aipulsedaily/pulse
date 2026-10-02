@@ -2043,6 +2043,12 @@ mod tests {
             "distrobox enter arch",
             "toolbox enter",
             "toolbox enter fedora-40",
+            // Gated wsl flags (field report "WSL is still a little iffy"):
+            // ordinary interactive invocations that used to fall through.
+            "wsl -u root",
+            "wsl --user root",
+            "wsl --cd /tmp",
+            "wsl -d Ubuntu -u root",
         ] {
             assert!(nested_shell_cmd(cmd), "{cmd:?} must classify nested");
         }
@@ -2094,9 +2100,16 @@ mod tests {
             "sshfs host:/ /mnt",
             "wsl ls",
             "wsl -e bash",
+            // Microsoft's internal system distro, not the user's shell.
             "wsl --system",
             "wsl -d Ubuntu ls",
-            "wsl -u root",
+            // `wsl -u root` MOVED to the positive set above (field report
+            // "WSL is still a little iffy"): the known value-consuming flags
+            // are gated now instead of refused wholesale. These keep failing
+            // for their own reasons — a command operand, and a flag-value
+            // miss.
+            "wsl -u root ls",
+            "wsl -u",
             "docker exec web bash",            // no -it
             "docker exec -i web bash",         // no tty
             "docker exec -t web bash",         // no stdin
@@ -2622,6 +2635,150 @@ mod tests {
     }
 
     /// Nested-cli-resume regression (hypothesis c): re-witnessing the SAME
+    /// WSL typed-opener classification, pinned shape by shape.
+    ///
+    /// The user reports WSL terminals being "a little iffy" with no repro.
+    /// This is the sharpest edge I can name: only the two BARE shapes are
+    /// recognised as a nested shell, and `wsl_interactive_shell` is
+    /// deliberately kept in lockstep with `wsl_family` so a typed `wsl` and a
+    /// `wsl` TERMINAL can never disagree. Everything else — including the
+    /// perfectly ordinary `wsl -u root` and `wsl --cd <dir>` — falls through.
+    ///
+    /// Falling through is NOT silent: the typed opener reads as an ordinary
+    /// long-running command, so there is no breadcrumb, no hook injection
+    /// into the distro, and the Win32 cwd tracker keeps stamping the local
+    /// Windows path over the POSIX one the user is actually in (the field
+    /// shape `track_hook_exec` quotes: "the composer still shows the LOCAL
+    /// cwd").
+    ///
+    /// This test does not assert that the gap is RIGHT — it asserts what the
+    /// gap IS, so that closing it is a deliberate act that must change both
+    /// classifiers together, and so the next person does not have to
+    /// rediscover the list.
+    #[test]
+    fn wsl_typed_opener_classification_table() {
+        // Recognised: the bare shapes, exactly the two `wsl_family` hooks.
+        for ok in ["wsl", "wsl.exe", "wsl -d Ubuntu", "wsl --distribution Ubuntu"] {
+            assert!(nested_shell_cmd(ok), "{ok} must classify");
+            assert!(crosses_to_posix(ok), "{ok} must cross to POSIX");
+        }
+        // A distro name with spaces now survives, since the tokeniser is
+        // quote-aware (it did not before `split_ws_quoted`).
+        assert!(nested_shell_cmd(r#"wsl -d "My Distro""#));
+
+        // Correctly refused: these run a finite command, not a shell.
+        for finite in [
+            "wsl -e bash -lc ls",
+            "wsl --exec ls",
+            "wsl -- ls",
+            "wsl ls",
+            "wsl --status",
+            "wsl -l -v",
+            "wsl --shutdown",
+            "wsl --terminate Ubuntu",
+        ] {
+            assert!(!nested_shell_cmd(finite), "{finite} is not an interactive shell");
+        }
+
+        // THE FIX (field report "WSL is still a little iffy"): ordinary
+        // interactive shapes that used to fall through, because the old rule
+        // was `matches!(args, [] | ["-d"|"--distribution", _])` and refused
+        // everything else. They are now gated with the same discipline ssh's
+        // `-i`/`-p` and the `env` prefix already use: known flags consumed
+        // with their values.
+        for ok in [
+            "wsl -u root",
+            "wsl --user root",
+            "wsl --cd /tmp",
+            "wsl --cd ~",
+            "wsl -d Ubuntu -u root",
+            "wsl -u root -d Ubuntu",
+            "wsl --distribution Ubuntu --user root --cd /srv",
+            "wsl --shell-type login",
+            "wsl --shell-type standard -d Ubuntu",
+            r#"wsl --cd "C:\my project""#,
+        ] {
+            assert!(nested_shell_cmd(ok), "{ok} must now classify");
+            assert!(crosses_to_posix(ok), "{ok} must cross to POSIX");
+        }
+
+        // Still refused, deliberately:
+        for no in [
+            // Asks for no shell at all.
+            "wsl --shell-type none",
+            // Microsoft's internal system distro — not the user's shell, and
+            // it may not even have bash.
+            "wsl --system",
+            // A flag-value miss is never a guess.
+            "wsl -u",
+            "wsl -d",
+            "wsl --cd",
+            // Unrecognised flags keep the exotic-argv doctrine.
+            "wsl --no-such-flag",
+            "wsl -x",
+            // A command operand after the flags is a finite session.
+            "wsl -u root ls",
+            "wsl --cd /tmp -- ls",
+            "wsl -d Ubuntu -e bash -lc ls",
+        ] {
+            assert!(!nested_shell_cmd(no), "{no} must stay refused");
+        }
+    }
+
+    /// The typed classifier and the TERMINAL classifier must stay in step for
+    /// every shape a terminal can actually be spawned with — the invariant
+    /// `wsl_interactive_shell` was written to hold. The typed lane is a
+    /// deliberate superset (`--cd`/`--shell-type` cannot ride a spawn because
+    /// `synth_wsl_args` emits its own); this pins both halves so the
+    /// divergence can only ever be the documented one.
+    #[test]
+    fn wsl_typed_and_terminal_classifiers_agree() {
+        use crate::state::{shell_family, ShellFamily, TermKind};
+        let fam = |args: &[&str]| {
+            let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            shell_family(&TermKind::Shell, "wsl.exe", &owned)
+        };
+        // Hooked at terminal level AND typed level.
+        for (args, distro) in [
+            (vec![], None),
+            (vec!["-d", "Ubuntu"], Some("Ubuntu")),
+            (vec!["--distribution", "Ubuntu"], Some("Ubuntu")),
+            (vec!["-u", "root"], None),
+            (vec!["--user", "root"], None),
+            (vec!["-d", "Ubuntu", "-u", "root"], Some("Ubuntu")),
+            (vec!["-u", "root", "-d", "Ubuntu"], Some("Ubuntu")),
+        ] {
+            assert_eq!(
+                fam(&args),
+                ShellFamily::WslShell {
+                    distro: distro.map(str::to_string)
+                },
+                "terminal-level: wsl {args:?}"
+            );
+            assert!(
+                crate::state::wsl_interactive_shell(&args),
+                "typed-level: wsl {args:?}"
+            );
+        }
+        // The documented divergence: typed yes, terminal no, because the
+        // synthesized tail already carries its own --cd/--exec.
+        for args in [vec!["--cd", "/tmp"], vec!["--shell-type", "login"]] {
+            assert!(crate::state::wsl_interactive_shell(&args));
+            assert_eq!(fam(&args), ShellFamily::Other, "spawn would duplicate the flag");
+        }
+        // Refused by both.
+        for args in [
+            vec!["--system"],
+            vec!["-e", "bash"],
+            vec!["--"],
+            vec!["ls"],
+            vec!["-u"],
+        ] {
+            assert!(!crate::state::wsl_interactive_shell(&args), "typed: {args:?}");
+            assert_eq!(fam(&args), ShellFamily::Other, "terminal: {args:?}");
+        }
+    }
+
     /// FIELD BUG (second user): his opener is
     /// `ssh -i "C:\…\hosting.pem" ubuntu@52.201.138.138`. Tokenised with
     /// `split_whitespace` the quoted key path shattered, `-i` ate `"C:\…`,
