@@ -346,6 +346,30 @@ impl complete::RemoteDirs for CompCache {
     }
 }
 
+/// remote-completion: the listing cache a terminal's composer is handed —
+/// for EVERY terminal, whenever the daemon speaks the protocol (proto 14).
+///
+/// v0.1.20 handed over `comp_cache.get(&id)`: None until an entry existed,
+/// while only an ask or an answer ever created one, and `enumerate` reads a
+/// missing cache as "nothing to ask". The first ask could never be produced
+/// — `cd pr<Tab>` inside a real ssh session did nothing, forever (the field
+/// bug). Creating it only for terminals that LOOK remote meant a second copy
+/// of the planner's own rule, free to drift from it. There is nothing to
+/// decide: a local plan never consults the cache (`enumerate` reads it only
+/// for a `Dir::Remote` plan and a WSL access-denied fall-through), so an
+/// empty one costs a map entry and nothing else.
+fn comp_cache_for(
+    caches: &mut HashMap<Uuid, CompCache>,
+    id: Uuid,
+    supported: bool,
+) -> Option<&CompCache> {
+    if supported {
+        Some(caches.entry(id).or_default())
+    } else {
+        None
+    }
+}
+
 /// QOL §3.3: the local directory a terminal's cwd maps to (pure, tested).
 /// Win-namespace shells/CLIs: live_cwd else the persisted cwd. WSL: posix
 /// `/mnt/<drive>/…` translates back to the drive form (nicer than UNC);
@@ -3065,6 +3089,26 @@ impl App {
                 // or relative request hits the same answer instead of
                 // re-asking for it.
                 D2C::Completion { id, asked, dir, found, trunc, entries } => {
+                    // Observability (v0.1.21): paired 1:1 with the `asking
+                    // for` line central.rs writes, so the log alone separates
+                    // "never asked" from "asked, got nothing" from "asked,
+                    // answered, still did not complete" — the three outcomes
+                    // v0.1.20 could not be told apart.
+                    log::info!(
+                        "terminal {id}: remote completion of {asked} answered{} — {}",
+                        if dir == asked {
+                            String::new()
+                        } else {
+                            format!(" (resolved {dir})")
+                        },
+                        if !found {
+                            "nothing".to_string()
+                        } else if trunc {
+                            "over the listing cap, dropped".to_string()
+                        } else {
+                            format!("{} entries", entries.len())
+                        }
+                    );
                     let c = self.comp_cache.entry(id).or_default();
                     c.pending.remove(&asked);
                     let listing = found.then(|| complete::RemoteListing {
@@ -6948,6 +6992,56 @@ pub fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// remote-completion, the v0.1.20 field bug at the seam that shipped it:
+    /// the FIRST Tab in a remote world must be able to ask. It can only if the
+    /// app hands the composer a cache before any ask exists — so this drives
+    /// the real `ComposerState` through a real Tab with exactly what the app
+    /// hands it, and pins that `central.rs` hands it exactly that.
+    #[test]
+    fn the_app_hands_every_composer_a_cache_its_first_tab_can_ask_with() {
+        use super::*;
+        let id = Uuid::new_v4();
+
+        // The user's shape: a pwsh terminal whose tracked cwd is a POSIX path
+        // on the far side of a typed `ssh`, no cache entry yet.
+        let mut caches = HashMap::new();
+        let mut st = composer::ComposerState::for_draft("cd pr", complete::Family::Pwsh);
+        let remote = comp_cache_for(&mut caches, id, true)
+            .map(|c| c as &dyn complete::RemoteDirs);
+        assert!(remote.is_some(), "a proto-14 daemon's terminal must be handed a cache");
+        assert_eq!(st.tab_press(Some("/home/dev"), 5, 1, remote), None);
+        assert_eq!(
+            st.take_comp_request().as_deref(),
+            Some("/home/dev"),
+            "the very first Tab in a remote world must ask"
+        );
+
+        // An older daemon cannot answer: nothing is handed over, nothing asked.
+        let mut caches = HashMap::new();
+        let mut st = composer::ComposerState::for_draft("cd pr", complete::Family::Pwsh);
+        assert!(comp_cache_for(&mut caches, id, false).is_none());
+        assert!(caches.is_empty());
+        assert_eq!(st.tab_press(Some("/home/dev"), 5, 1, None), None);
+        assert_eq!(st.take_comp_request(), None);
+
+        // The frame loop is not unit-drivable, so pin the wiring itself:
+        // `central.rs` must hand the composer `comp_cache_for`'s answer. The
+        // v0.1.20 spelling (`self.comp_cache.get(&id)`) is the bug.
+        let central = include_str!("central.rs");
+        assert!(
+            central.contains("comp_cache_for(&mut self.comp_cache, id, comp_supported)"),
+            "central.rs no longer hands the composer comp_cache_for's cache"
+        );
+        assert!(
+            central.contains("let comp_supported = self.completion_supported();"),
+            "central.rs no longer keys the cache on the daemon's protocol alone"
+        );
+        assert!(
+            !central.contains("self.comp_cache.get(&id)"),
+            "central.rs hands the composer a cache that may not exist yet"
+        );
+    }
+
     use super::*;
     use std::path::Path;
 

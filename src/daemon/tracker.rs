@@ -905,7 +905,19 @@ pub enum NestedEnd {
 /// > error occurred.
 ///
 /// So 255 is "ssh itself could not keep the connection" — a dropped link,
-/// a timed-out TCP session after a laptop sleep, a refused reconnect. Every
+/// a timed-out TCP session after a laptop sleep, a refused reconnect.
+///
+/// **And -1.** OpenSSH starts its exit status at -1 and only overwrites it
+/// when the server sends the remote command's status; a link lost before
+/// that exits with the -1 itself. Unix truncates it to 255, but Windows
+/// OpenSSH (the `ssh.exe` a pwsh terminal runs) reports it whole, so in a
+/// pwsh terminal a dropped link reads `$LASTEXITCODE` = -1 — while connect
+/// and auth failures, which leave through `fatal()`, read 255. Knowing only
+/// 255 meant the honest case (a session that was up, then dropped) never
+/// replayed on Windows at all. A remote exit status is always 0..=255, so
+/// -1 can only mean "no status: the link was lost". Probe
+/// `nested_death_reinstate` found it, killing a hooked session from the far
+/// side. Every
 /// other status belongs to the remote side (`exit 3` in the remote shell
 /// returns 3) and is therefore the user's own doing. Other crossing openers
 /// (`wsl`, `docker exec`) are deliberately NOT given a death verdict: a
@@ -959,7 +971,7 @@ pub fn nested_end_verdict(
         // A clean logout is the user's doing, always — a live ladder does
         // not change that, it ends it.
         Some(0) => NestedEnd::Deliberate,
-        Some(255) => NestedEnd::Died,
+        Some(255) | Some(-1) => NestedEnd::Died,
         // See the `$LASTEXITCODE` note above: an identical repeat folds to 1,
         // so mid-ladder any failure continues the ladder.
         Some(_) if ladder_live => NestedEnd::Died,
@@ -2883,6 +2895,9 @@ mod tests {
             Died
         );
 
+        // Windows OpenSSH reports a link lost before any exit status as -1,
+        // not 255 (Unix truncates the same -1 to 255).
+        assert_eq!(nested_end_verdict(Some("ssh user@host"), Some(-1), false), Died);
         // A clean logout is the user's doing — never resurrect it.
         assert_eq!(nested_end_verdict(Some("ssh user@host"), Some(0), false), Deliberate);
         // So is any other status: that one belongs to the REMOTE command

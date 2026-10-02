@@ -1005,6 +1005,20 @@ pub struct ComposerState {
     heur_cover_row: Option<i32>,
 }
 
+impl ComposerState {
+    /// A composer carrying one draft and one family, everything else at its
+    /// default. The private fields make struct-update syntax unusable outside
+    /// this module, and the live `nested_completion` probe has to build a
+    /// composer in a known state to drive a real Tab through it.
+    pub fn for_draft(draft: impl Into<String>, fam: complete::Family) -> Self {
+        Self {
+            draft: draft.into(),
+            fam,
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for ComposerState {
     fn default() -> Self {
         Self {
@@ -5714,6 +5728,47 @@ mod tests {
         let mut st = drafted("cd al");
         assert_eq!(st.tab_press(Some(r"C:\nope\xyz"), 5, 1, Some(&rem)), None);
         assert_eq!(st.take_comp_request(), None, "a local plan never asks");
+    }
+
+    /// THE v0.1.20 FIELD BUG at the seam that shipped it: the very first Tab
+    /// in a remote world asks ONLY if the app has already handed the composer
+    /// a cache. `central.rs` passed `None` (its `comp_cache` had no entry
+    /// yet), `None` reads as "nothing to ask", and the ask that would have
+    /// created the entry was never produced — `cd pr<Tab>` inside a real ssh
+    /// session did nothing, forever. The app side is pinned by
+    /// `gui::tests::the_app_hands_every_composer_a_cache_its_first_tab_can_ask_with`.
+    #[test]
+    fn the_first_tab_in_a_remote_world_must_be_given_a_cache() {
+        let mut st = drafted("cd pr");
+        assert_eq!(st.fam, complete::Family::Pwsh, "the SPAWN family is pwsh");
+
+        // What v0.1.20 did: no cache ⇒ no ask, no edit, nothing to log.
+        assert_eq!(st.tab_press(Some("/home/dev"), 5, 1, None), None);
+        assert_eq!(st.draft, "cd pr");
+        assert_eq!(
+            st.take_comp_request(),
+            None,
+            "this is the dead end: nothing was ever asked for"
+        );
+
+        // With the cache the app now creates up front: the same press parks
+        // the ask, and the answer completes it on a later frame.
+        let mut rem = FakeRemote::default();
+        assert_eq!(st.tab_press(Some("/home/dev"), 5, 1, Some(&rem)), None);
+        assert_eq!(
+            st.take_comp_request().as_deref(),
+            Some("/home/dev"),
+            "an EMPTY cache still asks — that is the whole difference"
+        );
+        rem.answer(
+            "/home/dev",
+            &[("pre-migration-backup", true), ("pre", true), ("prod.log", false)],
+        );
+        st.tab_retry(Some("/home/dev"), Some(&rem)).unwrap();
+        assert_eq!(st.draft, "cd pre/");
+        // His directory is the next candidate in the cycle, dirs first.
+        st.tab_press(Some("/home/dev"), 7, 1, Some(&rem)).unwrap();
+        assert_eq!(st.draft, "cd pre-migration-backup/");
     }
 
     /// The user always wins: a keystroke (or a submit, or Ctrl-R) between

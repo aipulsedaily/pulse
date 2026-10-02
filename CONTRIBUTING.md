@@ -78,6 +78,19 @@ A live GUI is itself a client that resizes terminals, so kill all
 transport cases SKIP with an explanatory message unless you opt in
 (e.g. `TC_SSH_VIA_WSL`) — that's expected on a plain checkout.
 
+Two knobs are worth knowing for remote Tab completion:
+
+- `TC_COMP_SSH_RIG="ssh -p 2222 -i <key> … user@host"` runs `nested_completion`
+  over a **real** ssh hop instead of its `wsl -d <distro>` stand-in. Anything
+  that answers key-only with a bash login shell will do; a disposable container
+  is the cheapest rig.
+- `TC_TRACE_COMPLETION=1` (daemon) promotes the lane's hot events — every cache
+  hit, every miss with its `(epoch, depth)` key, every prefetched listing — from
+  `debug!` to `info!`. The decisive events (query typed / declined / answered /
+  abandoned, and the GUI's armed / asking / answered) are already `info!`, so
+  reach for this only when those are not enough. Unlike `TC_LOG_DEBUG` it works
+  on an ordinary install.
+
 > **Historical `TC_` prefix**: internal names predate the Pulse rebrand —
 > env vars (`TC_DATA_DIR`, `TC_CTL_TOKEN`, `TC_UPDATE_FEED`, …), the private
 > OSC 7717 `tcbeacon` protocol, remote `~/.tc/` helper paths, and various
