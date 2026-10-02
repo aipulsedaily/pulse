@@ -3265,11 +3265,16 @@ pub(crate) fn relaunch_label(cmd: Option<&str>) -> String {
 }
 
 /// F1 (ssh-reestablish) — the Reconnecting lane's text (pure, golden-
-/// tested): the AUTO supervision keeps its plain "reconnecting…"; the
-/// MANUAL, unlimited ladder shows its attempts honestly — `retrying —
-/// attempt 7 · next in 30s` between rungs, `retrying — attempt 7…` while an
-/// attempt is in flight, and the first rung names itself before anything
-/// has fired. Cancel stays in the Run slot through every phase.
+/// tested): `retrying — attempt 7 · next in 30s` between rungs, `retrying —
+/// attempt 7…` while an attempt is in flight, and the first rung names itself
+/// before anything has fired. The plain "reconnecting…" is the pre-first-
+/// attempt state. Cancel stays in the Run slot through every phase.
+///
+/// BOTH ladders report now. The automatic one used to stay on the bare
+/// "reconnecting…" because it gave up after ~42s anyway; it is unlimited as
+/// of this release (`reconnect::AUTO_BACKOFF_TAIL`), and an unbounded
+/// supervision the user cannot read — or cancel — would be worse than the
+/// give-up it replaced.
 pub(crate) fn retry_lane_label(attempt: u32, next_s: u32) -> String {
     match (attempt, next_s) {
         (0, 0) => "reconnecting\u{2026}".to_string(),
