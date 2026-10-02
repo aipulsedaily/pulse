@@ -1409,14 +1409,18 @@ pub fn view(ui: &mut egui::Ui, st: &mut LauncherState, vc: &ViewCtx) -> Launcher
                                 TEXT_MUTED,
                             );
                         }
-                        // Label, clipped to its lane.
+                        // Label: one line, ending in an ellipsis at its
+                        // lane (a long Claude-session title used to be cut
+                        // mid-glyph against the secondary text).
                         let lane_end = right_x - sec_w - 8.0;
-                        let lg = p.layout_no_wrap(label, FontId::proportional(13.0), TEXT);
-                        let cp = p.with_clip_rect(Rect::from_min_max(
-                            Pos2::new(rect.min.x + 36.0, rect.min.y),
-                            Pos2::new(lane_end.max(rect.min.x + 40.0), rect.max.y),
-                        ));
-                        cp.galley(
+                        let lane_w = (lane_end - (rect.min.x + 36.0)).max(4.0);
+                        let mut job = egui::text::LayoutJob::single_section(
+                            label,
+                            egui::TextFormat::simple(FontId::proportional(13.0), TEXT),
+                        );
+                        job.wrap = egui::text::TextWrapping::truncate_at_width(lane_w);
+                        let lg = p.layout_job(job);
+                        p.galley(
                             Pos2::new(rect.min.x + 36.0, rect.center().y - lg.size().y / 2.0),
                             lg,
                             TEXT,

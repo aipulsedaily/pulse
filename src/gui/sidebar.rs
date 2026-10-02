@@ -3,18 +3,46 @@
 
 use super::*;
 
+/// Pinned collapse/expand duration. Eased (cubic-out — most of the travel up
+/// front, a soft landing) rather than the old 150ms linear crawl.
+const SIDEBAR_ANIM: f32 = 0.18;
+
+/// The sidebar panel's animated width. ONE function, so the titlebar (which
+/// paints first and slides the terminal name with it) and the panel itself
+/// read the same value on the same frame.
+pub(super) fn sidebar_panel_width(ctx: &egui::Context, collapsed: bool) -> f32 {
+    let k = ctx.animate_bool_with_time_and_easing(
+        Id::new("sidebar-open"),
+        !collapsed,
+        SIDEBAR_ANIM,
+        egui::emath::easing::cubic_out,
+    );
+    rail_peek::RAIL_W + (rail_peek::PANEL_W - rail_peek::RAIL_W) * k
+}
+
+/// Jump the panel straight to full width (pinning from an open flyout).
+fn snap_sidebar_open(ctx: &egui::Context) {
+    ctx.animate_bool_with_time(Id::new("sidebar-open"), true, 0.0);
+}
+
 impl App {
     pub(super) fn sidebar(&mut self, root: &mut egui::Ui) {
         // Animated collapse: full tree at 240px, slim status-dot rail at 44px.
-        let target = if self.prefs.sidebar_collapsed { 44.0 } else { 240.0 };
-        let width = root
-            .ctx()
-            .animate_value_with_time(Id::new("sidebar-width"), target, 0.15);
         let railed = self.prefs.sidebar_collapsed;
+        let width = sidebar_panel_width(root.ctx(), railed);
         // Boundary treatment (user: "we need divider for sidebar … line or
         // color shift"): the sidebar surface is LIFTED a step above the
         // terminal area's BG so the boundary reads as two surfaces meeting.
         let fill = BG_SIDEBAR_LIFT;
+
+        // Hover peek (railed only). Stepped BEFORE the rail paints: the
+        // rail's tooltips and its drag reset depend on whether the flyout is
+        // up. The rail rect is exactly where Panel::left puts the panel (the
+        // parent's available rect, left edge, `width` wide).
+        let avail = root.available_rect_before_wrap();
+        let rail_rect = Rect::from_min_size(avail.min, Vec2::new(width, avail.height()));
+        let peek = self.rail_peek_step(root.ctx(), railed, rail_rect);
+        self.rail_link = None;
 
         egui::Panel::left("sidebar")
             .resizable(false)
@@ -30,9 +58,13 @@ impl App {
             .show(root, |ui| {
                 if railed {
                     // The rail accepts no drops (§5.5) and hosts no rows to
-                    // drag from — collapse any in-flight drag.
-                    self.drag = None;
-                    self.drop_rows.clear();
+                    // drag from — collapse any in-flight drag. While the
+                    // flyout is up the drag belongs to ITS tree (it holds
+                    // the flyout open), so leave it alone then.
+                    if !peek.visible() {
+                        self.drag = None;
+                        self.drop_rows.clear();
+                    }
                     // Rail footer: just the daemon dot, centered.
                     let connected = self.ipc.as_ref().is_some_and(|c| c.is_connected());
                     egui::Panel::bottom("sidebar-footer")
@@ -71,7 +103,7 @@ impl App {
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             ui.add_space(4.0);
-                            self.sidebar_rail(ui);
+                            self.sidebar_rail(ui, peek.visible());
                         });
                     return;
                 }
@@ -103,25 +135,137 @@ impl App {
                     });
             });
 
+        // The flyout: the same tree the pinned panel shows (same rows, same
+        // actions, same context menus), floating OVER the terminal to the
+        // rail's right. Re-checked: a pin clicked on the rail this frame
+        // hands over to the real panel instead.
+        if self.prefs.sidebar_collapsed && peek.visible() {
+            let ctx = root.ctx().clone();
+            rail_peek::show_flyout(&ctx, rail_rect, &peek, fill, |ui| {
+                let inner = ui.max_rect().shrink(8.0);
+                let mut body = ui.new_child(
+                    UiBuilder::new()
+                        .max_rect(inner)
+                        .layout(Layout::top_down(Align::Min)),
+                );
+                egui::ScrollArea::vertical()
+                    .id_salt("sidebar-peek-scroll")
+                    .auto_shrink([false, false])
+                    .show(&mut body, |ui| {
+                        ui.add_space(4.0);
+                        self.sidebar_tree(ui);
+                        self.drag_autoscroll(ui);
+                    });
+            });
+        }
+    }
+
+    /// One frame of the rail hover peek: gather pointer facts, step the pure
+    /// state machine (`rail_peek`), schedule its frames. Pinned ⇒ inert.
+    fn rail_peek_step(
+        &mut self,
+        ctx: &egui::Context,
+        railed: bool,
+        rail: Rect,
+    ) -> rail_peek::PeekFrame {
+        let (now, hover, any_down, any_pressed, origin, maximized) = ctx.input(|i| {
+            (
+                i.time,
+                i.pointer.hover_pos(),
+                i.pointer.any_down(),
+                i.pointer.any_pressed(),
+                i.pointer.press_origin(),
+                i.viewport().maximized.unwrap_or(false),
+            )
+        });
+        let shown = rail_peek::visible_rect(rail, self.rail_peek.width_t());
+        let fly_zone = if shown.width() > 0.0 {
+            Rect::from_min_max(
+                shown.min,
+                Pos2::new(shown.max.x + rail_peek::EDGE_SLOP, shown.max.y),
+            )
+        } else {
+            Rect::NOTHING
+        };
+        let arm_zone = if maximized {
+            rail
+        } else {
+            Rect::from_min_max(
+                Pos2::new(rail.min.x + rail_peek::RESIZE_EDGE, rail.min.y),
+                rail.max,
+            )
+        };
+        let on_peek = |p: Pos2| rail.contains(p) || fly_zone.contains(p);
+        let renaming_row = self
+            .renaming
+            .as_ref()
+            .is_some_and(|r| r.host == RenameHost::Row);
+        let mut input = rail_peek::PeekInput {
+            now,
+            pinned: !railed,
+            in_arm_zone: hover.is_some_and(|p| arm_zone.contains(p)),
+            in_rail: hover.is_some_and(|p| rail.contains(p)),
+            in_flyout: hover.is_some_and(|p| fly_zone.contains(p)),
+            beyond_footprint: hover.is_none_or(|p| p.x > rail.min.x + rail_peek::PANEL_W),
+            hold: self.drag.is_some()
+                || renaming_row
+                || egui::Popup::is_any_open(ctx)
+                || (any_down && origin.is_some_and(on_peek)),
+            pressed_outside: any_pressed && origin.is_some_and(|p| !on_peek(p)),
+            buttons_down: any_down,
+        };
+        if let Some(d) = rail_peek::diag_peek() {
+            let on = match d {
+                rail_peek::DiagPeek::Open => true,
+                rail_peek::DiagPeek::Cycle => {
+                    let half = rail_peek::DIAG_HALF;
+                    let phase = now % (2.0 * half);
+                    ctx.request_repaint_after(Duration::from_secs_f64(
+                        half - phase % half + 0.001,
+                    ));
+                    phase < half
+                }
+            };
+            input.in_arm_zone = on;
+            input.in_rail = on;
+            input.in_flyout = on && input.in_flyout;
+            input.pressed_outside = false;
+        }
+        let frame = self.rail_peek.step(input);
+        if frame.animating {
+            ctx.request_repaint();
+        }
+        if let Some(secs) = frame.wake_in {
+            ctx.request_repaint_after(Duration::from_secs_f64(secs));
+        }
+        frame
     }
 
     /// Collapsed sidebar: one activity dot per terminal, folder groups separated
     /// by small gaps. Tooltip carries the name; click selects; the selected
     /// terminal gets a slim accent bar on the rail edge.
-    pub(super) fn sidebar_rail(&mut self, ui: &mut egui::Ui) {
+    pub(super) fn sidebar_rail(&mut self, ui: &mut egui::Ui, peek_up: bool) {
         // Rail header, one-column doctrine: everything centers on the same
         // vertical axis as the dot rows. The expanded titlebar cluster keeps
         // its toggle at x=36 — past a 44px rail's useful span — so while
         // railed the toggle stacks HERE, centered under the titlebar's app
         // mark, and returns to the titlebar on expand (same flag flips both,
         // so no frame draws two toggles mid-animation).
+        // Hovering the rail already PEEKS the sidebar (rail_peek), so this
+        // glyph's job is to keep it open — pinned, the real panel. Pinned
+        // from an open flyout, the panel snaps straight to full width (the
+        // flyout was already covering that span) instead of re-growing.
         ui.with_layout(Layout::top_down(Align::Center), |ui| {
             if footer_glyph(ui, Icon::Sidebar)
-                .on_hover_text("Expand sidebar")
+                .on_hover_text("Keep sidebar open")
                 .clicked()
             {
                 self.prefs.sidebar_collapsed = false;
                 self.save_prefs();
+                if self.rail_peek.width_t() > 0.0 {
+                    snap_sidebar_open(ui.ctx());
+                }
+                self.rail_peek.dismiss();
             }
             ui.add_space(6.0);
             // Rail + (§5.6): instant create pinned at the rail's top, above
@@ -163,14 +307,13 @@ impl App {
                 ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::click());
             let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
             let selected = self.selected == Some(id);
-            let hover_t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+            let hover_t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), HOVER_T);
+            if resp.hovered() {
+                self.rail_link = Some(id);
+            }
             let painter = ui.painter();
-            if hover_t > 0.02 {
-                painter.rect_filled(
-                    rect,
-                    CornerRadius::same(6),
-                    Color32::from_rgba_unmultiplied(255, 255, 255, (10.0 * hover_t) as u8),
-                );
+            if hover_t > 0.0 {
+                painter.rect_filled(rect, CornerRadius::same(6), OV_HOVER.gamma_multiply(hover_t));
             }
             if selected {
                 let bar = Rect::from_min_max(
@@ -195,15 +338,7 @@ impl App {
                 }
                 Activity::Asleep => {
                     // Rail rows: moon over the hover-lerped rail fill (S14).
-                    let row_bg = composite_over(
-                        BG_SIDEBAR_LIFT,
-                        Color32::from_rgba_unmultiplied(
-                            255,
-                            255,
-                            255,
-                            (10.0 * hover_t) as u8,
-                        ),
-                    );
+                    let row_bg = composite_over(BG_SIDEBAR_LIFT, OV_HOVER.gamma_multiply(hover_t));
                     draw_moon(painter, dot_c, 5.0, TEXT_MUTED, row_bg);
                 }
                 Activity::Dead => {
@@ -215,7 +350,9 @@ impl App {
                 painter.circle_filled(Pos2::new(rect.max.x - 8.0, rect.min.y + 8.0), 2.5, ACCENT);
             }
 
-            let resp = resp.on_hover_text(&t.name);
+            // The name tooltip yields to the flyout, which names every row
+            // (a tooltip there would land on top of the flyout's own rows).
+            let resp = if peek_up { resp } else { resp.on_hover_text(&t.name) };
             if resp.clicked() {
                 self.select_terminal(id);
             }
@@ -503,7 +640,7 @@ impl App {
         let t = ui.ctx().animate_bool_with_time(
             resp.id,
             resp.hovered() && !dragging,
-            0.12,
+            HOVER_T,
         );
         let close_rect =
             Rect::from_center_size(Pos2::new(rect.max.x - 13.0, rect.center().y), Vec2::splat(22.0));
@@ -546,8 +683,10 @@ impl App {
             );
             self.rename_editor(ui, er, semibold(13.0));
         } else {
+            // +24: the same x as an ungrouped terminal's name (row x0 8 +
+            // dot lane 16) — top-level names share one left edge.
             painter.text(
-                Pos2::new(rect.min.x + 26.0, rect.center().y),
+                Pos2::new(rect.min.x + 24.0, rect.center().y),
                 Align2::LEFT_CENTER,
                 &folder.name,
                 semibold(13.0),
@@ -692,15 +831,17 @@ impl App {
             Some(DragState { payload: DragPayload::Term { id, .. }, .. }) if *id == t.id
         );
 
+        // A rail dot under the pointer lights its flyout row too.
+        let linked = self.rail_link == Some(t.id);
         let hover_t = ui.ctx().animate_bool_with_time(
             resp.id,
-            resp.hovered() && !dragging,
-            0.12,
+            (resp.hovered() || linked) && !dragging,
+            HOVER_T,
         );
         let sel_t = ui.ctx().animate_bool_with_time(
             resp.id.with("sel"),
             selected,
-            0.12,
+            HOVER_T,
         );
         // Owned painter: the rename editor below needs `&mut ui`.
         let painter = ui.painter().clone();
@@ -1057,11 +1198,12 @@ impl App {
 // Rail geometry pins (collapsed-rail layout fix). egui lays the rail out at
 // runtime, so these pin the arithmetic the layout relies on: every centered
 // element must fit the 44px column, and header glyphs must share the dot
-// rows' center axis. The literals mirror sidebar():9 (44.0 rail width),
-// sidebar():27 (Margin::same(4) rail body), and icons::footer_glyph (18px).
+// rows' center axis. RAIL_W is the real constant (rail_peek::RAIL_W); the
+// literals mirror sidebar()'s Margin::same(4) rail body and
+// icons::footer_glyph (18px).
 #[cfg(test)]
 mod rail_layout_pins {
-    const RAIL_W: f32 = 44.0;
+    use super::rail_peek::RAIL_W;
     const RAIL_MARGIN: f32 = 4.0;
     const GLYPH: f32 = 18.0;
     const DOT_ROW_H: f32 = 28.0;

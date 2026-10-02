@@ -44,6 +44,8 @@ mod icons;
 /// standalone via `--updating-ui`/`--uninstall-ui`) + the first-run card.
 pub mod lifecycle_ui;
 mod modals;
+/// Hover-peek for the collapsed rail: pure state machine + flyout overlay.
+mod rail_peek;
 mod settings;
 mod sidebar;
 /// #34: Velopack update engine + sidebar update surface + backups.
@@ -108,6 +110,9 @@ const OV_PRESSED: Color32 = Color32::from_rgba_premultiplied(18, 18, 18, 18);
 /// One slim strip carries window chrome + the old terminal header.
 /// 36px keeps standard caption-button hit targets on a frameless window.
 const TITLEBAR_H: f32 = 36.0;
+/// The one hover-fade duration (rows, icon buttons, glyphs, captions):
+/// chrome that appears at one rate everywhere reads as one surface.
+const HOVER_T: f32 = 0.12;
 /// Pixels the inline scrollback-search cluster consumes when open (field +
 /// count + 3 icon buttons); pre-reserved out of the name/cwd text budget.
 const SEARCH_CLUSTER_W: f32 = 330.0;
@@ -1573,6 +1578,11 @@ pub struct App {
     /// The sidebar rows painted last frame while a drag was armed — the
     /// drop-slot map (§5.5). Rebuilt every armed frame.
     drop_rows: Vec<DropRow>,
+    /// Collapsed-rail hover peek (see `rail_peek`). Inert while pinned.
+    rail_peek: rail_peek::RailPeek,
+    /// The rail dot under the pointer this frame — its flyout row lights
+    /// with it, so the two columns read as one list.
+    rail_link: Option<Uuid>,
     /// Last frame's central-panel rect — anchors the launcher overlay.
     central_rect: Option<Rect>,
     prefs: Prefs,
@@ -1895,6 +1905,8 @@ impl App {
             renaming: None,
             drag: None,
             drop_rows: Vec::new(),
+            rail_peek: rail_peek::RailPeek::default(),
+            rail_link: None,
             central_rect: None,
             prefs,
             bindings: BindingsLayout::new(),
@@ -5359,21 +5371,20 @@ impl App {
                 {
                     self.prefs.sidebar_collapsed = true;
                     self.save_prefs();
+                    // No peek under the pointer that just collapsed it.
+                    self.rail_peek.require_rearm();
                 }
 
                 // Terminal identity (dot + name + dimmed cwd + inline search)
                 // starts at the TERMINAL column — right of the sidebar
                 // boundary — so the name reads as a title above the terminal
                 // content, not as window chrome (user-directed). Mirrors the
-                // sidebar panel's animated width (same id + target ⇒ same
-                // value this frame), so the name slides with collapse; the
-                // rail leaves no room, so clamp right of the toggle there.
-                let sb_target = if self.prefs.sidebar_collapsed { 44.0 } else { 240.0 };
-                let sidebar_w = ctx.animate_value_with_time(
-                    Id::new("sidebar-width"),
-                    sb_target,
-                    0.15,
-                );
+                // sidebar panel's animated width (one shared function ⇒ the
+                // same value this frame), so the name slides with collapse;
+                // the rail leaves no room, so clamp right of the toggle there.
+                // The hover flyout never moves it: it overlays, the panel
+                // stays RAIL_W.
+                let sidebar_w = sidebar::sidebar_panel_width(ctx, self.prefs.sidebar_collapsed);
                 let name_x = (rect.min.x + sidebar_w + 12.0).max(lui.min_rect().max.x + 8.0);
                 if let Some((id, status, asleep, cwd, name)) = &term_meta {
                     let id = *id;
@@ -5554,7 +5565,7 @@ impl App {
         let t = aui.ctx().animate_bool_with_time(
             Id::new("newterm-hover"),
             main.hovered() || chev.hovered(),
-            0.12,
+            HOVER_T,
         );
         let painter = aui.painter();
         if main.is_pointer_button_down_on() || chev.is_pointer_button_down_on() {
@@ -5570,7 +5581,7 @@ impl App {
         draw_icon(painter, ir, Icon::Plus, fg);
         let ct = aui
             .ctx()
-            .animate_bool_with_time(chev.id.with("hover"), chev.hovered(), 0.12);
+            .animate_bool_with_time(chev.id.with("hover"), chev.hovered(), HOVER_T);
         let cr = Rect::from_center_size(
             Pos2::new(chev_zone.center().x - 2.0, chev_zone.center().y),
             Vec2::splat(12.0),

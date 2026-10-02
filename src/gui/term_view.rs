@@ -423,6 +423,14 @@ pub fn show(
             .is_some_and(|f| !f.stale && !f.anchors.is_empty());
     let bctx = if blocks_active { blocks.as_ref() } else { None };
     // Layout BEFORE process_input (which may consume the press), render after.
+    // Only a pointer that is actually ON the grid's layer hovers a block: one
+    // resting on a floating surface above it (the sidebar flyout, a popup)
+    // must not light the block underneath or raise its toolbar.
+    let block_pointer = ui.ctx().pointer_latest_pos().filter(|p| {
+        ui.ctx()
+            .layer_id_at(*p)
+            .is_none_or(|l| l == ui.layer_id())
+    });
     let chrome = bctx.and_then(|b| {
         hovered_block_layout(
             &painter,
@@ -430,7 +438,7 @@ pub fn show(
             b,
             grid_rect,
             content_rect,
-            ui.ctx().pointer_latest_pos(),
+            block_pointer,
             vs.dragging,
         )
     });
