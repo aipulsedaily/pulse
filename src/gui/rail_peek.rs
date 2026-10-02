@@ -1,8 +1,8 @@
 //! Hover-peek for the collapsed sidebar rail.
 //!
 //! While the sidebar is collapsed to its 44px rail, resting the pointer on
-//! the rail flies the full sidebar tree out to the rail's right; leaving
-//! folds it away. The flyout is an egui `Area` OVER the terminal, never a
+//! the rail grows the rail into the full sidebar — over the terminal — and
+//! leaving folds it back. The flyout is an egui `Area` OVER the terminal, never a
 //! panel beside it: the rail panel stays exactly `RAIL_W` wide, so the
 //! central panel — and therefore the grid's cols/rows and the PTY size — is
 //! identical with the flyout open, opening, or closed. A mouse pass must
@@ -32,11 +32,10 @@ use egui::{Color32, Id, Order, Pos2, Rect, UiBuilder, Vec2};
 
 /// Collapsed rail width (the sidebar panel's width while railed).
 pub(super) const RAIL_W: f32 = 44.0;
-/// Pinned sidebar width; also the flyout's own width, so the tree inside it
-/// lays out at exactly the geometry it was designed for (row clusters,
-/// subtitle ellipsis) — the flyout is the sidebar, not a re-flow of it.
+/// Pinned sidebar width; also the open flyout's width (from the rail's left
+/// edge), so the tree inside it lays out at exactly the pinned geometry —
+/// the flyout IS the sidebar, and pinning from it changes no pixel of it.
 pub(super) const PANEL_W: f32 = 240.0;
-pub(super) const FLYOUT_W: f32 = PANEL_W;
 
 /// Dwell before the flyout opens. Crossing a 44px rail at an ordinary
 /// pointer speed (~600-1500 px/s) takes 30-75ms, so 150ms rejects every
@@ -277,31 +276,68 @@ fn smoothstep(x: f32) -> f32 {
     x * x * (3.0 - 2.0 * x)
 }
 
-/// The flyout's full (fully open) rect for a given rail rect.
+/// The flyout's full (fully open) rect: exactly the pinned sidebar's
+/// footprint, starting at the rail's left edge — the rail GROWS into the
+/// sidebar rather than a second panel appearing beside it.
 pub(super) fn flyout_rect(rail: Rect) -> Rect {
-    Rect::from_min_size(
-        Pos2::new(rail.max.x, rail.min.y),
-        Vec2::new(FLYOUT_W, rail.height()),
-    )
+    Rect::from_min_size(rail.min, Vec2::new(PANEL_W, rail.height()))
 }
 
-/// The flyout's currently visible rect.
+/// The flyout's currently visible rect: the rail's own column plus the grown
+/// share of the remaining `PANEL_W - RAIL_W`.
 pub(super) fn visible_rect(rail: Rect, width_t: f32) -> Rect {
-    let full = flyout_rect(rail);
-    Rect::from_min_max(
-        full.min,
-        Pos2::new(full.min.x + (FLYOUT_W * width_t).round(), full.max.y),
-    )
+    let grow = ((PANEL_W - RAIL_W) * width_t).round();
+    Rect::from_min_max(rail.min, Pos2::new(rail.max.x + grow, rail.max.y))
+}
+
+/// Depth cue at the flyout's right edge: a gradient quad strip, black at
+/// `SHADE_ALPHA` on the edge, ~35% of that at `SHADE_MID`, gone at
+/// `SHADE_W`. It reads as a surface casting onto the terminal (the text
+/// dims INTO the edge instead of being sliced off mid-glyph) — a tonal
+/// falloff, never a line, and no blur pass: 6 vertices, 4 triangles.
+const SHADE_W: f32 = 22.0;
+const SHADE_MID: f32 = 7.0;
+const SHADE_ALPHA: f32 = 120.0;
+
+fn edge_shade(painter: &egui::Painter, vis: Rect, strength: f32) {
+    let a0 = (SHADE_ALPHA * strength) as u8;
+    let a1 = (SHADE_ALPHA * 0.35 * strength) as u8;
+    if a0 == 0 {
+        return;
+    }
+    let (x0, y0, y1) = (vis.max.x, vis.min.y, vis.max.y);
+    let mut mesh = egui::Mesh::default();
+    let cols = [
+        Color32::from_black_alpha(a0),
+        Color32::from_black_alpha(a1),
+        Color32::TRANSPARENT,
+    ];
+    for (x, c) in [x0, x0 + SHADE_MID, x0 + SHADE_W].into_iter().zip(cols) {
+        mesh.colored_vertex(Pos2::new(x, y0), c);
+        mesh.colored_vertex(Pos2::new(x, y1), c);
+    }
+    for k in 0..2u32 {
+        let i = 2 * k;
+        mesh.add_triangle(i, i + 1, i + 2);
+        mesh.add_triangle(i + 1, i + 3, i + 2);
+    }
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 /// Paint the flyout over the terminal and run `add_contents` inside it.
 ///
-/// An `Area` (Order::Middle): above the panels, below popups/modals. The
-/// contents are laid out at the FULL flyout width from the first frame —
-/// the visible width only clips them, so nothing re-flows while it grows —
-/// and the clip also bounds interaction (a clipped-away row is not
-/// clickable). The Area's own extent is the visible rect, so a half-folded
-/// flyout never swallows clicks meant for the terminal beside it.
+/// An `Area` (Order::Middle): above the panels, below popups/modals. It
+/// covers the rail's column too, but paints NO fill there — the rail panel
+/// underneath is the same surface, and its dots stay visible while the
+/// width grows, then cross-fade out (the caller fades the rail by
+/// `1 - label_t`) as the tree's own rows fade in at `label_t`. One column
+/// of dots at any moment, never two lists side by side.
+///
+/// The contents are laid out at the FULL width from the first frame — the
+/// visible width only clips them, so nothing re-flows while it grows — and
+/// the clip also bounds interaction (a clipped-away row is not clickable).
+/// The Area's own extent is the visible rect, so a half-folded flyout never
+/// swallows clicks meant for the terminal beside it.
 pub(super) fn show_flyout(
     ctx: &egui::Context,
     rail: Rect,
@@ -318,30 +354,20 @@ pub(super) fn show_flyout(
         .fade_in(false)
         .movable(false)
         .show(ctx, |ui| {
-            // Depth, not a line (seamless doctrine): a soft shadow off the
-            // right edge only, clipped so it never smudges the titlebar or
-            // the rail. Fades with the width.
-            if vis.width() > 0.5 {
-                let shadow = egui::epaint::Shadow {
-                    offset: [8, 0],
-                    blur: 24,
-                    spread: 0,
-                    color: Color32::from_black_alpha((110.0 * frame.width_t) as u8),
-                };
-                let clip = Rect::from_min_max(
-                    Pos2::new(vis.max.x, rail.min.y),
-                    Pos2::new(vis.max.x + 40.0, rail.max.y),
-                );
+            let grown = Rect::from_min_max(Pos2::new(rail.max.x, vis.min.y), vis.max);
+            if grown.width() > 0.5 {
                 ui.painter()
-                    .with_clip_rect(clip)
-                    .add(shadow.as_shape(vis, egui::CornerRadius::ZERO));
-                ui.painter()
-                    .rect_filled(vis, egui::CornerRadius::ZERO, fill);
+                    .rect_filled(grown, egui::CornerRadius::ZERO, fill);
+                edge_shade(ui.painter(), vis, frame.width_t);
             }
-            let mut inner = ui.new_child(UiBuilder::new().max_rect(full));
-            inner.set_clip_rect(vis);
-            inner.multiply_opacity(frame.label_t);
-            add_contents(&mut inner);
+            // Contents are invisible until the labels start (the width-only
+            // first ~90ms of an open, the last of a close): skip them then.
+            if frame.label_t > 0.0 {
+                let mut inner = ui.new_child(UiBuilder::new().max_rect(full));
+                inner.set_clip_rect(vis);
+                inner.multiply_opacity(frame.label_t);
+                add_contents(&mut inner);
+            }
             // The Area's extent (hit-testing + layer hover) = visible rect.
             ui.advance_cursor_after_rect(vis);
         });
@@ -628,6 +654,20 @@ mod tests {
         );
     }
 
+    /// The rail becomes the sidebar: the flyout starts as exactly the rail
+    /// column and, fully open, is exactly the pinned panel's footprint — so
+    /// pinning from it moves no pixel of the sidebar.
+    #[test]
+    fn flyout_grows_from_the_rail_into_the_pinned_footprint() {
+        let rail = Rect::from_min_size(Pos2::new(0.0, 36.0), Vec2::new(RAIL_W, 700.0));
+        assert_eq!(visible_rect(rail, 0.0), rail);
+        let open = visible_rect(rail, 1.0);
+        assert_eq!(open, Rect::from_min_size(rail.min, Vec2::new(PANEL_W, 700.0)));
+        assert_eq!(open, flyout_rect(rail));
+        let mid = visible_rect(rail, 0.5);
+        assert!(mid.min == rail.min && mid.max.x > rail.max.x && mid.max.x < open.max.x);
+    }
+
     /// THE non-negotiable: the flyout overlays the terminal, it never
     /// displaces it. Real egui panels in the app's order (titlebar, rail
     /// panel at `RAIL_W`, central card) with the real `show_flyout` drawn at
@@ -660,7 +700,11 @@ mod tests {
                 egui::Panel::top("t")
                     .exact_size(36.0)
                     .show(&mut cui, |_| {});
-                let w = if as_panel { RAIL_W + FLYOUT_W * p.width_t } else { RAIL_W };
+                let w = if as_panel {
+                    RAIL_W + (PANEL_W - RAIL_W) * p.width_t
+                } else {
+                    RAIL_W
+                };
                 let r = egui::Panel::left("sidebar")
                     .resizable(false)
                     .default_size(w)

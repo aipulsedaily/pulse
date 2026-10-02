@@ -42,7 +42,6 @@ impl App {
         let avail = root.available_rect_before_wrap();
         let rail_rect = Rect::from_min_size(avail.min, Vec2::new(width, avail.height()));
         let peek = self.rail_peek_step(root.ctx(), railed, rail_rect);
-        self.rail_link = None;
 
         egui::Panel::left("sidebar")
             .resizable(false)
@@ -57,6 +56,15 @@ impl App {
             )
             .show(root, |ui| {
                 if railed {
+                    // Cross-fade: as the flyout's tree fades in over this
+                    // column, the rail's own glyphs fade out — one column of
+                    // dots at any moment (the rail becomes the sidebar).
+                    if peek.visible() {
+                        ui.multiply_opacity(1.0 - peek.label_t);
+                    }
+                    // Fully covered by the open flyout: nothing of the rail
+                    // can show or be hit — skip painting it (perf).
+                    let rail_hidden = peek.label_t >= 1.0;
                     // The rail accepts no drops (§5.5) and hosts no rows to
                     // drag from — collapse any in-flight drag. While the
                     // flyout is up the drag belongs to ITS tree (it holds
@@ -64,6 +72,9 @@ impl App {
                     if !peek.visible() {
                         self.drag = None;
                         self.drop_rows.clear();
+                    }
+                    if rail_hidden {
+                        return;
                     }
                     // Rail footer: just the daemon dot, centered.
                     let connected = self.ipc.as_ref().is_some_and(|c| c.is_connected());
@@ -121,7 +132,7 @@ impl App {
                         // #34 Axis 5: the quiet update row directly above the
                         // footer cluster — absent entirely while idle.
                         self.sidebar_update_row(ui);
-                        self.sidebar_footer(ui);
+                        self.sidebar_footer(ui, false);
                     });
 
                 egui::ScrollArea::vertical()
@@ -135,10 +146,10 @@ impl App {
                     });
             });
 
-        // The flyout: the same tree the pinned panel shows (same rows, same
-        // actions, same context menus), floating OVER the terminal to the
-        // rail's right. Re-checked: a pin clicked on the rail this frame
-        // hands over to the real panel instead.
+        // The flyout: the pinned sidebar itself (same tree, rows, actions,
+        // context menus, footer, same 240px footprint and 8px inset), grown
+        // out of the rail and floating OVER the terminal. Re-checked: a pin
+        // clicked this frame hands over to the real panel instead.
         if self.prefs.sidebar_collapsed && peek.visible() {
             let ctx = root.ctx().clone();
             rail_peek::show_flyout(&ctx, rail_rect, &peek, fill, |ui| {
@@ -148,6 +159,17 @@ impl App {
                         .max_rect(inner)
                         .layout(Layout::top_down(Align::Min)),
                 );
+                // Unfilled: the flyout/rail surface is already behind it,
+                // and a fill here would blank the fading rail footer.
+                egui::Panel::bottom("sidebar-peek-footer")
+                    .frame(
+                        egui::Frame::new()
+                            .inner_margin(Margin { left: 2, right: 2, top: 4, bottom: 2 }),
+                    )
+                    .show(&mut body, |ui| {
+                        self.sidebar_update_row(ui);
+                        self.sidebar_footer(ui, true);
+                    });
                 egui::ScrollArea::vertical()
                     .id_salt("sidebar-peek-scroll")
                     .auto_shrink([false, false])
@@ -158,6 +180,19 @@ impl App {
                     });
             });
         }
+    }
+
+    /// Pin the sidebar open from the rail or the open flyout. From an open
+    /// flyout the panel snaps straight to full width: the flyout already
+    /// occupied exactly that footprint, so nothing visibly moves but the
+    /// terminal's (now real) left edge.
+    pub(super) fn pin_sidebar_from_peek(&mut self, ctx: &egui::Context) {
+        self.prefs.sidebar_collapsed = false;
+        self.save_prefs();
+        if self.rail_peek.width_t() > 0.0 {
+            snap_sidebar_open(ctx);
+        }
+        self.rail_peek.dismiss();
     }
 
     /// One frame of the rail hover peek: gather pointer facts, step the pure
@@ -178,8 +213,8 @@ impl App {
                 i.viewport().maximized.unwrap_or(false),
             )
         });
-        let shown = rail_peek::visible_rect(rail, self.rail_peek.width_t());
-        let fly_zone = if shown.width() > 0.0 {
+        let fly_zone = if self.rail_peek.width_t() > 0.0 {
+            let shown = rail_peek::visible_rect(rail, self.rail_peek.width_t());
             Rect::from_min_max(
                 shown.min,
                 Pos2::new(shown.max.x + rail_peek::EDGE_SLOP, shown.max.y),
@@ -260,12 +295,7 @@ impl App {
                 .on_hover_text("Keep sidebar open")
                 .clicked()
             {
-                self.prefs.sidebar_collapsed = false;
-                self.save_prefs();
-                if self.rail_peek.width_t() > 0.0 {
-                    snap_sidebar_open(ui.ctx());
-                }
-                self.rail_peek.dismiss();
+                self.pin_sidebar_from_peek(ui.ctx());
             }
             ui.add_space(6.0);
             // Rail + (§5.6): instant create pinned at the rail's top, above
@@ -308,9 +338,6 @@ impl App {
             let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
             let selected = self.selected == Some(id);
             let hover_t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), HOVER_T);
-            if resp.hovered() {
-                self.rail_link = Some(id);
-            }
             let painter = ui.painter();
             if hover_t > 0.0 {
                 painter.rect_filled(rect, CornerRadius::same(6), OV_HOVER.gamma_multiply(hover_t));
@@ -360,8 +387,11 @@ impl App {
     }
 
     /// Bottom-of-sidebar status cluster (V-B): daemon dot, font steppers,
-    /// density toggle, version. 24px tall, muted 11px, no borders.
-    pub(super) fn sidebar_footer(&mut self, ui: &mut egui::Ui) {
+    /// density toggle, version. 24px tall, muted 11px, no borders. `peek`:
+    /// drawn inside the hover flyout, which covers the rail's own pin glyph,
+    /// so the flyout carries it here (left of settings) instead — inside the
+    /// flyout, fading with it, never shifting the titlebar.
+    pub(super) fn sidebar_footer(&mut self, ui: &mut egui::Ui, peek: bool) {
         let connected = self.ipc.as_ref().is_some_and(|c| c.is_connected());
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
@@ -427,6 +457,13 @@ impl App {
                     .clicked()
                 {
                     self.open_settings();
+                }
+                if peek
+                    && footer_glyph(ui, Icon::Sidebar)
+                        .on_hover_text("Keep sidebar open")
+                        .clicked()
+                {
+                    self.pin_sidebar_from_peek(ui.ctx());
                 }
             });
         });
@@ -831,11 +868,9 @@ impl App {
             Some(DragState { payload: DragPayload::Term { id, .. }, .. }) if *id == t.id
         );
 
-        // A rail dot under the pointer lights its flyout row too.
-        let linked = self.rail_link == Some(t.id);
         let hover_t = ui.ctx().animate_bool_with_time(
             resp.id,
-            (resp.hovered() || linked) && !dragging,
+            resp.hovered() && !dragging,
             HOVER_T,
         );
         let sel_t = ui.ctx().animate_bool_with_time(

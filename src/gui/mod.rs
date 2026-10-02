@@ -1580,9 +1580,6 @@ pub struct App {
     drop_rows: Vec<DropRow>,
     /// Collapsed-rail hover peek (see `rail_peek`). Inert while pinned.
     rail_peek: rail_peek::RailPeek,
-    /// The rail dot under the pointer this frame — its flyout row lights
-    /// with it, so the two columns read as one list.
-    rail_link: Option<Uuid>,
     /// Last frame's central-panel rect — anchors the launcher overlay.
     central_rect: Option<Rect>,
     prefs: Prefs,
@@ -1906,7 +1903,6 @@ impl App {
             drag: None,
             drop_rows: Vec::new(),
             rail_peek: rail_peek::RailPeek::default(),
-            rail_link: None,
             central_rect: None,
             prefs,
             bindings: BindingsLayout::new(),
