@@ -1104,7 +1104,9 @@ impl App {
         // (§6.2 — the shrink-to-content chip read as floating debris).
         let hr = egui::Frame::new()
             .fill(SURFACE)
-            .inner_margin(Margin { left: 8, right: 8, top: 0, bottom: 0 })
+            // 12 = the card grid's gutter: Back's left edge lines up with
+            // the first card column instead of sitting 4px outside it.
+            .inner_margin(Margin { left: 12, right: 12, top: 0, bottom: 0 })
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.set_height(40.0);
@@ -1153,6 +1155,10 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.add_space(gap);
                     ui.vertical(|ui| {
+                        // Rows step by exactly `gap` — the layout's own item
+                        // spacing used to stack on top (16px between rows vs
+                        // 12px between columns).
+                        ui.spacing_mut().item_spacing.y = 0.0;
                         for chunk in ids.chunks(cols) {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = gap;
@@ -1190,7 +1196,7 @@ impl App {
         time: f64,
     ) -> Option<CardAction> {
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
-        let hover_t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+        let hover_t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), HOVER_T);
         let painter = ui.painter();
         // Card body: background shift only (hover brightens it) — no border
         // stroke (seamless doctrine).
@@ -1209,14 +1215,18 @@ impl App {
         // takes the card's hover-lerped fill).
         let dot_c = Pos2::new(rect.min.x + 16.0, rect.min.y + 18.0);
         match act {
+            // Same dot grammar as the sidebar row (halo on the two live
+            // signals), so a state reads identically on both surfaces.
             Activity::Working => {
                 let pulse = 0.75 + 0.25 * (time as f32 * std::f32::consts::TAU).sin();
+                painter.circle_filled(dot_c, 6.0, ACCENT.gamma_multiply(0.20 * pulse));
                 painter.circle_filled(dot_c, 4.0, ACCENT.gamma_multiply(pulse));
             }
             Activity::Idle => {
                 painter.circle_filled(dot_c, 4.0, TEXT_MUTED);
             }
             Activity::NeedsYou => {
+                painter.circle_filled(dot_c, 6.0, ATTENTION.gamma_multiply(0.22));
                 painter.circle_filled(dot_c, 4.0, ATTENTION);
             }
             Activity::Asleep => {

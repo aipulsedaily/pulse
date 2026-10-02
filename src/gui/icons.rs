@@ -144,27 +144,27 @@ pub(super) fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: 
             painter.rect_stroke(front, CornerRadius::ZERO, Stroke::new(1.1, color), StrokeKind::Inside);
         }
         Icon::Folder => {
-            let w = r * 1.6;
-            let h = r * 1.1;
-            let top = c.y - h * 0.6;
+            // Inside its slot like every other glyph (it used to span 3.2r —
+            // 22px in a 14px slot — and sat wider than the column of `>_`
+            // marks above it in the launcher).
+            let w = r * 0.95;
             let body = Rect::from_min_max(
-                Pos2::new(c.x - w, top + h * 0.25),
-                Pos2::new(c.x + w, top + h * 1.25),
+                Pos2::new(c.x - w, c.y - r * 0.45),
+                Pos2::new(c.x + w, c.y + r * 0.75),
             );
             painter.rect_stroke(body, CornerRadius::same(2), stroke, StrokeKind::Inside);
-            // Tab.
+            // Tab: rises off the body's top-left, steps down at ~45%.
+            let tab_y = c.y - r * 0.8;
             painter.line_segment(
-                [
-                    Pos2::new(c.x - w, top + h * 0.25),
-                    Pos2::new(c.x - w * 0.35, top + h * 0.25),
-                ],
+                [Pos2::new(c.x - w + 0.75, c.y - r * 0.45), Pos2::new(c.x - w + 0.75, tab_y)],
                 stroke,
             );
             painter.line_segment(
-                [
-                    Pos2::new(c.x - w * 0.35, top + h * 0.25),
-                    Pos2::new(c.x - w * 0.1, top),
-                ],
+                [Pos2::new(c.x - w + 0.75, tab_y), Pos2::new(c.x - r * 0.15, tab_y)],
+                stroke,
+            );
+            painter.line_segment(
+                [Pos2::new(c.x - r * 0.15, tab_y), Pos2::new(c.x + r * 0.15, c.y - r * 0.45)],
                 stroke,
             );
         }
@@ -346,7 +346,7 @@ pub(super) fn danger_wash(t: f32) -> Color32 {
 /// 28x28 icon button (D25). `danger` gives it a red hover/glyph.
 pub(super) fn icon_button(ui: &mut egui::Ui, icon: Icon, danger: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
-    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), HOVER_T);
     let painter = ui.painter();
     if t > 0.0 {
         let fill = if danger {
@@ -366,7 +366,7 @@ pub(super) fn icon_button(ui: &mut egui::Ui, icon: Icon, danger: bool) -> egui::
 /// the close button a red hover fill (V1).
 pub(super) fn caption_button(ui: &mut egui::Ui, rect: Rect, icon: Icon, danger: bool) -> egui::Response {
     let resp = ui.interact(rect, Id::new(("caption", rect.min.x as i32)), Sense::click());
-    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.10);
+    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), HOVER_T);
     if t > 0.0 {
         let fill = if danger {
             DANGER.gamma_multiply(t)
@@ -388,7 +388,7 @@ pub(super) fn caption_button(ui: &mut egui::Ui, rect: Rect, icon: Icon, danger: 
 /// Tiny 18px transparent icon button for the sidebar footer (V-B).
 pub(super) fn footer_glyph(ui: &mut egui::Ui, icon: Icon) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
-    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), HOVER_T);
     let col = lerp_col(TEXT_MUTED, TEXT_SECONDARY, t);
     draw_icon(ui.painter(), rect.shrink(2.0), icon, col);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -423,7 +423,7 @@ pub(super) fn burst_badge(painter: &egui::Painter, right_center: Pos2, label: &s
 /// Full-width ghost button with an optional leading icon (D22/D24).
 pub(super) fn ghost_button(ui: &mut egui::Ui, width: f32, label: &str, icon: Option<Icon>) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::click());
-    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), HOVER_T);
     let painter = ui.painter();
     if resp.is_pointer_button_down_on() {
         painter.rect_filled(rect, CornerRadius::same(8), OV_PRESSED);
@@ -504,7 +504,7 @@ pub(super) fn ghost_button_auto(ui: &mut egui::Ui, label: &str, color: Color32) 
     );
     let width = galley.size().x + 24.0;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 32.0), Sense::click());
-    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), HOVER_T);
     let painter = ui.painter();
     if t > 0.0 {
         painter.rect_filled(rect, CornerRadius::same(8), SURFACE_2.gamma_multiply(t));
