@@ -11,6 +11,7 @@ pub mod claude_registry;
 // pub(crate): gui/drop.rs reuses `wsl_mnt_path` (the golden-tested drive →
 // /mnt translation) — a second implementation would drift (QOL §4.4).
 pub(crate) mod bootstrap;
+mod completion;
 mod control;
 mod ctl_tokens;
 pub(crate) mod frame;
@@ -553,6 +554,18 @@ pub struct Core {
     /// contract — why the nested shell needs its own token, why the payload
     /// is written in two phases, and every honest abort.
     nesthooks: Mutex<HashMap<Uuid, NestHook>>,
+    /// remote-completion: per-terminal directory-listing cache + the
+    /// in-flight query (LEAF lock). Filled by the hooked shell's own prompt
+    /// hook (the prefetch lane) and by `pump_completion`'s bash-only query
+    /// lane; read by `C2D::RequestCompletion`. Keyed to (spawn generation,
+    /// hook scope depth) so a relaunch or a collapsed nested world can never
+    /// serve a listing from a world that is gone. See `completion`.
+    completion: Mutex<HashMap<Uuid, completion::CompState>>,
+    /// remote-completion: terminal → (journal length, when it last changed) —
+    /// the output-quiescence clock the query gate reads. Separate from
+    /// `completion` because the gate samples it BEFORE taking that lock
+    /// (LEAF lock, nothing else held).
+    comp_quiet: Mutex<HashMap<Uuid, (u64, Instant)>>,
     /// Remote CLI-resume probe bookkeeping (LEAF locks inside): the §4.6
     /// auth-dead cache + the 30s listing cooldown. Arc so probe worker
     /// threads (M0 snapshot legs) borrow no Core.
@@ -898,6 +911,21 @@ impl Core {
             blocks::HookVerb::Init { home, .. } if !home.is_empty() => Some(home.clone()),
             _ => None,
         };
+        // remote-completion: the init's `shell` field is the ONLY witness for
+        // whether the query lane may ever type into this shell (bash yes, zsh
+        // and everything else no — `bootstrap::comp_query_supported`), and a
+        // `comp` is the listing itself. Captured here because the match below
+        // moves the payload; applied after the leaf blocks lock releases.
+        let init_shell = match &ev.verb {
+            blocks::HookVerb::Init { shell, .. } => Some(shell.clone()),
+            _ => None,
+        };
+        let comp_payload = match &ev.verb {
+            blocks::HookVerb::Comp { dir, trunc, list } => {
+                Some((dir.clone(), *trunc, list.clone()))
+            }
+            _ => None,
+        };
         let mut hook_cwd: Option<std::path::PathBuf> = None;
         // P6b §3.3.1: cmd's static PROMPT pre carries no cwd payload ($P
         // cannot be hex-encoded by PROMPT macros), but the adjacent tokenless
@@ -1005,8 +1033,30 @@ impl Core {
                 blocks::HookVerb::PromptEnd => None, // early-returned above
                 blocks::HookVerb::PromptStart => None, // early-returned above
                 blocks::HookVerb::Beacon { .. } => None, // early-returned above
+                // remote-completion: a listing touches NOTHING in the block
+                // store — no record, no open block, no cwd, no busy signal.
+                // It is pure side-channel data, filed below once this leaf
+                // lock is released.
+                blocks::HookVerb::Comp { .. } => None,
             }
         };
+        // remote-completion: everything the lane learns from a hook, applied
+        // with the blocks lock released (its own lock is a leaf too, and two
+        // leaves are never held at once). The epoch/depth pair is what keys
+        // the cache, so a relaunch or a collapsed nested world wipes it.
+        {
+            let epoch = self.blocks.lock().get(&id).map(|s| s.epoch).unwrap_or(0);
+            let depth = scope.depth();
+            if let Some(shell) = init_shell {
+                self.comp_on_init(id, epoch, depth, &shell);
+            }
+            if is_pre {
+                self.comp_on_pre(id, epoch, depth);
+            }
+            if let Some((dir, trunc, list)) = comp_payload {
+                self.comp_on_listing(id, epoch, depth, &dir, trunc, &list);
+            }
+        }
         // ANY token-checked hook (init/exec/pre) proves the link is
         // interactive again — a CLI-resume trailing occupies the shell
         // BEFORE its first prompt, so waiting for a `pre` alone left a
@@ -1260,6 +1310,8 @@ impl Core {
         // relaunch re-arms from the persisted breadcrumb when one survives).
         self.cancel_reestablish(id, "session exited");
         self.cancel_nesthook(id, "session exited");
+        // remote-completion: the cache describes a world that just died.
+        self.comp_forget(id);
         // Flush this terminal's journal so the tail survives a crash. No
         // in-stream "process exited" marker: the sidebar status dot and the
         // Restore affordance already say it, and any seam text would survive
@@ -3837,6 +3889,11 @@ impl Core {
                 // always FINISHES (the shell is parked in our `read`).
                 let submitted = bytes.last().is_some_and(|b| *b == b'\r' || *b == b'\n');
                 self.nesthook_on_input(id, submitted);
+                // remote-completion: the user's keystroke supersedes any
+                // in-flight query, and half-typed bytes mark the shell's line
+                // buffer dirty so the next query declines rather than append
+                // our trigger to their command.
+                self.comp_on_input(id, submitted);
                 // Clone the writer Arc out and write OUTSIDE the sessions
                 // mutex (SubmitCommand's pattern): a full ConPTY input pipe
                 // (app stopped reading stdin) blocks write_all indefinitely,
@@ -4000,6 +4057,12 @@ impl Core {
                 // click's refusal is simply inert (idempotent by gate).
                 let _ = self.manual_reconnect(id);
             }
+            // remote-completion (proto 14): a composer Tab asking for a
+            // directory listing only the remote shell can take. Answered from
+            // the prefetch cache when possible, else by one bash-only query on
+            // the hook channel — strictly a side channel (see `completion`).
+            C2D::RequestCompletion { id, dir } => self.comp_request(client, id, &dir),
+
             C2D::SetAutoReconnect { id, on } => {
                 self.mutate(|s| {
                     if let Some(t) = s.terminal_mut(id) {
@@ -4027,6 +4090,9 @@ impl Core {
         // A composer submission is a whole line: the injection keeps waiting
         // for the prompt that comes back after it (nested-shell-hooks).
         self.nesthook_on_input(id, true);
+        // remote-completion: a submission supersedes any in-flight query
+        // and leaves no line buffer behind (see `comp_on_input`).
+        self.comp_on_input(id, true);
         if let Err(msg) = validate_submit_command(&cmd) {
             log::warn!("SubmitCommand for {id} refused: {msg}");
             if let Some(f) = frame_bytes(&D2C::Error {
@@ -5039,6 +5105,8 @@ pub fn run() -> anyhow::Result<()> {
         reestablish: Mutex::new(HashMap::new()),
         nested_retry: Mutex::new(HashMap::new()),
         nesthooks: Mutex::new(HashMap::new()),
+        completion: Mutex::new(HashMap::new()),
+        comp_quiet: Mutex::new(HashMap::new()),
         probe_rt: Arc::new(remote_probe::Runtime::new()),
         probing: Mutex::new(HashSet::new()),
         hook_homes: Mutex::new(HashMap::new()),
@@ -5135,6 +5203,7 @@ pub fn run() -> anyhow::Result<()> {
                 // fast path: one lock probe while the map is empty).
                 flush_core.pump_reestablish();
             flush_core.pump_nesthook();
+            flush_core.pump_completion();
                 // pw5-F3: coalesced state.json save for relabel-class
                 // changes (live_cwd folds, tracker verdicts). Serialize AND
                 // write stay under the state mutex — totally ordered with

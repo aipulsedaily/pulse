@@ -844,6 +844,7 @@ impl App {
                     self.state.terminal(id).map(|t| t.display_cwd())
                 });
             let mut comp_write = Vec::new();
+            let mut comp_request: Option<String> = None;
             let mut spacer_gesture = false;
             let mut toggle_history = false;
             let mut wake_clicked = false;
@@ -851,10 +852,13 @@ impl App {
             let mut cancel_reconnect_clicked = false;
             let mut retry_reconnect_clicked = false;
             self.history_btn_rect = None;
-            if let (Some(st), Some(backend), Some(bl)) = (
+            // remote-completion: disjoint field borrows — the cache is read
+            // beside the composer it serves, never through it.
+            if let (Some(st), Some(backend), Some(bl), remote) = (
                 self.composers.get_mut(&id),
                 self.terms.get(&id),
                 self.blocks.get(&id),
+                self.comp_cache.get(&id),
             ) {
                 let out = composer::show(
                     ui,
@@ -871,6 +875,7 @@ impl App {
                     font,
                     cover_line,
                     prompt_cwd.as_deref(),
+                    remote.map(|c| c as &dyn composer::RemoteDirs),
                 );
                 st.has_focus = out.has_focus;
                 comp_write = out.write;
@@ -881,6 +886,20 @@ impl App {
                 cancel_reconnect_clicked = out.cancel_reconnect;
                 retry_reconnect_clicked = out.retry_reconnect;
                 self.history_btn_rect = out.history_btn;
+                comp_request = out.comp_request;
+            }
+            // remote-completion: ship the ask the completer parked, deduped
+            // by this client's own in-flight map so a double Tab is one
+            // request. Proto-gated: an older daemon drops the connection on
+            // an undecodable C2D variant (the color-tag/sleep skew pattern).
+            if let Some(dir) = comp_request {
+                if self.completion_supported() {
+                    let c = self.comp_cache.entry(id).or_default();
+                    if c.should_ask(&dir) {
+                        c.pending.insert(dir.clone(), std::time::Instant::now());
+                        self.send(C2D::RequestCompletion { id, dir });
+                    }
+                }
             }
             if wake_clicked || restore_clicked {
                 // SLEEP: the strip's Wake ▸ — RestartTerminal IS wake (S5).

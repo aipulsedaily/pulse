@@ -744,7 +744,10 @@ impl TermBackend {
                 HookVerb::Pre { .. } => self.capture_pre(),
                 HookVerb::PromptStart => self.capture_prompt_start(),
                 HookVerb::PromptEnd => self.capture_prompt_end(),
-                HookVerb::Init { .. } | HookVerb::Beacon { .. } => {}
+                // remote-completion: side-channel data; it anchors nothing.
+                HookVerb::Init { .. }
+                | HookVerb::Beacon { .. }
+                | HookVerb::Comp { .. } => {}
             }
         }
         self.parser.advance(&mut self.term, &bytes[done..]);

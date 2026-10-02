@@ -91,7 +91,7 @@ fn is_quoted(fam: &Family, raw: &str) -> bool {
     let quotes: &[char] = match fam {
         Family::Pwsh => &['\'', '"'],
         Family::Cmd | Family::Other => &['"'],
-        Family::Wsl { .. } | Family::Ssh => &['\'', '"'],
+        Family::Wsl { .. } | Family::Remote => &['\'', '"'],
     };
     raw.starts_with(quotes)
 }
@@ -105,7 +105,7 @@ fn is_var(fam: &Family, raw: &str) -> bool {
     match fam {
         Family::Cmd => percent,
         Family::Other => dollar || percent,
-        Family::Pwsh | Family::Wsl { .. } | Family::Ssh => dollar,
+        Family::Pwsh | Family::Wsl { .. } | Family::Remote => dollar,
     }
 }
 

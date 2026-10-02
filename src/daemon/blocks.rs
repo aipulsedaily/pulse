@@ -87,6 +87,23 @@ pub enum HookVerb {
     /// ever RESOLVE a close a token-checked pre armed, never open or forge
     /// one. APPENDED last.
     PromptStart,
+    /// remote-completion: one directory listing, as the hooked shell itself
+    /// sees it (`bootstrap::COMP_FN`). `dir` is the ABSOLUTE path the shell
+    /// resolved and listed (`~`/relative requests are expanded on its side,
+    /// so this is the authoritative cache key); `list` is `ls -A -p -L`
+    /// output — one name per line, a trailing `/` marking a directory;
+    /// `trunc` means the listing blew `COMP_MAX_BYTES` and was DROPPED, so
+    /// the only honest answer is "no candidates" (a common prefix over a
+    /// subset would over-complete).
+    ///
+    /// Token-checked like `init`/`exec`/`pre` — a `comp` carrying an
+    /// unrecognized token is a spoof and never reaches the cache. APPENDED
+    /// last.
+    Comp {
+        dir: String,
+        trunc: bool,
+        list: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -257,6 +274,18 @@ struct PrePayload {
     d: String,
 }
 
+/// remote-completion (`bootstrap::COMP_FN`): `d` = the absolute directory the
+/// shell listed, `t` = over-cap flag, `l` = `ls -A -p -L` output.
+#[derive(serde::Deserialize)]
+struct CompPayload {
+    #[serde(default)]
+    d: String,
+    #[serde(default)]
+    t: u8,
+    #[serde(default)]
+    l: String,
+}
+
 /// Parse an OSC body (bytes between `ESC ]` and the terminator). Only bodies
 /// starting `7717;` are ours — plus the tokenless `133;B` prompt-end and
 /// `133;A` prompt-start markers (P3 / D*); anything malformed is dropped
@@ -358,6 +387,20 @@ fn parse_hook(body: &[u8], offset_after: usize) -> Option<BlockEvent> {
             n: p.n,
             cwd: p.d,
         }),
+        // remote-completion: a listing is accepted only when the shell named
+        // the ABSOLUTE directory it listed — that string is the cache key, and
+        // a relative or empty one could only ever be filed against the wrong
+        // directory. A truncated listing arrives with `l` already empty (the
+        // shell drops it); dropping it again here costs nothing and makes the
+        // invariant local.
+        "comp" => serde_json::from_slice::<CompPayload>(&json)
+            .ok()
+            .filter(|p| p.d.starts_with('/'))
+            .map(|p| HookVerb::Comp {
+                dir: p.d,
+                trunc: p.t != 0,
+                list: if p.t != 0 { String::new() } else { p.l },
+            }),
         _ => None,
     };
     match verb {
@@ -915,6 +958,88 @@ mod tests {
         assert_eq!(collect(1), whole);
         assert_eq!(collect(7), whole);
         assert_eq!(collect(64), whole);
+    }
+
+    /// remote-completion: the `comp` payload parser — every shape the wire
+    /// can carry, including the ones a hostile or broken emitter produces.
+    #[test]
+    fn comp_payload_parser_accepts_only_answerable_listings() {
+        let one = |json: &str| {
+            let mut sc = BlockScanner::new();
+            sc.feed(&hook("comp", json, TOK)).into_iter().next().map(|e| e.verb)
+        };
+        // The ordinary answer.
+        assert_eq!(
+            one(r#"{"d":"/root","t":0,"l":"alpha/\nnotes.txt"}"#),
+            Some(HookVerb::Comp {
+                dir: "/root".into(),
+                trunc: false,
+                list: "alpha/\nnotes.txt".into(),
+            })
+        );
+        // An EMPTY directory is an answer, not a failure — the GUI caches it
+        // and stops asking.
+        assert_eq!(
+            one(r#"{"d":"/empty","t":0,"l":""}"#),
+            Some(HookVerb::Comp { dir: "/empty".into(), trunc: false, list: String::new() })
+        );
+        // OVER-CAP: the listing is dropped on BOTH sides. A subset could only
+        // ever over-complete, so `l` is forced empty here even if an emitter
+        // sent one anyway.
+        assert_eq!(
+            one(r#"{"d":"/huge","t":1,"l":"aaa\nbbb"}"#),
+            Some(HookVerb::Comp { dir: "/huge".into(), trunc: true, list: String::new() })
+        );
+        // The directory must be ABSOLUTE: it is the cache key both sides
+        // agree on, and a relative or missing one could only be filed against
+        // the wrong directory.
+        assert_eq!(one(r#"{"d":"rel/x","t":0,"l":"a"}"#), None);
+        assert_eq!(one(r#"{"d":"","t":0,"l":"a"}"#), None);
+        assert_eq!(one(r#"{"t":0,"l":"a"}"#), None);
+        // Garbage: not JSON, not an object, truncated mid-string, undecodable
+        // hex, odd-length hex. Every one is dropped, none panics.
+        assert_eq!(one("not json"), None);
+        assert_eq!(one("[1,2,3]"), None);
+        assert_eq!(one(r#"{"d":"/root","t":0,"l":"unterminated"#), None);
+        let mut sc = BlockScanner::new();
+        assert!(sc.feed(b"\x1b]7717;0123456789abcdef;comp;zzzz\x07").is_empty());
+        let mut sc = BlockScanner::new();
+        assert!(sc.feed(b"\x1b]7717;0123456789abcdef;comp;7b7\x07").is_empty());
+        // Unknown extra fields are ignored, so the payload can grow.
+        assert_eq!(
+            one(r#"{"d":"/root","t":0,"l":"x","future":[1]}"#),
+            Some(HookVerb::Comp { dir: "/root".into(), trunc: false, list: "x".into() })
+        );
+        // A WRONG-token comp is a spoof: the scanner still parses the
+        // envelope (it is token-agnostic), and `classify_token` upstream is
+        // what rejects it — pinned here so the token slot is never dropped
+        // from the comp path.
+        let evs = {
+            let mut sc = BlockScanner::new();
+            sc.feed(&hook("comp", r#"{"d":"/root","t":0,"l":"x"}"#, "deadbeefdeadbeef"))
+        };
+        assert_eq!(evs[0].token, "deadbeefdeadbeef");
+    }
+
+    /// remote-completion: the shell's byte cap must keep the whole OSC body
+    /// under the scanner's `BODY_CAP`, or a maximal listing would be dropped
+    /// at the carry buffer and the lane would fail exactly on the big
+    /// directories it is bounded for.
+    #[test]
+    fn comp_payload_fits_the_osc_body_cap() {
+        let dir = "/".to_string() + &"d".repeat(1024); // a maximal-ish path
+        let list = "x".repeat(super::super::bootstrap::COMP_MAX_BYTES);
+        let json = format!(r#"{{"d":"{dir}","t":0,"l":"{list}"}}"#);
+        // The body is `7717;<token>;comp;<hex(json)>` — hex doubles it.
+        let body = 5 + TOK.len() + 1 + "comp".len() + 1 + json.len() * 2;
+        assert!(
+            body < BODY_CAP,
+            "a maximal comp body is {body} bytes, over the {BODY_CAP}-byte cap"
+        );
+        // ...and it really does round-trip through the scanner at that size.
+        let mut sc = BlockScanner::new();
+        let evs = sc.feed(&hook("comp", &json, TOK));
+        assert_eq!(evs.len(), 1, "a maximal listing must survive the scanner");
     }
 
     #[test]

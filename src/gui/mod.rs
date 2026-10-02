@@ -285,6 +285,67 @@ fn menu_gates(
     }
 }
 
+/// remote-completion: one terminal's cache of directory listings reported by
+/// the hooked shell on the other machine, and the asks still in flight.
+///
+/// It is a MIRROR of the daemon's own cache, not a second authority: every
+/// entry arrived as a `D2C::Completion` answering a question this client
+/// asked. Its TTLs are shorter than the daemon's (`completion::CACHE_TTL`) on
+/// purpose, so re-asking lands as a cache HIT there — a sub-millisecond
+/// loopback round trip — instead of ever being the thing that keeps a stale
+/// listing alive.
+#[derive(Default)]
+struct CompCache {
+    /// Directory as ASKED → the answer (`None` = a definitive nothing) and
+    /// when it landed.
+    dirs: std::collections::HashMap<String, (Option<complete::RemoteListing>, Instant)>,
+    /// Directory as asked → when the request went out. Dedupes a double Tab
+    /// and expires so a lost answer is eventually re-asked.
+    pending: std::collections::HashMap<String, Instant>,
+}
+
+/// A listing is reused for this long. Short: the directory is on another
+/// machine and anything could have happened to it, and a re-ask is a
+/// loopback round trip answered from the daemon's prefetch cache.
+const COMP_FRESH: Duration = Duration::from_secs(10);
+/// A definitive "nothing" is remembered for this long — long enough that
+/// holding Tab in an unanswerable directory costs one request, not hundreds.
+const COMP_DECLINED: Duration = Duration::from_secs(3);
+/// An in-flight ask is deduped for this long; after it, a lost answer (a
+/// dropped connection, a daemon restart) is asked for again.
+const COMP_INFLIGHT: Duration = Duration::from_secs(3);
+
+impl CompCache {
+    fn fresh(&self, dir: &str, ttl: Duration) -> Option<&Option<complete::RemoteListing>> {
+        self.dirs
+            .get(dir)
+            .filter(|(_, at)| at.elapsed() < ttl)
+            .map(|(l, _)| l)
+    }
+
+    /// True when the ask should go out: not answered recently, not already
+    /// in flight.
+    fn should_ask(&self, dir: &str) -> bool {
+        if self.fresh(dir, COMP_FRESH).is_some_and(Option::is_some)
+            || self.fresh(dir, COMP_DECLINED).is_some_and(Option::is_none)
+        {
+            return false;
+        }
+        self.pending
+            .get(dir)
+            .is_none_or(|at| at.elapsed() >= COMP_INFLIGHT)
+    }
+}
+
+impl complete::RemoteDirs for CompCache {
+    fn listing(&self, dir: &str) -> Option<complete::RemoteListing> {
+        self.fresh(dir, COMP_FRESH)?.clone()
+    }
+    fn declined(&self, dir: &str) -> bool {
+        matches!(self.fresh(dir, COMP_DECLINED), Some(None))
+    }
+}
+
 /// QOL §3.3: the local directory a terminal's cwd maps to (pure, tested).
 /// Win-namespace shells/CLIs: live_cwd else the persisted cwd. WSL: posix
 /// `/mnt/<drive>/…` translates back to the drive form (nicer than UNC);
@@ -1429,6 +1490,10 @@ pub struct App {
     /// frame with epoch > 0 — hookless terminals (claude, cmd) never allocate
     /// one and pay zero cost anywhere in the composer path.
     composers: HashMap<Uuid, ComposerState>,
+    /// remote-completion: per-terminal mirror of the daemon's directory
+    /// listings (`CompCache`). Empty for every purely local terminal — a
+    /// Windows or WSL plan answers from `read_dir` and never looks here.
+    comp_cache: HashMap<Uuid, CompCache>,
     /// The blocks recall panel (P2), open for the selected terminal only.
     blocks_panel: Option<BlocksPanel>,
     /// This frame's header Blocks-button rect: click-outside panel closing
@@ -1793,6 +1858,7 @@ impl App {
             terms: HashMap::new(),
             blocks: HashMap::new(),
             composers: HashMap::new(),
+            comp_cache: HashMap::new(),
             blocks_panel: None,
             blocks_btn_rect: None,
             history: None,
@@ -1992,6 +2058,14 @@ impl App {
         self.ipc.as_ref().is_some_and(|c| c.proto >= 13)
     }
 
+    /// remote-completion: the connected daemon understands proto-14
+    /// `C2D::RequestCompletion` (same skew-window pattern — an older daemon
+    /// drops the connection on the unknown variant, so the send is gated and
+    /// a Tab in a remote directory is simply the old no-op under skew).
+    fn completion_supported(&self) -> bool {
+        self.ipc.as_ref().is_some_and(|c| c.proto >= 14)
+    }
+
     /// The presented lifecycle state of a terminal (SLEEP S1).
     fn presented(&self, id: Uuid) -> PresentedStatus {
         self.state
@@ -2066,10 +2140,27 @@ impl App {
     /// on the composer at creation. Owns the distro for WSL posix↔local
     /// mapping.
     fn family_complete(&self, id: Uuid) -> complete::Family {
-        self.state
+        let fam = self
+            .state
             .terminal(id)
             .map(|t| complete::family_for(&shell_family(&t.kind, &t.program, &t.args)))
-            .unwrap_or(complete::Family::Pwsh)
+            .unwrap_or(complete::Family::Pwsh);
+        // remote-completion: a default-distro WSL terminal (`wsl`, `wsl -u
+        // root` — no `-d`) carried `distro: None`, and with no name there is
+        // no `\\wsl.localhost\<distro>` to build, so EVERY path outside
+        // `/mnt` silently no-opped. The name is not unknowable, though: it is
+        // the Lxss `DefaultDistribution` entry the shell launcher already
+        // reads. Resolved once, here, at composer creation — `family_for`
+        // itself stays pure and registry-free.
+        match fam {
+            complete::Family::Wsl { distro: None } => complete::Family::Wsl {
+                distro: shells::wsl_distros()
+                    .into_iter()
+                    .find(|d| d.is_default)
+                    .map(|d| d.name),
+            },
+            f => f,
+        }
     }
 
     /// P6b §5.2: ship a Cmd-family submission. A proto ≥ 6 daemon gets the
@@ -2750,6 +2841,9 @@ impl App {
                     }
                 }
                 D2C::Reset { id } => {
+                    // remote-completion: the world this terminal's listings
+                    // describe is being rewritten. Drop them.
+                    self.comp_cache.remove(&id);
                     // The daemon rewrote this terminal's world (restore); a
                     // fresh serialized Replay follows — via our own re-Attach
                     // below (proto ≥ 12), or the legacy daemon push. Start
@@ -2908,6 +3002,9 @@ impl App {
                     ));
                 }
                 D2C::Exited { id, .. } => {
+                    // remote-completion: the shell that reported these
+                    // listings is gone; nothing it said is true any more.
+                    self.comp_cache.remove(&id);
                     // SLEEP §7.3: the flag Snapshot precedes the kill's
                     // Exited on the same queue, so the meta is already
                     // truthful here — re-stamp (belt) and let on_exited pick
@@ -2956,6 +3053,37 @@ impl App {
                         self.send(C2D::Attach { id, cols, rows });
                     }
                 }
+                // remote-completion: the answer to a Tab's question about a
+                // directory on another machine. Pure cache fill — the pending
+                // Tab (if the draft has not moved on) applies it on the next
+                // frame through `ComposerState::tab_retry`, so nothing here
+                // reaches into the editor or the submit path.
+                //
+                // Filed under BOTH spellings: `asked` is what this client's
+                // plan will look up again, and `dir` is what the shell
+                // actually resolved — so a later absolute spelling of a `~`
+                // or relative request hits the same answer instead of
+                // re-asking for it.
+                D2C::Completion { id, asked, dir, found, trunc, entries } => {
+                    let c = self.comp_cache.entry(id).or_default();
+                    c.pending.remove(&asked);
+                    let listing = found.then(|| complete::RemoteListing {
+                        entries: entries
+                            .into_iter()
+                            .map(|e| complete::Entry { name: e.name, dir: e.dir })
+                            .collect(),
+                        trunc,
+                    });
+                    let now = Instant::now();
+                    if dir != asked && !dir.is_empty() {
+                        c.dirs.insert(dir, (listing.clone(), now));
+                    }
+                    c.dirs.insert(asked, (listing, now));
+                    // A repaint so the pending Tab retries promptly instead
+                    // of waiting for the next ambient frame.
+                    ctx.request_repaint();
+                }
+
                 D2C::ReplayAnchors { id, items } => {
                     // Restored-history hints (proto 7): join block hints to
                     // their records by start_off (spoofed/stale offsets match

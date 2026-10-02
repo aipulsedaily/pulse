@@ -674,7 +674,7 @@ impl Core {
     }
 
     /// Journal length helper (the quiescence clock both phases read).
-    fn journal_len(&self, id: Uuid) -> Option<u64> {
+    pub(super) fn journal_len(&self, id: Uuid) -> Option<u64> {
         self.journal(id).ok().map(|j| j.lock().absolute_len())
     }
 
@@ -687,7 +687,7 @@ impl Core {
     /// user sees. Field case it exists for: a brand-new account whose zsh
     /// runs `zsh-newuser-install`, a full-screen menu that settles quietly
     /// and then eats a typed line one keypress at a time.
-    fn cursor_row_is_prompt(&self, id: Uuid) -> bool {
+    pub(super) fn cursor_row_is_prompt(&self, id: Uuid) -> bool {
         use alacritty_terminal::grid::Dimensions;
         use alacritty_terminal::index::{Column, Line};
         use alacritty_terminal::term::cell::Flags;
@@ -721,7 +721,7 @@ impl Core {
     /// The mirror IS the truth about what the terminal did — every wrap and
     /// every scroll is already folded into it — so asking it beats trying to
     /// reproduce the terminal's own layout arithmetic daemon-side.
-    fn nesthook_erase_row(&self, id: Uuid, reader: &str) -> Option<usize> {
+    pub(super) fn nesthook_erase_row(&self, id: Uuid, reader: &str) -> Option<usize> {
         use alacritty_terminal::grid::Dimensions;
         use alacritty_terminal::index::{Column, Line};
         use alacritty_terminal::term::cell::Flags;
@@ -754,7 +754,7 @@ impl Core {
     }
 
     /// Is a full-screen program on screen right now?
-    fn terminal_is_alt(&self, id: Uuid) -> bool {
+    pub(super) fn terminal_is_alt(&self, id: Uuid) -> bool {
         let term = self.sessions.lock().get(&id).map(|s| s.term.clone());
         term.is_some_and(|t| {
             t.lock()

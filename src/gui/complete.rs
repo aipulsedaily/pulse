@@ -17,8 +17,23 @@
 //!  • Families: Pwsh/Cmd/Other = Windows namespace, case-INSENSITIVE prefix
 //!    match; WslShell = posix tokens mapped to `/mnt/<drive>` or
 //!    `\\wsl.localhost\<distro>` for enumeration (rendered back as posix),
-//!    case-SENSITIVE; Ssh = NO local view of the remote fs — Tab is a
-//!    silent no-op (never spaces).
+//!    case-SENSITIVE; Remote = a POSIX world no local call can see.
+//!  • remote-completion: `Remote` is the lane that used to be a silent
+//!    no-op. A directory on another machine cannot be enumerated by any
+//!    local syscall, so its listing comes from the hooked shell STANDING in
+//!    it, over the OSC 7717 hook channel the daemon already reads
+//!    (`daemon::completion`). This module stays synchronous and pure: a
+//!    `Dir::Remote` plan is answered from a cache the caller owns, and a
+//!    cache miss returns `Start::Request` — "ask for this directory" — so
+//!    the Tab no-ops exactly as it did before while the answer is fetched.
+//!    The LOCAL lanes are untouched: a Windows or WSL plan is still one
+//!    inline `read_dir`, at the same latency, through the same code.
+//!  • Which world a terminal is IN is not the world it was SPAWNED in:
+//!    typing `ssh host` at a pwsh prompt (or `sudo su` inside that) puts a
+//!    POSIX shell in front of the user while `ShellFamily` still says Pwsh.
+//!    `effective_family` reads that off the tracked cwd — the hooked remote
+//!    shell reports its own `$PWD`, and a POSIX-absolute cwd under a Windows
+//!    family can only mean a POSIX world is live inside it.
 //!  • Quoting reuses drop.rs: PS single-quote, cmd conditional `"…"`, bash
 //!    single-quote — applied to the WHOLE token only when it needs it; the
 //!    tokenizer unquotes on the way in, so cycling a quoted token round-trips.
@@ -63,8 +78,12 @@ pub enum Family {
     /// `distro`: value after -d; None = the default distro (no name to build
     /// a `\\wsl.localhost` UNC with — only `/mnt/<drive>` paths complete).
     Wsl { distro: Option<String> },
-    /// No local view of the remote fs: Tab no-ops, silently.
-    Ssh,
+    /// A POSIX world no local call can see: a Pulse-spawned ssh terminal, a
+    /// typed `ssh host`, a `sudo su` on the far side of either. Posix
+    /// tokenizing and bash quoting; enumeration comes from the hooked remote
+    /// shell (`Dir::Remote`), and with no listing in hand Tab no-ops exactly
+    /// as it always did.
+    Remote,
     /// Hookless/custom shells that somehow gained a composer: Windows
     /// namespace, WT-style bare-or-`"…"` quoting.
     Other,
@@ -77,7 +96,7 @@ pub fn family_for(f: &ShellFamily) -> Family {
         ShellFamily::WslShell { distro } => Family::Wsl {
             distro: distro.clone(),
         },
-        ShellFamily::Ssh { .. } => Family::Ssh,
+        ShellFamily::Ssh { .. } => Family::Remote,
         ShellFamily::Other => Family::Other,
     }
 }
@@ -99,12 +118,12 @@ fn quote_chars(fam: &Family) -> &'static [char] {
         // cmd (and WT-style Other) know only `"…"`.
         Family::Cmd | Family::Other => &['"'],
         // bash: both forms; backslash escapes outside single quotes.
-        Family::Wsl { .. } | Family::Ssh => &['\'', '"'],
+        Family::Wsl { .. } | Family::Remote => &['\'', '"'],
     }
 }
 
 fn bs_escapes(fam: &Family) -> bool {
-    matches!(fam, Family::Wsl { .. } | Family::Ssh)
+    matches!(fam, Family::Wsl { .. } | Family::Remote)
 }
 
 /// Split the WHOLE draft on unquoted whitespace (family quote/escape rules;
@@ -197,11 +216,59 @@ pub(crate) fn token_at(fam: &Family, s: &str, caret: usize) -> Tok {
 
 // ───────────────────────── path resolution ─────────────────────────
 
+/// Where one plan's candidates come from.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Dir {
+    /// A path this process can `read_dir` (may be UNC — then budget-threaded).
+    Local(PathBuf),
+    /// A POSIX directory only the shell standing on that host can list
+    /// (remote-completion). The string is exactly what the shell is asked
+    /// for: absolute, `$PWD`-relative, or `~`-prefixed — the SHELL resolves
+    /// all three, and it is also the cache key both sides agree on.
+    Remote(String),
+    /// WSL: the `\\wsl.localhost` view FIRST (local, no round trip), with the
+    /// hook channel as the fallback. The two differ in exactly the cases
+    /// that matter: a nested `sudo su` world's `/root` is readable by the
+    /// distro's root shell and EACCES over the UNC share, and a
+    /// default-distro terminal may have no UNC name to build at all.
+    LocalThenRemote(PathBuf, String),
+}
+
+/// One directory as the remote shell reported it (remote-completion). Owned
+/// rather than borrowed so the cache can live behind any lock the caller
+/// likes; the entry count is bounded by `bootstrap::COMP_MAX_BYTES`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RemoteListing {
+    pub entries: Vec<Entry>,
+    /// The directory blew the payload cap and the listing was dropped: the
+    /// honest answer is no candidates (the same verdict `MATCH_BOUND` reaches
+    /// locally — a cycle over a subset would over-complete).
+    pub trunc: bool,
+}
+
+/// The caller's cache of remote listings. A trait so this module keeps no
+/// dependency on the IPC layer and the whole remote lane is testable with a
+/// hand-built map.
+pub trait RemoteDirs {
+    /// `Some` = known (possibly an empty/truncated listing, which is still an
+    /// answer); `None` = not known.
+    fn listing(&self, dir: &str) -> Option<RemoteListing>;
+    /// A DEFINITIVE "nothing" has already come back for this directory — the
+    /// gate declined, the shell did not answer, the path does not exist.
+    /// Without it an unanswerable directory would be asked for forever; with
+    /// it the Tab degrades to the old silent no-op and stays there.
+    ///
+    /// An ask still IN FLIGHT is deliberately NOT declined: the plan keeps
+    /// returning `Start::Request`, which is how `tab_retry` knows to keep
+    /// waiting, and the caller (which owns the send) dedupes.
+    fn declined(&self, dir: &str) -> bool;
+}
+
 /// Everything needed to enumerate + render candidates for one token.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Plan {
-    /// Local directory to enumerate (may be UNC — then budget-threaded).
-    pub fs_dir: PathBuf,
+    /// Where the candidates come from.
+    pub dir: Dir,
     /// Name prefix candidates must start with.
     pub prefix: String,
     /// What precedes the name in the rendered (pre-quoting) token — the
@@ -251,9 +318,79 @@ pub(crate) fn plan(
     value: &str,
 ) -> Option<Plan> {
     match fam {
-        Family::Ssh => None,
+        Family::Remote => plan_remote(cwd, value),
         Family::Wsl { distro } => plan_wsl(cwd, distro.as_deref(), value),
         _ => plan_win(fam, cwd, home, value),
+    }
+}
+
+/// Canonical spelling of a directory the SHELL will be asked for: no trailing
+/// separator (so `src/` and `src` are one cache key on both sides), except
+/// for the root itself, which IS its separator.
+fn canon_req(d: &str) -> String {
+    let t = d.trim_end_matches('/');
+    if t.is_empty() {
+        "/".to_string()
+    } else {
+        t.to_string()
+    }
+}
+
+/// remote-completion: a POSIX plan whose listing can only come from the
+/// shell on the other machine.
+///
+/// It never resolves anything it cannot know. `~` is passed through to the
+/// shell VERBATIM — the remote home is the shell's business, and the v1
+/// WSL `~` no-op existed precisely because guessing it would complete
+/// garbage. A relative token is anchored at the tracked cwd, which for a
+/// remote world is the hooked shell's own reported `$PWD`; `..` is left in
+/// the request rather than folded, so the SHELL (and `ls`) resolve symlinked
+/// parents the way the user's own `cd ..` would.
+fn plan_remote(cwd: Option<&str>, value: &str) -> Option<Plan> {
+    let (parent, prefix) = match value.rfind('/') {
+        Some(i) => (&value[..i + 1], &value[i + 1..]),
+        None => ("", value),
+    };
+    let req = if parent.starts_with('~') || parent.starts_with('/') {
+        parent.to_string()
+    } else {
+        let c = cwd.filter(|c| c.starts_with('/'))?;
+        format!("{}/{parent}", c.trim_end_matches('/'))
+    };
+    Some(Plan {
+        dir: Dir::Remote(canon_req(&req)),
+        prefix: prefix.to_string(),
+        render_parent: parent.to_string(),
+        sep: '/',
+        ci: false,
+        posix_hidden: true,
+    })
+}
+
+/// The world the terminal is IN right now, which is not always the world it
+/// was SPAWNED in (remote-completion).
+///
+/// A typed `ssh host` — the field-reported case — leaves `ShellFamily` at
+/// Pwsh/Cmd forever: it is derived from the persisted program+args and
+/// nothing about typing a command changes that. What DOES change is the
+/// tracked cwd: the remote shell Pulse hooked (its own ssh rcfile, or
+/// `nesthook`'s injection into a shell it witnessed being opened) reports its
+/// `$PWD`, and the daemon folds that into `live_cwd`. A POSIX-ABSOLUTE cwd
+/// under a Windows family is therefore not ambiguous — a Windows shell's cwd
+/// is always drive-shaped — and it can only mean a POSIX world is live in
+/// front of the user. That is the signal, and it is a witness, not a guess.
+///
+/// Scoped to completion on purpose: the composer's highlighter and quoting
+/// still follow the SPAWN family. Widening it is a separate change with its
+/// own blast radius (paste quoting, the history ghost's path heuristics),
+/// and completing the wrong filesystem is the bug in front of us.
+pub fn effective_family(fam: &Family, cwd: Option<&str>) -> Family {
+    let posix_cwd = cwd.is_some_and(|c| c.starts_with('/'));
+    match fam {
+        // WSL keeps its local UNC lane (and its own remote fallback).
+        Family::Wsl { .. } | Family::Remote => fam.clone(),
+        _ if posix_cwd => Family::Remote,
+        _ => fam.clone(),
     }
 }
 
@@ -268,7 +405,7 @@ fn plan_win(fam: &Family, cwd: Option<&str>, home: Option<&str>, value: &str) ->
     // "C:" ≠ "C:\" trap: bare drives resolve against a per-process cwd).
     if value.len() == 2 && win_shaped(value) {
         return Some(Plan {
-            fs_dir: PathBuf::from(format!("{value}\\")),
+            dir: Dir::Local(PathBuf::from(format!("{value}\\"))),
             prefix: String::new(),
             render_parent: format!("{value}{sep}"),
             sep,
@@ -308,7 +445,7 @@ fn plan_win(fam: &Family, cwd: Option<&str>, home: Option<&str>, value: &str) ->
         (Path::new(c).join(parent), parent.to_string())
     };
     Some(Plan {
-        fs_dir,
+        dir: Dir::Local(fs_dir),
         prefix: prefix.to_string(),
         render_parent,
         sep,
@@ -319,9 +456,11 @@ fn plan_win(fam: &Family, cwd: Option<&str>, home: Option<&str>, value: &str) ->
 
 fn plan_wsl(cwd: Option<&str>, distro: Option<&str>, value: &str) -> Option<Plan> {
     if value.starts_with('~') {
-        // The distro user's home isn't knowable from the GUI — no-op
-        // (never-guess; a wrong home would complete garbage).
-        return None;
+        // The distro user's home isn't knowable from the GUI — but it IS
+        // knowable to the shell, which is hooked. remote-completion routes
+        // `~` straight through to it rather than guessing (the v1 no-op) or
+        // completing a Windows `%USERPROFILE%` that does not exist in there.
+        return plan_remote(cwd, value);
     }
     let (parent, prefix) = match value.rfind('/') {
         Some(i) => (&value[..i + 1], &value[i + 1..]),
@@ -342,9 +481,16 @@ fn plan_wsl(cwd: Option<&str>, distro: Option<&str>, value: &str) -> Option<Plan
         };
         format!("{}/{parent}", base.trim_end_matches('/'))
     };
-    let fs_dir = posix_to_local(&posix_parent, distro)?;
+    // The UNC/drive view when one exists (local, no round trip), with the
+    // hook channel behind it; a default-distro terminal inside the distro fs
+    // has no UNC name to build and goes straight to the shell.
+    let req = canon_req(&posix_parent);
+    let dir = match posix_to_local(&posix_parent, distro) {
+        Some(fs) => Dir::LocalThenRemote(fs, req),
+        None => Dir::Remote(req),
+    };
     Some(Plan {
-        fs_dir,
+        dir,
         prefix: prefix.to_string(),
         render_parent: parent.to_string(),
         sep: '/',
@@ -440,6 +586,89 @@ fn enum_budgeted(
     rx.recv_timeout(UNC_BUDGET).ok().flatten()
 }
 
+/// remote-completion: the same filter/order over a listing the shell already
+/// sent. No IO, no budget, no thread — the round trip happened before the
+/// Tab, which is the whole point of the prefetch lane.
+fn enum_remote(l: &RemoteListing, prefix: &str, posix_hidden: bool) -> EnumOut {
+    if l.trunc {
+        // The shell dropped the listing rather than send a subset.
+        return EnumOut {
+            matches: Vec::new(),
+            capped: false,
+        };
+    }
+    let want_hidden = prefix.starts_with('.');
+    let mut matches: Vec<Entry> = l
+        .entries
+        .iter()
+        .filter(|e| !(posix_hidden && e.name.starts_with('.') && !want_hidden))
+        .filter(|e| e.name.starts_with(prefix))
+        .cloned()
+        .collect();
+    matches.sort_by(|a, b| {
+        b.dir
+            .cmp(&a.dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    EnumOut {
+        matches,
+        capped: false,
+    }
+}
+
+/// What enumerating a plan produced.
+enum Enumerated {
+    Found(EnumOut),
+    /// remote-completion: only the shell can answer, and it has not been
+    /// asked yet. The caller asks and this Tab no-ops — the honest degrade.
+    Ask(String),
+    /// Nothing, and nothing to ask: exactly today's silent no-op.
+    Nothing,
+}
+
+/// Resolve a plan's target to candidates. The LOCAL legs are byte-for-byte
+/// the pre-remote path (one `read_dir`, same budget, same caps); the remote
+/// leg is a cache lookup; the WSL leg tries local first and only falls
+/// through when the Windows-side view cannot answer at all (no such
+/// directory, or EACCES — a nested root shell's `/root` over the UNC share).
+fn enumerate(
+    plan: &Plan,
+    cap: usize,
+    remote: Option<&dyn RemoteDirs>,
+) -> Enumerated {
+    let ask = |dir: &str| match remote {
+        Some(r) => match r.listing(dir) {
+            Some(l) => Enumerated::Found(enum_remote(&l, &plan.prefix, plan.posix_hidden)),
+            None if r.declined(dir) => Enumerated::Nothing,
+            None => Enumerated::Ask(dir.to_string()),
+        },
+        None => Enumerated::Nothing,
+    };
+    match &plan.dir {
+        Dir::Local(fs) => match enum_budgeted(
+            fs.clone(),
+            plan.prefix.clone(),
+            plan.ci,
+            plan.posix_hidden,
+            cap,
+        ) {
+            Some(out) => Enumerated::Found(out),
+            None => Enumerated::Nothing,
+        },
+        Dir::Remote(dir) => ask(dir),
+        Dir::LocalThenRemote(fs, dir) => match enum_budgeted(
+            fs.clone(),
+            plan.prefix.clone(),
+            plan.ci,
+            plan.posix_hidden,
+            cap,
+        ) {
+            Some(out) => Enumerated::Found(out),
+            None => ask(dir),
+        },
+    }
+}
+
 // ───────────────────────── rendering + quoting ─────────────────────────
 
 /// Build the full replacement token for one candidate: parent spelling as
@@ -472,7 +701,7 @@ fn quote_token(fam: &Family, t: &str) -> String {
             }
         }
         Family::Cmd => super::drop::cmd_quote(t),
-        Family::Wsl { .. } | Family::Ssh => {
+        Family::Wsl { .. } | Family::Remote => {
             const SPECIAL: &[char] = &[
                 '\'', '"', '`', '$', '&', '|', ';', '(', ')', '<', '>', '*', '?', '[', ']',
                 '{', '}', '!', '#', '~', '\\',
@@ -575,6 +804,12 @@ pub(crate) enum Start {
     /// no cycle; the NEXT Tab re-plans from the completed token, which is
     /// what makes a completed directory descend.
     Edit { draft: String, caret: usize },
+    /// remote-completion: the directory is only knowable from the shell on
+    /// the other machine and no listing is in hand. The caller asks for it
+    /// (`C2D::RequestCompletion`) and this Tab does NOTHING — identical to
+    /// the pre-remote behaviour, which is what makes the lane safe to add:
+    /// the worst case is the old no-op.
+    Request(String),
     /// Nothing to do — the Tab was consumed regardless (never spaces).
     None,
 }
@@ -589,19 +824,16 @@ pub(crate) fn start(
     draft: &str,
     caret: usize,
     cap: usize,
+    remote: Option<&dyn RemoteDirs>,
 ) -> Start {
     let tok = token_at(fam, draft, caret.min(draft.len()));
     let Some(plan) = plan(fam, cwd, home, &tok.value) else {
         return Start::None;
     };
-    let Some(out) = enum_budgeted(
-        plan.fs_dir.clone(),
-        plan.prefix.clone(),
-        plan.ci,
-        plan.posix_hidden,
-        cap,
-    ) else {
-        return Start::None;
+    let out = match enumerate(&plan, cap, remote) {
+        Enumerated::Found(out) => out,
+        Enumerated::Ask(dir) => return Start::Request(dir),
+        Enumerated::Nothing => return Start::None,
     };
     if out.matches.is_empty() {
         return Start::None;
@@ -662,6 +894,69 @@ mod tests {
     fn wsl(d: Option<&str>) -> Family {
         Family::Wsl {
             distro: d.map(str::to_string),
+        }
+    }
+
+    /// The LOCAL target of a plan — `Dir::Local`, or the local half of
+    /// `Dir::LocalThenRemote` (the WSL UNC view, tried first). Panics on a
+    /// purely remote plan, which is what every assertion here wants: these
+    /// tests are about the local lanes staying byte-identical.
+    fn local_of(p: &Plan) -> PathBuf {
+        match &p.dir {
+            Dir::Local(d) | Dir::LocalThenRemote(d, _) => d.clone(),
+            Dir::Remote(d) => panic!("expected a local plan, got remote {d}"),
+        }
+    }
+
+    /// The REMOTE target of a plan: the string the shell will be asked for.
+    fn remote_of(p: &Plan) -> &str {
+        match &p.dir {
+            Dir::Remote(d) | Dir::LocalThenRemote(_, d) => d,
+            Dir::Local(d) => panic!("expected a remote plan, got local {d:?}"),
+        }
+    }
+
+    /// A hand-built listing cache — the whole remote lane is testable
+    /// without a daemon, a PTY or a network.
+    #[derive(Default)]
+    struct FakeRemote {
+        dirs: std::collections::HashMap<String, RemoteListing>,
+        declined: std::collections::HashSet<String>,
+    }
+
+    impl FakeRemote {
+        fn with(mut self, dir: &str, names: &[(&str, bool)]) -> Self {
+            self.dirs.insert(
+                dir.to_string(),
+                RemoteListing {
+                    entries: names
+                        .iter()
+                        .map(|(n, d)| Entry { name: n.to_string(), dir: *d })
+                        .collect(),
+                    trunc: false,
+                },
+            );
+            self
+        }
+        fn truncated(mut self, dir: &str) -> Self {
+            self.dirs.insert(
+                dir.to_string(),
+                RemoteListing { entries: Vec::new(), trunc: true },
+            );
+            self
+        }
+        fn declined(mut self, dir: &str) -> Self {
+            self.declined.insert(dir.to_string());
+            self
+        }
+    }
+
+    impl RemoteDirs for FakeRemote {
+        fn listing(&self, dir: &str) -> Option<RemoteListing> {
+            self.dirs.get(dir).cloned()
+        }
+        fn declined(&self, dir: &str) -> bool {
+            self.declined.contains(dir)
         }
     }
 
@@ -745,27 +1040,27 @@ mod tests {
         let cwd = Some(r"C:\proj");
         // Relative with ../ keeps the typed spelling; sep style follows.
         let p = plan(&pwsh(), cwd, None, "../").unwrap();
-        assert_eq!(p.fs_dir, PathBuf::from(r"C:\proj").join("../"));
+        assert_eq!(local_of(&p), PathBuf::from(r"C:\proj").join("../"));
         assert_eq!((p.render_parent.as_str(), p.sep, p.ci), ("../", '/', true));
         // Relative subdir, backslash style.
         let p = plan(&pwsh(), cwd, None, r"src\ma").unwrap();
-        assert_eq!(p.fs_dir, PathBuf::from(r"C:\proj").join(r"src\"));
+        assert_eq!(local_of(&p), PathBuf::from(r"C:\proj").join(r"src\"));
         assert_eq!((p.prefix.as_str(), p.sep), ("ma", '\\'));
         // Absolute.
         let p = plan(&pwsh(), None, None, r"C:\Users\za").unwrap();
-        assert_eq!(p.fs_dir, PathBuf::from(r"C:\Users\"));
+        assert_eq!(local_of(&p), PathBuf::from(r"C:\Users\"));
         assert_eq!(p.prefix, "za");
         // Bare drive completes the ROOT (never drive-relative).
         let p = plan(&pwsh(), None, None, "C:").unwrap();
-        assert_eq!(p.fs_dir, PathBuf::from(r"C:\"));
+        assert_eq!(local_of(&p), PathBuf::from(r"C:\"));
         assert_eq!((p.prefix.as_str(), p.render_parent.as_str()), ("", r"C:\"));
         // Root-relative anchors at the cwd's drive.
         let p = plan(&pwsh(), cwd, None, r"\tools\x").unwrap();
-        assert_eq!(p.fs_dir, PathBuf::from(r"C:\tools\"));
+        assert_eq!(local_of(&p), PathBuf::from(r"C:\tools\"));
         // ~: pwsh renders it back as typed; cmd expands (no ~ in cmd).
         let home = Some(r"C:\Users\z");
         let p = plan(&pwsh(), None, home, "~/Doc").unwrap();
-        assert_eq!(p.fs_dir, PathBuf::from(r"C:\Users\z/"));
+        assert_eq!(local_of(&p), PathBuf::from(r"C:\Users\z/"));
         assert_eq!(p.render_parent, "~/");
         let p = plan(&Family::Cmd, None, home, r"~\Doc").unwrap();
         assert_eq!(p.render_parent, r"C:\Users\z\");
@@ -804,7 +1099,7 @@ mod tests {
         // Relative against a posix cwd → UNC enumeration, posix render.
         let p = plan(&wsl(d), Some("/home/z"), None, "../").unwrap();
         assert_eq!(
-            p.fs_dir,
+            local_of(&p),
             PathBuf::from(r"\\wsl.localhost\Ubuntu-24.04\home\z\..\")
         );
         assert_eq!((p.render_parent.as_str(), p.sep), ("../", '/'));
@@ -812,17 +1107,22 @@ mod tests {
         assert!(p.posix_hidden);
         // /mnt token → drive-letter enumeration (local, no UNC budget).
         let p = plan(&wsl(d), Some("/home/z"), None, "/mnt/c/Us").unwrap();
-        assert_eq!(p.fs_dir, PathBuf::from(r"C:\"));
+        assert_eq!(local_of(&p), PathBuf::from(r"C:\"));
         assert_eq!(p.prefix, "Us");
         // Windows-shaped pre-first-cd cwd translates through /mnt.
         let p = plan(&wsl(d), Some(r"C:\proj"), None, "src/").unwrap();
-        assert_eq!(p.fs_dir, PathBuf::from(r"C:\proj\src\"));
-        // Default distro: /mnt maps, distro-fs paths honestly no-op.
+        assert_eq!(local_of(&p), PathBuf::from(r"C:\proj\src\"));
+        // Default distro: /mnt still maps to the drive letter; a distro-fs
+        // path has no UNC name to build, so remote-completion routes it to
+        // the shell instead of the old silent no-op.
         let p = plan(&wsl(None), Some("/mnt/c/x"), None, "y/").unwrap();
-        assert_eq!(p.fs_dir, PathBuf::from(r"C:\x\y\"));
-        assert_eq!(plan(&wsl(None), Some("/home/z"), None, "y/"), None);
-        // ~ no-ops on WSL (home unknowable — never guess).
-        assert_eq!(plan(&wsl(d), Some("/home/z"), None, "~/x"), None);
+        assert_eq!(local_of(&p), PathBuf::from(r"C:\x\y\"));
+        let p = plan(&wsl(None), Some("/home/z"), None, "y/").unwrap();
+        assert_eq!(p.dir, Dir::Remote("/home/z/y".into()));
+        // `~` likewise: the SHELL knows the distro user's home, so the token
+        // goes to it verbatim (never a %USERPROFILE% guess).
+        let p = plan(&wsl(d), Some("/home/z"), None, "~/x").unwrap();
+        assert_eq!(p.dir, Dir::Remote("~".into()));
     }
 
     // ── enumeration: ordering, filters, cap ──────────────────────────────
@@ -876,7 +1176,7 @@ mod tests {
         }
         let cwd = dir.to_str().unwrap();
         // cap 3 < 4 entries ⇒ capped ⇒ Edit to the common prefix "aaa".
-        match start(&pwsh(), Some(cwd), None, "cd a", 4, 3) {
+        match start(&pwsh(), Some(cwd), None, "cd a", 4, 3, None) {
             Start::Edit { draft, caret } => {
                 assert_eq!(draft, "cd aaa");
                 assert_eq!(caret, 6);
@@ -885,12 +1185,12 @@ mod tests {
         }
         // No progress beyond the typed prefix ⇒ honest no-op.
         assert!(matches!(
-            start(&pwsh(), Some(cwd), None, "cd aaa", 6, 3),
+            start(&pwsh(), Some(cwd), None, "cd aaa", 6, 3, None),
             Start::None
         ));
         // Under the cap the same dir cycles normally.
         assert!(matches!(
-            start(&pwsh(), Some(cwd), None, "cd a", 4, ENUM_CAP),
+            start(&pwsh(), Some(cwd), None, "cd a", 4, ENUM_CAP, None),
             Start::Cycle(_)
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -905,7 +1205,7 @@ mod tests {
         std::fs::create_dir(dir.join("bravo")).unwrap();
         touch(&dir, "a file.txt");
         let cwd = dir.to_str().unwrap();
-        let Start::Cycle(mut c) = start(&pwsh(), Some(cwd), None, "cd ", 3, ENUM_CAP) else {
+        let Start::Cycle(mut c) = start(&pwsh(), Some(cwd), None, "cd ", 3, ENUM_CAP, None) else {
             panic!("expected cycle");
         };
         // Forward: dirs first alphabetically, then the quoted spacey file.
@@ -923,7 +1223,7 @@ mod tests {
         assert!(c.matches("cd 'a file.txt'"));
         assert!(!c.matches("cd 'a file.txt' x"));
         // A fresh REVERSE entry lands on the LAST candidate.
-        let Start::Cycle(mut c) = start(&pwsh(), Some(cwd), None, "cd ", 3, ENUM_CAP) else {
+        let Start::Cycle(mut c) = start(&pwsh(), Some(cwd), None, "cd ", 3, ENUM_CAP, None) else {
             panic!("expected cycle");
         };
         assert_eq!(c.step(-1).0, "cd 'a file.txt'");
@@ -936,14 +1236,14 @@ mod tests {
         std::fs::create_dir(dir.join("src")).unwrap();
         touch(&dir.join("src"), "main.rs");
         let cwd = dir.to_str().unwrap();
-        let Start::Edit { draft, caret } = start(&pwsh(), Some(cwd), None, "cd sr", 5, ENUM_CAP)
+        let Start::Edit { draft, caret } = start(&pwsh(), Some(cwd), None, "cd sr", 5, ENUM_CAP, None)
         else {
             panic!("expected single-candidate Edit");
         };
         assert_eq!(draft, r"cd src\");
         assert_eq!(caret, 7);
         // The NEXT Tab re-plans from the completed token — descends.
-        let Start::Edit { draft, .. } = start(&pwsh(), Some(cwd), None, &draft, 7, ENUM_CAP)
+        let Start::Edit { draft, .. } = start(&pwsh(), Some(cwd), None, &draft, 7, ENUM_CAP, None)
         else {
             panic!("expected descent");
         };
@@ -958,7 +1258,7 @@ mod tests {
         touch(&dir.join("a dir"), "it's.txt");
         let cwd = dir.to_str().unwrap();
         // Completing into a spacey dir quotes the WHOLE token…
-        let Start::Edit { draft, caret } = start(&pwsh(), Some(cwd), None, "cd a", 4, ENUM_CAP)
+        let Start::Edit { draft, caret } = start(&pwsh(), Some(cwd), None, "cd a", 4, ENUM_CAP, None)
         else {
             panic!();
         };
@@ -966,7 +1266,7 @@ mod tests {
         // …and the quoted token re-tokenizes for the next Tab: descend into
         // it, meeting a name with a quote (pwsh doubles it).
         let Start::Edit { draft, .. } =
-            start(&pwsh(), Some(cwd), None, &draft, caret, ENUM_CAP)
+            start(&pwsh(), Some(cwd), None, &draft, caret, ENUM_CAP, None)
         else {
             panic!();
         };
@@ -1000,7 +1300,7 @@ mod tests {
         std::fs::create_dir(dir.join("Program Files")).unwrap();
         std::fs::create_dir(dir.join("plain")).unwrap();
         let cwd = dir.to_str().unwrap();
-        let Start::Cycle(mut c) = start(&Family::Cmd, Some(cwd), None, "cd p", 4, ENUM_CAP)
+        let Start::Cycle(mut c) = start(&Family::Cmd, Some(cwd), None, "cd p", 4, ENUM_CAP, None)
         else {
             panic!();
         };
@@ -1009,19 +1309,270 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ── remote-completion: the source matrix ─────────────────────────────
+
+    /// WHERE each (family, cwd) pair takes its candidates from — the whole
+    /// point of the change, as one table.
+    ///
+    /// The rows that were SILENT no-ops before this exists are the
+    /// field-reported ones: a Windows family whose tracked cwd is a POSIX
+    /// path (a typed `ssh host`, or a `sudo su` inside it), an ssh-program
+    /// terminal, and a default-distro WSL shell outside `/mnt`.
+    #[test]
+    fn completion_source_matrix() {
+        // Local pwsh / cmd / other: a drive-lettered cwd, one local
+        // read_dir. The remote cache is never consulted.
+        for fam in [pwsh(), Family::Cmd, Family::Other] {
+            let p = plan(&fam, Some(r"C:\proj"), None, "s").unwrap();
+            assert!(matches!(p.dir, Dir::Local(_)), "{fam:?} must stay local");
+        }
+        // WSL with a NAMED distro: the UNC view first, the hook channel
+        // behind it (a nested root shell's /root is EACCES over the share).
+        let p = plan(&wsl(Some("U")), Some("/home/z"), None, "d").unwrap();
+        assert_eq!(
+            p.dir,
+            Dir::LocalThenRemote(
+                PathBuf::from(r"\\wsl.localhost\U\home\z\"),
+                "/home/z".into()
+            )
+        );
+        // WSL DEFAULT distro inside the distro fs: no UNC name to build —
+        // it used to return None (silent no-op); now the shell answers.
+        let p = plan(&wsl(None), Some("/home/z"), None, "d").unwrap();
+        assert_eq!(p.dir, Dir::Remote("/home/z".into()));
+        // ...and /mnt still resolves to a DRIVE LETTER, which is an ordinary
+        // local directory — the hook channel sits behind it as a fallback
+        // that only matters if the Windows-side read fails.
+        let p = plan(&wsl(None), Some("/mnt/c/x"), None, "d").unwrap();
+        assert_eq!(
+            p.dir,
+            Dir::LocalThenRemote(PathBuf::from(r"C:\x\"), "/mnt/c/x".into())
+        );
+
+        // An ssh-PROGRAM terminal: remote, always.
+        let p = plan(&Family::Remote, Some("/var/log"), None, "s").unwrap();
+        assert_eq!(p.dir, Dir::Remote("/var/log".into()));
+
+        // THE FIELD REPORT: pwsh/cmd that typed `ssh host` and cd'd on the
+        // far side. `ShellFamily` still says Pwsh/Cmd; the tracked cwd is
+        // the remote shell's own reported $PWD, and that is the witness.
+        for fam in [pwsh(), Family::Cmd] {
+            let eff = effective_family(&fam, Some("/root"));
+            assert_eq!(eff, Family::Remote, "{fam:?} inside a remote shell");
+            let p = plan(&eff, Some("/root"), None, "pro").unwrap();
+            assert_eq!(p.dir, Dir::Remote("/root".into()));
+            assert_eq!(p.prefix, "pro");
+            assert!(!p.ci, "posix is case-SENSITIVE");
+            assert!(p.posix_hidden, "posix hides dotfiles");
+            // With no cwd witness at all, a Windows family stays Windows —
+            // never promoted on a guess.
+            assert_eq!(effective_family(&fam, None), fam);
+            assert_eq!(effective_family(&fam, Some(r"C:\proj")), fam);
+        }
+        // WSL and Remote are never re-derived: WSL keeps its local lane.
+        assert_eq!(
+            effective_family(&wsl(Some("U")), Some("/home/z")),
+            wsl(Some("U"))
+        );
+        assert_eq!(effective_family(&Family::Remote, None), Family::Remote);
+    }
+
+    /// `plan_remote` resolves only what it can know and hands the rest to
+    /// the shell, which is the only thing that knows a remote `$HOME`.
+    #[test]
+    fn plan_remote_requests_and_render_spelling() {
+        let r = Family::Remote;
+        // Empty token: the cwd itself — and spelled EXACTLY as the prompt
+        // hook reports `$PWD`, so the prefetch is a cache HIT (the whole
+        // reason `cd <Tab>` is instant).
+        let p = plan(&r, Some("/root"), None, "").unwrap();
+        assert_eq!(remote_of(&p), "/root");
+        assert_eq!((p.prefix.as_str(), p.render_parent.as_str()), ("", ""));
+        // Relative: anchored at the cwd, trailing separator canonicalized
+        // away so `src` and `src/` are ONE key on both sides.
+        let p = plan(&r, Some("/root"), None, "src/ma").unwrap();
+        assert_eq!(remote_of(&p), "/root/src");
+        assert_eq!((p.prefix.as_str(), p.render_parent.as_str()), ("ma", "src/"));
+        // `..` is left for the shell to resolve — folding it here would walk
+        // through a symlinked parent the user's own `cd ..` would not.
+        let p = plan(&r, Some("/home/z"), None, "../").unwrap();
+        assert_eq!(remote_of(&p), "/home/z/..");
+        // Absolute.
+        let p = plan(&r, Some("/root"), None, "/etc/ss").unwrap();
+        assert_eq!((remote_of(&p), p.prefix.as_str()), ("/etc", "ss"));
+        // Root is its own separator.
+        let p = plan(&r, Some("/root"), None, "/e").unwrap();
+        assert_eq!((remote_of(&p), p.prefix.as_str()), ("/", "e"));
+        // A cwd that IS the root still anchors.
+        let p = plan(&r, Some("/"), None, "e").unwrap();
+        assert_eq!(remote_of(&p), "/");
+        // `~` goes to the shell VERBATIM — the remote home is unknowable
+        // here, and guessing %USERPROFILE% would complete a Windows path
+        // that does not exist on that host.
+        let p = plan(&r, Some("/root"), None, "~/Doc").unwrap();
+        assert_eq!((remote_of(&p), p.render_parent.as_str()), ("~", "~/"));
+        let p = plan(&r, Some("/root"), None, "~/").unwrap();
+        assert_eq!(remote_of(&p), "~");
+        // A WSL `~` takes the same lane (it used to be a flat no-op).
+        let p = plan(&wsl(Some("U")), Some("/home/z"), None, "~/x").unwrap();
+        assert_eq!(remote_of(&p), "~");
+        // A relative token with no cwd, or a Windows-shaped one, cannot be
+        // anchored: honest None, exactly like the local lanes.
+        assert_eq!(plan(&r, None, None, "src/"), None);
+        assert_eq!(plan(&r, Some(r"C:\proj"), None, "src/"), None);
+    }
+
+    /// The remote lane cycles, orders and quotes IDENTICALLY to the local
+    /// one — same dirs-first ordering, same trailing separator, same posix
+    /// dotfile rule, same bash quoting.
+    #[test]
+    fn remote_listing_cycles_like_a_local_dir() {
+        let r = Family::Remote;
+        let rem = FakeRemote::default().with(
+            "/root",
+            &[
+                ("notes.txt", false),
+                ("bravo", true),
+                ("alpha", true),
+                ("a file.txt", false),
+                (".hidden", false),
+                (".config", true),
+            ],
+        );
+        let Start::Cycle(mut c) =
+            start(&r, Some("/root"), None, "cd ", 3, ENUM_CAP, Some(&rem))
+        else {
+            panic!("expected a cycle from the cached listing");
+        };
+        // Dirs first, alphabetical within groups; dotfiles hidden for a bare
+        // prefix; a spacey name bash-quoted as a WHOLE token.
+        assert_eq!(c.step(1).0, "cd alpha/");
+        assert_eq!(c.step(1).0, "cd bravo/");
+        assert_eq!(c.step(1).0, "cd 'a file.txt'");
+        assert_eq!(c.step(1).0, "cd notes.txt");
+        assert_eq!(c.step(1).0, "cd alpha/", "wraps");
+        assert_eq!(c.restore().0, "cd ", "Esc restores byte-exact");
+        // A `.` prefix reveals them, dirs still first.
+        let Start::Cycle(mut c) =
+            start(&r, Some("/root"), None, "cd .", 4, ENUM_CAP, Some(&rem))
+        else {
+            panic!();
+        };
+        assert_eq!(c.step(1).0, "cd .config/");
+        assert_eq!(c.step(1).0, "cd .hidden");
+        // Case SENSITIVITY: posix never folds.
+        let rem2 = FakeRemote::default().with("/root", &[("Notes", false)]);
+        assert!(matches!(
+            start(&r, Some("/root"), None, "cd n", 4, ENUM_CAP, Some(&rem2)),
+            Start::None
+        ));
+        // A single candidate completes without a cycle and the NEXT Tab
+        // descends — which is what asks for the subdirectory's listing.
+        let rem3 = FakeRemote::default().with("/root", &[("src", true)]);
+        let Start::Edit { draft, caret } =
+            start(&r, Some("/root"), None, "cd sr", 5, ENUM_CAP, Some(&rem3))
+        else {
+            panic!("expected a single-candidate Edit");
+        };
+        assert_eq!((draft.as_str(), caret), ("cd src/", 7));
+        assert!(matches!(
+            start(&r, Some("/root"), None, &draft, caret, ENUM_CAP, Some(&rem3)),
+            Start::Request(ref d) if d == "/root/src"
+        ));
+    }
+
+    /// Everything the remote lane does when it has no answer — and every one
+    /// of them is the pre-remote silent no-op or an ask, never a guess.
+    #[test]
+    fn remote_misses_ask_once_then_degrade() {
+        let r = Family::Remote;
+        // Unknown directory with a cache present: ASK, and the Tab does
+        // nothing this frame.
+        let rem = FakeRemote::default();
+        assert!(matches!(
+            start(&r, Some("/root"), None, "cd x", 4, ENUM_CAP, Some(&rem)),
+            Start::Request(ref d) if d == "/root"
+        ));
+        // A DEFINITIVE nothing came back for it: no candidates, and no
+        // further asking — holding Tab costs one request, not hundreds.
+        let rem = FakeRemote::default().declined("/root");
+        assert!(matches!(
+            start(&r, Some("/root"), None, "cd x", 4, ENUM_CAP, Some(&rem)),
+            Start::None
+        ));
+        // NO cache at all (a pre-proto-14 daemon, a terminal with no remote
+        // world): byte-identical to the behaviour this change replaced.
+        assert!(matches!(
+            start(&r, Some("/root"), None, "cd x", 4, ENUM_CAP, None),
+            Start::None
+        ));
+        // Over-cap directory: the shell dropped the listing rather than send
+        // a subset, so there is nothing to complete and nothing to prefix —
+        // a common prefix over a subset would OVER-complete.
+        let rem = FakeRemote::default().truncated("/root");
+        assert!(matches!(
+            start(&r, Some("/root"), None, "cd a", 4, ENUM_CAP, Some(&rem)),
+            Start::None
+        ));
+        // An empty directory is an ANSWER, not a miss: no candidates, no ask.
+        let rem = FakeRemote::default().with("/root", &[]);
+        assert!(matches!(
+            start(&r, Some("/root"), None, "cd a", 4, ENUM_CAP, Some(&rem)),
+            Start::None
+        ));
+    }
+
+    /// The WSL fallback: local UNC first (byte-identical latency and
+    /// results), the hook channel only when the Windows-side view cannot
+    /// answer at all — the nested `sudo su` `/root` case.
+    #[test]
+    fn wsl_prefers_the_local_view_and_falls_back() {
+        let dir = scratch("wslfb");
+        std::fs::create_dir(dir.join("local_only")).unwrap();
+        // A plan whose LOCAL half exists: the remote cache is ignored even
+        // when it holds a different (stale) answer.
+        let p = Plan {
+            dir: Dir::LocalThenRemote(dir.clone(), "/home/z".into()),
+            prefix: String::new(),
+            render_parent: String::new(),
+            sep: '/',
+            ci: false,
+            posix_hidden: true,
+        };
+        let rem = FakeRemote::default().with("/home/z", &[("remote_only", true)]);
+        let Enumerated::Found(out) = enumerate(&p, ENUM_CAP, Some(&rem)) else {
+            panic!("the local view must win");
+        };
+        assert_eq!(out.matches.len(), 1);
+        assert_eq!(out.matches[0].name, "local_only");
+        // An UNREADABLE local half (EACCES / missing — a root-owned /root
+        // over the UNC share) falls through to the shell.
+        let p = Plan {
+            dir: Dir::LocalThenRemote(dir.join("nope"), "/home/z".into()),
+            ..p
+        };
+        let Enumerated::Found(out) = enumerate(&p, ENUM_CAP, Some(&rem)) else {
+            panic!("expected the remote fallback");
+        };
+        assert_eq!(out.matches[0].name, "remote_only");
+        // ...and with no cache, the old honest no-op.
+        assert!(matches!(enumerate(&p, ENUM_CAP, None), Enumerated::Nothing));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn ssh_and_missing_context_no_op() {
         assert!(matches!(
-            start(&Family::Ssh, Some("/home/z"), None, "cd x", 4, ENUM_CAP),
+            start(&Family::Remote, Some("/home/z"), None, "cd x", 4, ENUM_CAP, None),
             Start::None
         ));
         // Nonexistent dir / no cwd for a relative token: silent no-op.
         assert!(matches!(
-            start(&pwsh(), Some(r"C:\definitely\not\a\dir\xyz"), None, "cd x", 4, ENUM_CAP),
+            start(&pwsh(), Some(r"C:\definitely\not\a\dir\xyz"), None, "cd x", 4, ENUM_CAP, None),
             Start::None
         ));
         assert!(matches!(
-            start(&pwsh(), None, None, "cd x", 4, ENUM_CAP),
+            start(&pwsh(), None, None, "cd x", 4, ENUM_CAP, None),
             Start::None
         ));
     }
