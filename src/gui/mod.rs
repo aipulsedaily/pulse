@@ -3065,6 +3065,26 @@ impl App {
                 // or relative request hits the same answer instead of
                 // re-asking for it.
                 D2C::Completion { id, asked, dir, found, trunc, entries } => {
+                    // Observability (v0.1.21): paired 1:1 with the `asking
+                    // for` line central.rs writes, so the log alone separates
+                    // "never asked" from "asked, got nothing" from "asked,
+                    // answered, still did not complete" — the three outcomes
+                    // v0.1.20 could not be told apart.
+                    log::info!(
+                        "terminal {id}: remote completion of {asked} answered{} — {}",
+                        if dir == asked {
+                            String::new()
+                        } else {
+                            format!(" (resolved {dir})")
+                        },
+                        if !found {
+                            "nothing".to_string()
+                        } else if trunc {
+                            "over the listing cap, dropped".to_string()
+                        } else {
+                            format!("{} entries", entries.len())
+                        }
+                    );
                     let c = self.comp_cache.entry(id).or_default();
                     c.pending.remove(&asked);
                     let listing = found.then(|| complete::RemoteListing {

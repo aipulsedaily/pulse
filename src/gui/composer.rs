@@ -1005,6 +1005,20 @@ pub struct ComposerState {
     heur_cover_row: Option<i32>,
 }
 
+impl ComposerState {
+    /// A composer carrying one draft and one family, everything else at its
+    /// default. The private fields make struct-update syntax unusable outside
+    /// this module, and the live `nested_completion` probe has to build a
+    /// composer in a known state to drive a real Tab through it.
+    pub fn for_draft(draft: impl Into<String>, fam: complete::Family) -> Self {
+        Self {
+            draft: draft.into(),
+            fam,
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for ComposerState {
     fn default() -> Self {
         Self {
@@ -2668,6 +2682,15 @@ impl ComposerState {
     /// and the tracked cwd is the witness that says so.
     fn tab_fam(&self, cwd: Option<&str>) -> complete::Family {
         complete::effective_family(&self.fam, cwd)
+    }
+
+    /// remote-completion: whether this composer's Tab can need the remote
+    /// lane (`complete::remote_lane_possible`) — the app's cue to have a
+    /// listing cache in hand BEFORE the first Tab, so the very first press
+    /// can park its ask instead of reading as "nothing to ask". The spawn
+    /// family is private, so the question is answered here.
+    pub(crate) fn remote_lane_possible(&self, cwd: Option<&str>) -> bool {
+        complete::remote_lane_possible(&self.fam, cwd)
     }
 
     /// One frame's Tab traffic: `delta` = net presses (+forward/−reverse,
@@ -5714,6 +5737,56 @@ mod tests {
         let mut st = drafted("cd al");
         assert_eq!(st.tab_press(Some(r"C:\nope\xyz"), 5, 1, Some(&rem)), None);
         assert_eq!(st.take_comp_request(), None, "a local plan never asks");
+    }
+
+    /// THE v0.1.20 FIELD BUG at the seam that shipped it: the very first Tab
+    /// in a remote world asks ONLY if the app has already handed the composer
+    /// a cache, and `remote_lane_possible` is how the app knows to. Without
+    /// it `central.rs` passed `None` (its `comp_cache` had no entry yet),
+    /// `None` reads as "nothing to ask", and the ask that would have created
+    /// the entry was never produced — `cd pr<Tab>` inside a real ssh session
+    /// did nothing, forever.
+    #[test]
+    fn the_first_tab_in_a_remote_world_must_be_given_a_cache() {
+        let mut st = drafted("cd pr");
+        assert_eq!(st.fam, complete::Family::Pwsh, "the SPAWN family is pwsh");
+        // The predicate the app keys the cache on, in his exact shape.
+        assert!(
+            st.remote_lane_possible(Some("/home/dev")),
+            "a pwsh terminal reporting a POSIX cwd needs the remote cache"
+        );
+        assert!(
+            !st.remote_lane_possible(Some(r"C:\Users\dev")),
+            "a local pwsh terminal must stay cache-free"
+        );
+
+        // What v0.1.20 did: no cache ⇒ no ask, no edit, nothing to log.
+        assert_eq!(st.tab_press(Some("/home/dev"), 5, 1, None), None);
+        assert_eq!(st.draft, "cd pr");
+        assert_eq!(
+            st.take_comp_request(),
+            None,
+            "this is the dead end: nothing was ever asked for"
+        );
+
+        // With the cache the app now creates up front: the same press parks
+        // the ask, and the answer completes it on a later frame.
+        let mut rem = FakeRemote::default();
+        assert_eq!(st.tab_press(Some("/home/dev"), 5, 1, Some(&rem)), None);
+        assert_eq!(
+            st.take_comp_request().as_deref(),
+            Some("/home/dev"),
+            "an EMPTY cache still asks — that is the whole difference"
+        );
+        rem.answer(
+            "/home/dev",
+            &[("pre-migration-backup", true), ("pre", true), ("prod.log", false)],
+        );
+        st.tab_retry(Some("/home/dev"), Some(&rem)).unwrap();
+        assert_eq!(st.draft, "cd pre/");
+        // His directory is the next candidate in the cycle, dirs first.
+        st.tab_press(Some("/home/dev"), 7, 1, Some(&rem)).unwrap();
+        assert_eq!(st.draft, "cd pre-migration-backup/");
     }
 
     /// The user always wins: a keystroke (or a submit, or Ctrl-R) between

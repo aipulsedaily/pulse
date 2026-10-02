@@ -40,6 +40,42 @@
 
 use super::*;
 
+/// remote-completion OBSERVABILITY, and why it is shaped this way.
+///
+/// v0.1.20 shipped this feature with every line it writes at `debug!`. The
+/// daemon logs at `info!`, and `TC_LOG_DEBUG` refuses to raise that outside a
+/// `TC_DATA_DIR` sandbox — so on a real install the lane was completely
+/// unobservable. When the field report came in ("`cd pr<Tab>` does nothing"),
+/// the log could not say whether a query had been armed, declined, typed,
+/// answered or never asked for at all. That is half the bug.
+///
+/// So the DECISIVE events are `info!` now: a query typed, a query declined
+/// (with the gate's own verdict), a query answered or abandoned. Each is at
+/// most one line per Tab that actually reached the shell, and the only
+/// repeat-prone one — a decline while the user holds Tab — is deduped per
+/// terminal to the FIRST of each (directory, verdict) pair.
+///
+/// The HOT events (a cache hit, every prefetched listing) stay `debug!`,
+/// because they fire per Tab and per `cd` forever. `TC_TRACE_COMPLETION=1`
+/// promotes them to `info!` — the house `TC_TRACE_*` shape, and unlike
+/// `TC_LOG_DEBUG` it works on an ordinary install, which is where the next
+/// field report will come from.
+fn comp_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TC_TRACE_COMPLETION").as_deref() == Ok("1"))
+}
+
+/// One hot-path completion event: `debug!` normally, `info!` under
+/// `TC_TRACE_COMPLETION=1`. Per Tab and per `cd`, never per byte, so
+/// building the message unconditionally costs nothing that matters.
+fn comp_log(msg: &str) {
+    if comp_trace() {
+        log::info!("{msg}");
+    } else {
+        log::debug!("{msg}");
+    }
+}
+
 /// The shell must have been output-quiet this long before a query is typed.
 /// Unlike `nesthook`, which WAITS for quiescence (it has one chance at a
 /// witnessed episode), a Tab that arrives mid-output simply declines: the
@@ -123,10 +159,19 @@ pub(super) struct CompState {
     /// depth → the shell's own `init` report of what it is. The query lane
     /// arms only for a depth whose shell said "bash".
     shells: HashMap<usize, String>,
-    /// A `comp` has actually arrived from this shell: proof the hook body in
+    /// Depths whose shell has actually SENT a `comp`: proof the hook body in
     /// there knows the verb (an older build's body does not), so a query can
     /// expect an answer rather than silence.
-    capable: bool,
+    ///
+    /// Per DEPTH, and retained when a deeper world collapses, for the same
+    /// reason `shells` is: a shell that proved itself once does not become
+    /// incapable because the user ran `sudo su` and came back out. A single
+    /// terminal-wide bool did exactly that — `rebase` cleared it on the way
+    /// back down, and the prefetch that would re-prove it only fires on a cwd
+    /// CHANGE, which returning to an unchanged `$PWD` is not. The query lane
+    /// then stayed `NoCapability` for the rest of the session (rig-observed,
+    /// depth 2 → depth 1, pinned by `capability_survives_a_nested_round_trip`).
+    capable: HashSet<usize>,
     /// The query lane is retired for this spawn — a previous query's erase
     /// was declined, and one visible artifact is the most this feature may
     /// ever cost the user.
@@ -137,6 +182,11 @@ pub(super) struct CompState {
     dirty: bool,
     /// The in-flight query, if any (one at a time, per terminal).
     req: Option<CompReq>,
+    /// The last (directory, verdict) a query was declined for. Holding Tab in
+    /// a directory the lane cannot answer would otherwise write the same
+    /// `info!` line every few hundred milliseconds; the first one is the one
+    /// that explains the failure.
+    last_decline: Option<(String, CompGate)>,
 }
 
 /// One cached listing, stamped with the world it describes. `rebase` already
@@ -281,18 +331,24 @@ impl CompState {
             self.depth = depth;
             self.dirs.clear();
             self.shells.clear();
-            self.capable = false;
+            self.capable.clear();
             self.stood_down = false;
             self.dirty = false;
             self.req = None;
+            self.last_decline = None;
             return;
         }
         if self.depth != depth {
             self.depth = depth;
+            // Listings do NOT survive: the world they describe was being
+            // changed by another shell. Capability and the shell's identity
+            // DO, for every scope at or outside the new one — those are facts
+            // about hook bodies that are still running.
             self.dirs.clear();
             self.shells.retain(|d, _| *d <= depth);
-            self.capable = false;
+            self.capable.retain(|d| *d <= depth);
             self.req = None;
+            self.last_decline = None;
         }
     }
 
@@ -331,6 +387,11 @@ impl CompState {
             .get(&self.depth)
             .is_some_and(|s| bootstrap::comp_query_supported(s))
     }
+
+    /// The shell at the CURRENT depth has proved it speaks `comp`.
+    fn capable_here(&self) -> bool {
+        self.capable.contains(&self.depth)
+    }
 }
 
 impl Core {
@@ -363,7 +424,7 @@ impl Core {
             let mut map = self.completion.lock();
             let st = map.entry(id).or_default();
             st.rebase(epoch, depth);
-            st.capable = true;
+            st.capable.insert(depth);
             st.insert(dir.to_string(), listing.clone(), now);
             // The in-flight query is resolved by the ANSWER, not by the path
             // it asked for: the shell reports what it actually listed, and a
@@ -388,12 +449,19 @@ impl Core {
             }
             (reply, dir.to_string())
         };
-        log::debug!(
+        // A listing that ANSWERS a query is decisive (it closes the loop a
+        // field report asks about) and rare — one per Tab that reached the
+        // shell. An unsolicited one is the prefetch, which fires on every
+        // `cd` forever, so it stays hot.
+        let msg = format!(
             "terminal {id}: remote completion listed {dir_owned} ({n} entr{}, trunc={trunc})",
             if n == 1 { "y" } else { "ies" }
         );
         if let Some((client, asked)) = reply {
+            log::info!("{msg} — answering the query for {asked}");
             self.send_completion(&client, id, &asked, &dir_owned, Some(&listing));
+        } else {
+            comp_log(&msg);
         }
     }
 
@@ -446,6 +514,10 @@ impl Core {
         // A request is a path the GUI read off the draft — bound it before it
         // is ever typed anywhere.
         if dir.is_empty() || dir.len() > 1024 || dir.contains(['\n', '\r', '\0']) {
+            log::info!(
+                "terminal {id}: remote completion request rejected — the directory is empty, \
+                 over 1024 bytes, or carries a newline"
+            );
             self.send_completion(&Arc::downgrade(client), id, dir, dir, None);
             return;
         }
@@ -458,12 +530,35 @@ impl Core {
             st.get(dir, now).cloned()
         };
         if let Some(l) = hit {
+            comp_log(&format!(
+                "terminal {id}: remote completion of {dir} served from the cache \
+                 ({} entries, epoch {epoch}, depth {depth})",
+                l.entries.len()
+            ));
             self.send_completion(&Arc::downgrade(client), id, dir, dir, Some(&l));
             return;
         }
+        comp_log(&format!(
+            "terminal {id}: remote completion cache miss for {dir} (epoch {epoch}, depth {depth})"
+        ));
         let verdict = self.comp_arm(client, id, dir, now);
         if verdict != CompGate::Arm {
-            log::debug!("terminal {id}: remote completion of {dir} declined ({verdict:?})");
+            // Decisive AND repeat-prone: a user holding Tab in a directory the
+            // lane cannot answer would write this every few hundred
+            // milliseconds, so only the FIRST of each (directory, verdict) is
+            // recorded. `rebase` forgets it when the world changes, so a
+            // verdict that becomes true again is said again.
+            let fresh = {
+                let mut map = self.completion.lock();
+                let st = map.entry(id).or_default();
+                let now_pair = (dir.to_string(), verdict);
+                let fresh = st.last_decline.as_ref() != Some(&now_pair);
+                st.last_decline = Some(now_pair);
+                fresh
+            };
+            if fresh {
+                log::info!("terminal {id}: remote completion of {dir} declined ({verdict:?})");
+            }
             // Honest degrade: the GUI learns there is nothing, and stops
             // asking for a short while (its own negative cache).
             self.send_completion(&Arc::downgrade(client), id, dir, dir, None);
@@ -518,7 +613,7 @@ impl Core {
             let st = map.entry(id).or_default();
             let v = comp_gate(
                 running,
-                st.capable && hooks_live,
+                st.capable_here() && hooks_live,
                 st.bash_here(),
                 st.stood_down,
                 st.req.is_some(),
@@ -550,7 +645,9 @@ impl Core {
             self.completion.lock().get_mut(&id).map(|s| s.req.take());
             return CompGate::NotRunning;
         }
-        log::debug!("terminal {id}: remote completion query typed for {dir}");
+        // Decisive: the one event that proves the lane reached the user's own
+        // shell. One line per Tab that missed the cache and passed the gate.
+        log::info!("terminal {id}: remote completion query typed for {dir}");
         CompGate::Arm
     }
 
@@ -726,7 +823,7 @@ impl Core {
             map.get_mut(&id).and_then(|s| s.req.take())
         };
         if let Some(r) = taken {
-            log::debug!(
+            log::info!(
                 "terminal {id}: remote completion query for {} abandoned after {}ms — {why}",
                 r.dir,
                 r.armed.elapsed().as_millis()
@@ -919,15 +1016,66 @@ mod tests {
         st.rebase(1, 1);
         assert!(!st.bash_here(), "depth 1 reported zsh — no query lane there");
         st.insert("/deep".into(), one("q"), now);
-        st.capable = true;
+        st.capable.insert(1);
         st.rebase(1, 0);
         assert!(st.get("/deep", now).is_none(), "the nested world is gone");
-        assert!(!st.capable, "capability is per shell, not per terminal");
+        assert!(!st.capable_here(), "depth 0 never proved itself");
+        assert!(
+            !st.capable.contains(&1),
+            "the deeper shell's capability died with it"
+        );
         assert!(st.bash_here(), "depth 0 still reports bash");
         // A relaunch wipes the shell map too (a new spawn re-announces).
         st.stood_down = true;
         st.rebase(2, 0);
         assert!(st.shells.is_empty() && !st.stood_down && !st.bash_here());
+    }
+
+    /// RIG-FOUND (v0.1.20): `sudo su` on the remote host, then `exit`, and the
+    /// query lane was dead for the rest of the session.
+    ///
+    /// `capable` was one bool for the whole terminal, cleared on every depth
+    /// change. Coming back OUT of a nested shell is a depth change, and the
+    /// only thing that re-proves capability is a prefetch — which fires on a
+    /// cwd CHANGE, and returning to a `$PWD` you never left is not one. So
+    /// every later Tab was declined `NoCapability`, silently, forever.
+    ///
+    /// Capability is a fact about a hook body that is still running, so it
+    /// belongs per depth and survives the collapse of anything deeper —
+    /// exactly like the `shells` map beside it.
+    #[test]
+    fn capability_survives_a_nested_round_trip() {
+        let mut st = CompState::default();
+        // Depth 1: the hooked remote bash speaks, and proves the verb.
+        st.rebase(1, 1);
+        st.shells.insert(1, "bash".into());
+        st.capable.insert(1);
+        assert!(st.capable_here() && st.bash_here());
+
+        // `sudo su` → depth 2. Nothing there has spoken yet, so no query is
+        // armed into it on a guess.
+        st.rebase(1, 2);
+        assert!(!st.capable_here(), "an unproven shell must not be typed into");
+        st.shells.insert(2, "bash".into());
+        st.capable.insert(2);
+        assert!(st.capable_here());
+
+        // `exit` → back to depth 1, whose `$PWD` never changed, so no fresh
+        // prefetch will arrive. THE REGRESSION: it must still be capable.
+        st.rebase(1, 1);
+        assert!(
+            st.capable_here(),
+            "the depth-1 shell proved itself once and is still running"
+        );
+        assert!(st.bash_here(), "...and its shell identity survives too");
+        assert!(
+            !st.capable.contains(&2),
+            "the root shell is gone; a NEW one must prove itself again"
+        );
+
+        // A relaunch is the one thing that wipes it: that shell is dead.
+        st.rebase(2, 0);
+        assert!(st.capable.is_empty() && st.shells.is_empty());
     }
 
     /// zsh prefetches but is never typed into; bash gets both lanes.

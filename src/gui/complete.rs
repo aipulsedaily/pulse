@@ -394,6 +394,25 @@ pub fn effective_family(fam: &Family, cwd: Option<&str>) -> Family {
     }
 }
 
+/// Whether this terminal's Tab can need the REMOTE lane at all: a POSIX
+/// world is live in front of the user (`effective_family`), or it is WSL —
+/// whose local UNC leg can still fall THROUGH to the hook channel (a nested
+/// root shell's `/root`, a default-distro terminal with no UNC name).
+///
+/// The app reads it to make sure the listing cache EXISTS before the first
+/// Tab, and that is not a nicety: `enumerate` cannot tell a cache that is
+/// merely EMPTY from "there is no remote lane here" (`remote: None` ⇒
+/// `Nothing`), and the cache used to be created only BY an ask — so the ask
+/// that would have created it could never be parked. That circle is the
+/// v0.1.20 field bug: `cd pr<Tab>` inside a real ssh session did nothing,
+/// forever, and silently.
+pub fn remote_lane_possible(fam: &Family, cwd: Option<&str>) -> bool {
+    matches!(
+        effective_family(fam, cwd),
+        Family::Remote | Family::Wsl { .. }
+    )
+}
+
 fn plan_win(fam: &Family, cwd: Option<&str>, home: Option<&str>, value: &str) -> Option<Plan> {
     // Token separator style wins for rendered dirs; default Windows `\`.
     let sep = if value.contains('/') && !value.contains('\\') {
@@ -1500,8 +1519,14 @@ mod tests {
             start(&r, Some("/root"), None, "cd x", 4, ENUM_CAP, Some(&rem)),
             Start::None
         ));
-        // NO cache at all (a pre-proto-14 daemon, a terminal with no remote
-        // world): byte-identical to the behaviour this change replaced.
+        // NO cache at all: byte-identical to the behaviour this change
+        // replaced — nothing to ask THROUGH, so nothing is asked.
+        //
+        // v0.1.20's comment here read "a pre-proto-14 daemon, a terminal with
+        // no remote world", and that second clause was the field bug: a
+        // terminal that very much HAS a remote world also arrives here,
+        // because the app's cache was created only BY an ask. See
+        // `remote_lane_possible` and `an_empty_cache_asks_a_missing_one_cannot`.
         assert!(matches!(
             start(&r, Some("/root"), None, "cd x", 4, ENUM_CAP, None),
             Start::None
@@ -1518,6 +1543,119 @@ mod tests {
         let rem = FakeRemote::default().with("/root", &[]);
         assert!(matches!(
             start(&r, Some("/root"), None, "cd a", 4, ENUM_CAP, Some(&rem)),
+            Start::None
+        ));
+    }
+
+    /// THE v0.1.20 FIELD BUG, as a pure assertion.
+    ///
+    /// `cd pr<Tab>` inside a real ssh session did nothing at all, forever,
+    /// because the two halves below are NOT the same thing and the app could
+    /// only ever supply the second one on a first Tab: a listing cache that
+    /// exists and is empty parks an ask, and a cache that does not exist
+    /// cannot. The app's cache was created only as a CONSEQUENCE of an ask,
+    /// so the ask that would have created it was never produced — a closed
+    /// circle, in every remote shape, with nothing in any log.
+    ///
+    /// `remote_lane_possible` is what breaks it: the app now creates the
+    /// cache from the tracked cwd, before any Tab.
+    #[test]
+    fn an_empty_cache_asks_a_missing_one_cannot() {
+        let r = Family::Remote;
+        let empty = FakeRemote::default();
+        // His exact gesture: a bare `pr` stem anchored at the remote $PWD.
+        assert!(
+            matches!(
+                start(&r, Some("/home/dev"), None, "cd pr", 5, ENUM_CAP, Some(&empty)),
+                Start::Request(ref d) if d == "/home/dev"
+            ),
+            "an empty cache must park the ask for the remote cwd"
+        );
+        assert!(
+            matches!(
+                start(&r, Some("/home/dev"), None, "cd pr", 5, ENUM_CAP, None),
+                Start::None
+            ),
+            "no cache at all cannot ask — which is why one must EXIST first"
+        );
+        // And with the answer in hand the same press completes, including the
+        // prefix-of-another-directory shape he hit.
+        let rem = FakeRemote::default().with(
+            "/home/dev",
+            &[("pre-migration-backup", true), ("pre", true), ("prod.log", false)],
+        );
+        let Start::Cycle(mut c) =
+            start(&r, Some("/home/dev"), None, "cd pr", 5, ENUM_CAP, Some(&rem))
+        else {
+            panic!("the answered cache must cycle");
+        };
+        assert_eq!(c.step(1).0, "cd pre/");
+        assert_eq!(c.step(1).0, "cd pre-migration-backup/");
+        assert_eq!(c.step(1).0, "cd prod.log");
+    }
+
+    /// Which terminals must be handed a listing cache before their first Tab
+    /// — the predicate the app keys the fix on. It must say YES for every
+    /// shape that can reach `Dir::Remote`, and NO for every purely local one
+    /// (which must keep carrying no cache at all).
+    #[test]
+    fn remote_lane_possible_follows_the_tracked_cwd() {
+        // The field shape: a pwsh/cmd terminal that typed `ssh host`. The
+        // SPAWN family never changes; the POSIX cwd is the whole witness.
+        for fam in [Family::Pwsh, Family::Cmd, Family::Other] {
+            assert!(
+                remote_lane_possible(&fam, Some("/home/dev")),
+                "{fam:?} with a posix cwd is a remote world"
+            );
+            assert!(
+                remote_lane_possible(&fam, Some("/root")),
+                "{fam:?} inside a nested sudo su is still remote"
+            );
+            // Purely local: no cache, exactly as before.
+            assert!(!remote_lane_possible(&fam, Some(r"C:\Users\dev")));
+            assert!(!remote_lane_possible(&fam, None));
+        }
+        // An ssh-PROGRAM terminal (`family_for(ShellFamily::Ssh)`) is remote
+        // before it has reported any cwd at all — `cd /et<Tab>` there needs
+        // the lane with cwd None.
+        assert!(remote_lane_possible(&Family::Remote, None));
+        // WSL keeps its local UNC leg but can still fall through to the hook
+        // channel (`/root` under a nested root shell, a default distro with
+        // no UNC name), so it needs the cache too — including inside `/mnt`,
+        // where a `~` token in the same draft can still ask.
+        assert!(remote_lane_possible(
+            &Family::Wsl { distro: Some("Ubuntu-24.04".into()) },
+            Some("/home/dev")
+        ));
+        assert!(remote_lane_possible(&Family::Wsl { distro: None }, Some("/mnt/c")));
+        // A WSL terminal needs it even before it reports a cwd.
+        assert!(remote_lane_possible(&Family::Wsl { distro: None }, None));
+
+        // The two WSL shapes the lane actually answers, now that the cache
+        // exists for them. `~` goes straight to the shell (the GUI cannot
+        // know a distro home), and a DEFAULT distro has no UNC name to build,
+        // so anything outside `/mnt` is the shell's to answer too.
+        let named = Family::Wsl { distro: Some("Ubuntu-24.04".into()) };
+        let dflt = Family::Wsl { distro: None };
+        let empty = FakeRemote::default();
+        assert!(
+            matches!(
+                start(&named, Some("/home/z"), None, "cd ~/pr", 7, ENUM_CAP, Some(&empty)),
+                Start::Request(ref d) if d == "~"
+            ),
+            "`~` in WSL must ask the shell, never guess a Windows home"
+        );
+        assert!(
+            matches!(
+                start(&dflt, Some("/home/z"), None, "cd pr", 5, ENUM_CAP, Some(&empty)),
+                Start::Request(ref d) if d == "/home/z"
+            ),
+            "a default-distro WSL home has no UNC view — it must ask"
+        );
+        // ...while a `/mnt` cwd the Windows side CAN enumerate never leaves
+        // the local lane: `C:\` is read, nothing matches, and no ask goes out.
+        assert!(matches!(
+            start(&dflt, Some("/mnt/c"), None, "cd __tc_absent__", 16, ENUM_CAP, Some(&empty)),
             Start::None
         ));
     }

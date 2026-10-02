@@ -7020,6 +7020,140 @@ fn case_wsl_nested_hooks() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// remote-completion: the app's listing cache, reduced to exactly what the
+/// completer reads off it (`gui::CompCache` is private to the GUI and owns
+/// TTLs this probe has no use for; what matters here is the SHAPE).
+#[derive(Default)]
+pub(crate) struct ProbeCompCache(
+    std::collections::HashMap<String, crate::gui::complete::RemoteListing>,
+);
+
+impl crate::gui::complete::RemoteDirs for ProbeCompCache {
+    fn listing(&self, dir: &str) -> Option<crate::gui::complete::RemoteListing> {
+        self.0.get(dir).cloned()
+    }
+    fn declined(&self, _: &str) -> bool {
+        false
+    }
+}
+
+/// remote-completion: drive ONE real Tab through the REAL `ComposerState`
+/// against the REAL listing the remote shell answers with — the half of the
+/// lane v0.1.20 never exercised, and the half that was broken.
+///
+/// The daemon side was pinned from the start (`await_completion` asks it
+/// directly and it answers), and the feature still did nothing in the field,
+/// because the APP could not decide to ask: `central.rs` handed the completer
+/// `comp_cache.get(&id)`, `None` until an entry existed, `None` reads as
+/// "there is nothing to ask" — and the entry was only ever created BY an ask.
+/// A closed circle, in every remote shape, with nothing in any log.
+///
+/// So this asserts, in order: the predicate `central.rs` now keys the cache on
+/// (`remote_lane_possible`), the v0.1.20 dead end with no cache, the ask with
+/// one, the real round trip, the completed draft, and the next candidate.
+/// Returns the filled cache so the caller can go on using it.
+fn comp_app_lane(
+    c: &mut Conn,
+    id: Uuid,
+    draft: &str,
+    first: &str,
+    second: Option<&str>,
+) -> anyhow::Result<ProbeCompCache> {
+    use crate::gui::complete::{self, Entry, RemoteListing};
+    use crate::gui::composer::ComposerState;
+
+    // The live terminal as the app sees it: the SPAWN family (which a typed
+    // `ssh` never changes) and the tracked cwd (which is the whole witness).
+    // Read over a FRESH connection — the daemon pushes a Snapshot on connect,
+    // whereas the case's long-lived `c` only sees one when something changes,
+    // and waiting on it here would both time out and swallow a `Completion`.
+    // Retried: a connect that lands between pushes reads nothing and the
+    // socket's own 3s timeout fires.
+    let mut snap = None;
+    for _ in 0..10 {
+        if let Some(s) = Conn::open().ok().and_then(|mut cc| cc.first_snapshot().ok()) {
+            snap = Some(s);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let snap = snap.ok_or_else(|| anyhow::anyhow!("no snapshot for the app-lane check"))?;
+    let t = snap
+        .terminals
+        .iter()
+        .find(|t| t.id == id)
+        .ok_or_else(|| anyhow::anyhow!("the probe terminal vanished"))?;
+    let fam = complete::family_for(&crate::state::shell_family(&t.kind, &t.program, &t.args));
+    let cwd = t
+        .live_cwd
+        .clone()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    anyhow::ensure!(
+        cwd.starts_with('/'),
+        "the tracked cwd must be the INNER POSIX one, got {cwd:?}"
+    );
+
+    // THE FIX'S PREDICATE — the whole of what `central.rs` tests before it
+    // creates the cache. False here ⇒ the v0.1.20 dead end, silently.
+    anyhow::ensure!(
+        complete::remote_lane_possible(&fam, Some(cwd.as_str())),
+        "the app would not have created a listing cache for {fam:?} at {cwd}"
+    );
+
+    let caret = draft.len();
+    let mut comp = ComposerState::for_draft(draft, fam);
+    // v0.1.20, exactly: no cache ⇒ no edit AND no ask. The silent no-op.
+    anyhow::ensure!(
+        comp.tab_press(Some(&cwd), caret, 1, None).is_none()
+            && comp.take_comp_request().is_none(),
+        "a cacheless Tab must not ask — that is the defect being pinned"
+    );
+    anyhow::ensure!(comp.draft == draft, "a cacheless Tab edited the draft");
+
+    // With the cache the app now creates up front, the SAME press asks.
+    let mut cache = ProbeCompCache::default();
+    anyhow::ensure!(
+        comp.tab_press(Some(&cwd), caret, 1, Some(&cache)).is_none(),
+        "a cold Tab must not edit the draft"
+    );
+    let want = comp
+        .take_comp_request()
+        .ok_or_else(|| anyhow::anyhow!("the Tab parked no request at {cwd}"))?;
+
+    // Ship it the way the app does, and fill the cache from the REAL answer
+    // the remote shell gives over this link.
+    let (resolved, found, trunc, entries) = c.await_completion(id, &want, 25)?;
+    anyhow::ensure!(found && !trunc, "the app's own ask for {want} went unanswered");
+    let listing = RemoteListing {
+        entries: entries
+            .into_iter()
+            .map(|e| Entry { name: e.name, dir: e.dir })
+            .collect(),
+        trunc,
+    };
+    cache.0.insert(resolved, listing.clone());
+    cache.0.insert(want, listing);
+
+    // ...and the parked press completes, a frame later, for real.
+    let moved = comp
+        .tab_retry(Some(&cwd), Some(&cache))
+        .ok_or_else(|| anyhow::anyhow!("the answered Tab still did nothing"))?;
+    anyhow::ensure!(comp.draft == first, "expected {first:?}, got {:?}", comp.draft);
+    anyhow::ensure!(moved == comp.draft.chars().count(), "caret {moved}");
+    if let Some(second) = second {
+        // A name that is a PREFIX of another must never swallow it.
+        comp.tab_press(Some(&cwd), comp.draft.len(), 1, Some(&cache))
+            .ok_or_else(|| anyhow::anyhow!("the cycle did not step"))?;
+        anyhow::ensure!(
+            comp.draft == second,
+            "expected the sibling {second:?}, got {:?}",
+            comp.draft
+        );
+    }
+    Ok(cache)
+}
+
 /// remote-completion `nested_completion` — the live pin for the feature, in
 /// a REAL nested POSIX shell, end to end through a real ConPTY.
 ///
@@ -7054,12 +7188,38 @@ fn case_wsl_nested_hooks() -> anyhow::Result<()> {
 ///     reconstruction, nowhere in the block records (so nowhere in the
 ///     sidebar, block history or the Ctrl-R corpus), and nowhere in bash's
 ///     interactive history;
-///   - the unanswerable case degrades honestly rather than hanging.
+///   - the unanswerable case degrades honestly rather than hanging;
+///   - THE APP'S OWN LANE (`comp_app_lane`) — the real `ComposerState`
+///     driven through a real Tab against the real listing, which is the half
+///     v0.1.20 shipped broken: the daemon answered perfectly and the app
+///     could never bring itself to ask. Local completion is asserted inert
+///     in the same breath;
+///   - DEPTH 2 — the same gesture inside a `sudo su` on the far side, and
+///     depth 1 still healthy after leaving it (skipped where sudo wants a
+///     password: a probe never types a credential).
+///
+/// `TC_COMP_SSH_RIG=<a complete `ssh …` opener>` runs the whole case over a
+/// REAL network ssh hop instead of the WSL stand-in.
 fn case_nested_completion() -> anyhow::Result<()> {
-    let Some(distro) = wsl_probe_distro() else {
-        return Err(skip("no WSL distro in the Lxss registry".into()));
+    // TC_COMP_SSH_RIG=<a complete `ssh …` opener> runs this whole case over a
+    // REAL network ssh hop instead of the WSL stand-in — the one transport the
+    // lane was never exercised on before the v0.1.20 field report. Everything
+    // below is transport-blind on purpose, so it is the same assertions.
+    let opener = match std::env::var("TC_COMP_SSH_RIG") {
+        Ok(o) if !o.trim().is_empty() => o.trim().to_string(),
+        _ => {
+            let Some(distro) = wsl_probe_distro() else {
+                return Err(skip(
+                    "no WSL distro in the Lxss registry and no TC_COMP_SSH_RIG opener".into(),
+                ));
+            };
+            format!("wsl -d {distro}")
+        }
     };
-    let opener = format!("wsl -d {distro}");
+    anyhow::ensure!(
+        crate::daemon::tracker::nested_shell_cmd(&opener),
+        "the probe's own opener must classify as an interactive nested shell"
+    );
     anyhow::ensure!(
         crate::daemon::tracker::crosses_to_posix(&opener),
         "the probe's own opener must classify as a crossing nested shell"
@@ -7142,6 +7302,7 @@ fn case_nested_completion() -> anyhow::Result<()> {
     let root = "/tmp/__pulse_probe_comp__";
     let setup = format!(
         "rm -rf {root}; mkdir -p {root}/alpha/deeper {root}/bravo {root}/huge && \
+         mkdir -p {root}/pre {root}/pre-migration-backup && \
          : > {root}/notes.txt && : > {root}/.hidden && mkdir -p '{root}/a dir' && \
          ln -sfn {root}/bravo {root}/linkdir && : > {root}/alpha/deeper/leaf.txt && \
          i=0; while [ $i -lt 400 ]; do : > {root}/huge/padded_name_entry_$i; i=$((i+1)); done;          echo TC_COMP_SETUP"
@@ -7241,6 +7402,131 @@ fn case_nested_completion() -> anyhow::Result<()> {
         home.starts_with('/') && home != "~",
         "`~` must come back as the shell's own absolute $HOME, got {home:?}"
     );
+
+    // -- THE APP'S OWN LANE -------------------------------------------
+    // Everything above proves the DAEMON answers. v0.1.20 proved exactly that
+    // much and still shipped a Tab that did nothing in the field, because the
+    // half `comp_app_lane` covers -- the app deciding to ASK at all -- was
+    // never exercised by anything.
+    settle();
+    let cache = comp_app_lane(&mut c, id, "cd pre", "cd pre/", Some("cd pre-migration-backup/"))?;
+
+    // LOCAL completion is untouched by any of it: a Windows cwd never
+    // consults the remote cache, never asks, and never leaves the local
+    // `read_dir` -- even with a full remote cache sitting right there.
+    {
+        use crate::gui::composer::ComposerState;
+        let mut loc = ComposerState::for_draft("cd pre", crate::gui::complete::Family::Pwsh);
+        anyhow::ensure!(
+            !loc.remote_lane_possible(Some("C:\\Windows")),
+            "a local pwsh cwd must not arm the remote lane"
+        );
+        anyhow::ensure!(
+            loc.tab_press(Some("C:\\Windows\\__tc_absent__"), 6, 1, Some(&cache))
+                .is_none()
+                && loc.take_comp_request().is_none(),
+            "a local plan asked the remote lane"
+        );
+        anyhow::ensure!(loc.draft == "cd pre", "a local Tab edited the draft");
+    }
+
+    // ── DEPTH 2 ──────────────────────────────────────────────────────────
+    // A `sudo su` INSIDE the remote shell: a second nested world, a second
+    // hook scope, a second cache generation. It shares the whole lane with
+    // depth 1, so it is where a scope-keying mistake would show up first —
+    // so it is where a scope-keying mistake shows up first. Run only where
+    // sudo elevates without a password; a probe must never type a credential,
+    // so a password-gated sudo skips the section rather than failing the case.
+    //
+    // The verdict is read as an EXACT LINE, never `contains`: `ctl run` echoes
+    // the command itself into the output, so a marker that appears in the
+    // command text would always "match" and the section would run into a
+    // password prompt (observed — the injection then correctly refused to type
+    // into it, and the case failed).
+    let sudo_free = matches!(
+        ctl_run_retry(
+            &mut ctl,
+            &mut rid,
+            id,
+            "sudo -n true >/dev/null 2>&1 && echo SUDO-FREE || echo SUDO-GATED",
+            Some(RunWait { timeout_ms: 30_000, tail_bytes: 2048 }),
+            60,
+        )?,
+        CtlBody::RunDone { ref output, .. }
+            if output.lines().any(|l| l.trim() == "SUDO-FREE")
+    );
+    if sudo_free {
+        c.send(&C2D::Input { id, bytes: b"sudo su\r".to_vec() })?;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !log_since(log0).contains("nested shell hooked (depth 2") {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "the depth-2 shell never hooked: {:?}",
+                log_since(log0)
+                    .lines()
+                    .filter(|l| l.contains("depth 2"))
+                    .collect::<Vec<_>>()
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        // Stand the root shell in the SAME scratch tree — it already holds
+        // the two prefix-sharing directories, and reusing it means the
+        // elevated world writes nothing of its own anywhere (notably not in
+        // `/root`, which on a real WSL distro is the user's own).
+        match ctl_run_retry(
+            &mut ctl,
+            &mut rid,
+            id,
+            &format!("id -un && cd {root} && echo TC_COMP_ROOT"),
+            Some(RunWait { timeout_ms: 30_000, tail_bytes: 2048 }),
+            60,
+        )? {
+            CtlBody::RunDone { output, .. } => {
+                anyhow::ensure!(
+                    output.lines().any(|l| l.trim() == "TC_COMP_ROOT"),
+                    "the depth-2 shell was not usable: {output:?}"
+                );
+                anyhow::ensure!(
+                    output.lines().any(|l| l.trim() == "root"),
+                    "`sudo su` did not land in a root shell: {output:?}"
+                );
+            }
+            other => anyhow::bail!("the depth-2 check returned {other:?}"),
+        }
+        settle();
+        let _ = comp_app_lane(&mut c, id, "cd pre", "cd pre/", Some("cd pre-migration-backup/"))?;
+        c.send(&C2D::Input { id, bytes: b"exit\r".to_vec() })?;
+        // Back at depth 1, with its own world intact: the shallower shell
+        // speaking wipes the deeper cache, so the lane below re-asks and
+        // re-answers. `id -un` is the witness that the root world is gone —
+        // asserted on the SHELL rather than on a snapshot push, which may
+        // land before anyone is listening for it.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let out = match ctl_run_retry(
+                &mut ctl,
+                &mut rid,
+                id,
+                &format!("id -un && cd {root} && echo TC_COMP_BACK1"),
+                Some(RunWait { timeout_ms: 30_000, tail_bytes: 2048 }),
+                60,
+            )? {
+                CtlBody::RunDone { output, .. } => output,
+                other => anyhow::bail!("depth-1 check returned {other:?}"),
+            };
+            let lines = || out.lines().map(str::trim);
+            if lines().any(|l| l == "TC_COMP_BACK1") && !lines().any(|l| l == "root") {
+                break;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "the depth-2 root shell never retired: {out:?}"
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        settle();
+        let _ = comp_app_lane(&mut c, id, "cd pre", "cd pre/", Some("cd pre-migration-backup/"))?;
+    }
 
     // ── THE BOUND ────────────────────────────────────────────────────────
     // 400 entries at ~22 bytes each blow COMP_MAX_BYTES: the shell DROPS the

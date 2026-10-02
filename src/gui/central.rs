@@ -843,6 +843,28 @@ impl App {
                     // must never fall back to a `C:\` string.
                     self.state.terminal(id).map(|t| t.display_cwd())
                 });
+            // remote-completion: the listing cache must EXIST before the
+            // FIRST Tab in a POSIX world. `complete::enumerate` cannot tell a
+            // missing cache from "there is nothing to ask" — both read as the
+            // old silent no-op — and the cache was only ever created BY an
+            // ask, so the lane could never start. That circle is the v0.1.20
+            // field bug (`cd pr<Tab>` inside a real ssh session, nothing,
+            // forever, and nothing in the log either). Created only where the
+            // lane can actually be used, so a purely local terminal still
+            // carries no cache at all.
+            if self.completion_supported()
+                && self
+                    .composers
+                    .get(&id)
+                    .is_some_and(|st| st.remote_lane_possible(prompt_cwd.as_deref()))
+                && !self.comp_cache.contains_key(&id)
+            {
+                self.comp_cache.insert(id, CompCache::default());
+                log::info!(
+                    "terminal {id}: remote completion lane armed (cwd {})",
+                    prompt_cwd.as_deref().unwrap_or("?")
+                );
+            }
             let mut comp_write = Vec::new();
             let mut comp_request: Option<String> = None;
             let mut spacer_gesture = false;
@@ -892,13 +914,25 @@ impl App {
             // by this client's own in-flight map so a double Tab is one
             // request. Proto-gated: an older daemon drops the connection on
             // an undecodable C2D variant (the color-tag/sleep skew pattern).
+            //
+            // Observability (v0.1.21): a Tab that asks and a Tab that cannot
+            // ask are both logged at `info!`, because v0.1.20 recorded
+            // NEITHER and the field report was unanswerable from the logs.
+            // `should_ask` throttles this hard (one line per directory per
+            // COMP_INFLIGHT), so a held Tab cannot flood gui.log.
             if let Some(dir) = comp_request {
                 if self.completion_supported() {
                     let c = self.comp_cache.entry(id).or_default();
                     if c.should_ask(&dir) {
                         c.pending.insert(dir.clone(), std::time::Instant::now());
+                        log::info!("terminal {id}: remote completion asking for {dir}");
                         self.send(C2D::RequestCompletion { id, dir });
                     }
+                } else {
+                    log::info!(
+                        "terminal {id}: remote completion of {dir} not asked — this daemon is \
+                         older than proto 14; Tab stays a no-op in remote worlds until it restarts"
+                    );
                 }
             }
             if wake_clicked || restore_clicked {
