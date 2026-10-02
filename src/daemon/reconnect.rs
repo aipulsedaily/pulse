@@ -73,7 +73,7 @@ const AUTO_BACKOFF_CEILING: Duration = Duration::from_secs(900);
 /// How long a spawned reconnect attempt may run without its hooks arming
 /// before supervision stops (the attempt itself is LEFT RUNNING — it may be
 /// sitting at an interactive auth prompt, which is a usable terminal).
-const RECONNECT_HOOK_WINDOW: Duration = Duration::from_secs(30);
+pub(super) const RECONNECT_HOOK_WINDOW: Duration = Duration::from_secs(30);
 
 /// Delay before the next attempt after `attempts_done` failures; None =
 /// exhausted (give up to Dead + the ordinary Restore affordances). A MANUAL
@@ -110,13 +110,86 @@ fn reconnect_backoff_after(attempts_done: u32, manual: bool) -> Option<Duration>
 }
 
 /// nested-death reinstate: the delay before replaying a nested opener after
-/// `attempts_done` failed replays. Deliberately the ssh ladder's own table in
-/// MANUAL mode — 2s, 10s, 30s, then 30s forever — because the ask is the same
-/// one the manual ladder answers ("keep trying until my server is back") and
-/// the terminal underneath is alive the whole time, so there is no Dead state
-/// to fall back to and nothing to give up to.
+/// `attempts_done` failed replays — the AUTOMATIC table: 2s, 10s, 30s, then
+/// the slow tail up to a 15-minute ceiling, forever.
+///
+/// It used the MANUAL table (30s forever), which is for a ladder the user
+/// started and is watching. Nobody starts this one and nobody is watching
+/// it, and every rung is a command TYPED into the user's shell — a block, a
+/// history line, a TCP timeout — so all night at 30s was ~2,900 of them.
+/// The terminal underneath stays alive, so there is still nothing to give
+/// up to: it just backs off like the other unattended ladder.
 pub(super) fn reconnect_backoff_after_for_nested(attempts_done: u32) -> Duration {
-    reconnect_backoff_after(attempts_done, true).unwrap_or(MANUAL_BACKOFF_CEILING)
+    reconnect_backoff_after(attempts_done, false).unwrap_or(AUTO_BACKOFF_CEILING)
+}
+
+/// The ssh failures no retry can cure — the key or the host was REJECTED —
+/// read off the last lines of the screen. Returns the matched phrase.
+///
+/// These all exit 255, exactly like a dropped link, and each retry is
+/// another failed authentication against the user's own server: a default
+/// fail2ban sshd jail bans the source address after five in ten minutes,
+/// which the ladders' first rungs reach in under two. So both ladders stop
+/// on them (`maybe_schedule_reconnect`, `Core::reinstate_nested_chain`).
+/// Name resolution and connection failures are deliberately NOT here: a
+/// laptop waking with no network fails exactly those ways, and that is the
+/// outage the ladders exist to ride out.
+pub(super) fn ssh_auth_wall(tail: &[String]) -> Option<&'static str> {
+    const WALLS: &[&str] = &[
+        "permission denied (",
+        "host key verification failed",
+        "remote host identification has changed",
+        "too many authentication failures",
+        "no supported authentication methods available",
+    ];
+    tail.iter().find_map(|l| {
+        let l = l.to_ascii_lowercase();
+        WALLS.iter().find(|w| l.contains(*w)).copied()
+    })
+}
+
+/// What to do with a nested episode the exit status says DIED.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReplayCall {
+    Replay,
+    /// It never got far enough to have been established — a typo'd host, a
+    /// refused connection, a rejected key on the FIRST connect. That is a
+    /// failed command, not a dropped link.
+    NeverEstablished,
+    /// The server rejected the key or the host key (`ssh_auth_wall`).
+    AuthWall(&'static str),
+}
+
+/// Decide a died nested episode's replay (pure, table-tested).
+///
+/// `established`: this episode's nested shell reported its hooks — Pulse
+/// SAW the far side's prompt — before it died. A ladder already climbing
+/// keeps going without that proof (its replays are retrying a link that was
+/// proven earlier), but only until the auth wall: a rejected key is never
+/// retried, whoever started the ladder.
+pub(super) fn nested_replay_call(
+    established: bool,
+    ladder_live: bool,
+    tail: &[String],
+) -> ReplayCall {
+    if let Some(wall) = ssh_auth_wall(tail) {
+        return ReplayCall::AuthWall(wall);
+    }
+    if !established && !ladder_live {
+        return ReplayCall::NeverEstablished;
+    }
+    ReplayCall::Replay
+}
+
+/// Is a replay ladder still "live" for an episode that has now ended after
+/// `episode_age`? A replayed opener that stayed up for a whole
+/// `RECONNECT_HOOK_WINDOW` CONNECTED — its ladder succeeded even if the far
+/// shell could not be hooked — so whatever ends it later is judged afresh.
+/// Without this a live ladder read ANY later non-zero exit as a death and
+/// resurrected a session the user had deliberately closed (`exit` after a
+/// failing command returns that command's status through ssh).
+pub(super) fn ladder_still_live(ladder_live: bool, episode_age: Duration) -> bool {
+    ladder_live && episode_age < RECONNECT_HOOK_WINDOW
 }
 
 /// The pure ssh auto-reconnect qualification (maybe_schedule_reconnect owns
@@ -169,12 +242,26 @@ impl Core {
         code: Option<u32>,
         expected: bool,
         hooks_were_live: bool,
+        tail: &[String],
     ) {
         // An existing supervision: the death of a watched attempt advances
         // the backoff; a waiting entry is untouched (the pump owns it).
         let prior = self.reconnects.lock().get(&id).copied();
         if let Some(rc) = prior {
             if rc.watching {
+                // An attempt the server REJECTED dies just as fast as one
+                // that found no route, and is never cured by waiting: stop
+                // the ladder instead of feeding fail2ban (`ssh_auth_wall`).
+                if let Some(wall) = ssh_auth_wall(tail) {
+                    log::info!(
+                        "terminal {id}: ssh reconnect stopped — the server refused the attempt ({wall}); \
+                         retrying would only repeat a failed login"
+                    );
+                    self.reconnects.lock().remove(&id);
+                    self.set_reconnecting_flag(id, false);
+                    self.set_retry_progress(id, 0, 0);
+                    return;
+                }
                 self.advance_reconnect(id, rc.attempt, rc.manual);
             }
             return;
@@ -528,6 +615,94 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lines(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The failures no retry can cure stop both ladders; the ones an outage
+    /// produces never do.
+    #[test]
+    fn auth_walls_stop_and_outages_do_not() {
+        for wall in [
+            "dev@host: Permission denied (publickey).",
+            "ubuntu@3.1.2.3: Permission denied (publickey,password).",
+            "Host key verification failed.",
+            "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @",
+            "Received disconnect from 10.0.0.1 port 22:2: Too many authentication failures",
+        ] {
+            assert!(
+                ssh_auth_wall(&lines(&["PS C:\\> ssh host", wall, "PS C:\\>"])).is_some(),
+                "{wall}"
+            );
+        }
+        for outage in [
+            "ssh: Could not resolve hostname host: No such host is known.",
+            "ssh: connect to host 10.0.0.1 port 22: Connection timed out",
+            "ssh: connect to host 10.0.0.1 port 22: Connection refused",
+            "client_loop: send disconnect: Connection reset",
+            "Connection to 10.0.0.1 closed by remote host.",
+        ] {
+            assert_eq!(ssh_auth_wall(&lines(&[outage, "PS C:\\>"])), None, "{outage}");
+        }
+    }
+
+    /// H1: a nested ssh that dies with 255 is replayed only if its far side
+    /// was REACHED. A typo'd host, a refused connection or a rejected key on
+    /// the first connect is a failed command — replaying it typed it into the
+    /// user's shell forever. A ladder already climbing (it retries a link
+    /// proven earlier) continues through outages, and nothing ever retries a
+    /// rejected key.
+    #[test]
+    fn only_an_established_nested_session_is_replayed() {
+        let quiet = lines(&["PS C:\\>"]);
+        let refused = lines(&["dev@host: Permission denied (publickey).", "PS C:\\>"]);
+        let typo = lines(&["ssh: Could not resolve hostname hots: No such host is known.", "PS C:\\>"]);
+        // A session that was up and hooked, then dropped: replay.
+        assert_eq!(nested_replay_call(true, false, &quiet), ReplayCall::Replay);
+        // The first connect never got there: never replay.
+        assert_eq!(nested_replay_call(false, false, &typo), ReplayCall::NeverEstablished);
+        assert_eq!(nested_replay_call(false, false, &quiet), ReplayCall::NeverEstablished);
+        // Mid-ladder, the host still down (or DNS still down after a wake):
+        // keep climbing.
+        assert_eq!(nested_replay_call(false, true, &typo), ReplayCall::Replay);
+        // A rejected key stops it, first death or mid-ladder.
+        for (est, ladder) in [(true, false), (false, true), (false, false)] {
+            assert!(
+                matches!(nested_replay_call(est, ladder, &refused), ReplayCall::AuthWall(_)),
+                "established={est} ladder={ladder}"
+            );
+        }
+    }
+
+    /// M7: a replay that stayed up for a whole hook window CONNECTED, so its
+    /// ladder is over — a later `exit 1` is the user's, not a death.
+    #[test]
+    fn a_replay_that_stayed_up_ends_its_ladder() {
+        assert!(ladder_still_live(true, Duration::from_secs(3)));
+        assert!(!ladder_still_live(true, RECONNECT_HOOK_WINDOW));
+        assert!(!ladder_still_live(true, Duration::from_secs(600)));
+        assert!(!ladder_still_live(false, Duration::ZERO));
+    }
+
+    /// M6: the nested replay ladder is unattended, so it backs off like the
+    /// automatic ssh ladder, not like the manual one the user is watching.
+    #[test]
+    fn the_nested_ladder_backs_off_like_the_unattended_one() {
+        if std::env::var("TC_RETRY_BACKOFF_MS").is_ok() {
+            return;
+        }
+        for n in 0..12 {
+            assert_eq!(
+                Some(reconnect_backoff_after_for_nested(n)),
+                reconnect_backoff_after(n, false),
+                "rung {n}"
+            );
+        }
+        assert_eq!(reconnect_backoff_after_for_nested(2), Duration::from_secs(30));
+        assert!(reconnect_backoff_after_for_nested(3) > MANUAL_BACKOFF_CEILING);
+        assert_eq!(reconnect_backoff_after_for_nested(100), AUTO_BACKOFF_CEILING);
+    }
 
     /// SSH auto-reconnect: the backoff table and the qualification truth
     /// table. The state machine's transitions ride these pure functions; the

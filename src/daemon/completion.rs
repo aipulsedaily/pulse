@@ -123,6 +123,13 @@ const REQ_ECHO_DEADLINE_MAX: Duration = Duration::from_secs(12);
 const REQ_REPLY_MIN: Duration = Duration::from_millis(2500);
 const REQ_REPLY_MAX: Duration = Duration::from_secs(20);
 
+/// How long an ask whose gate verdict was only "not right now"
+/// (`CompGate::transient`) is held and re-gated on the pump tick before it
+/// is declined. Answering those with an immediate "nothing" was cached by
+/// the GUI for `COMP_DECLINED` (3s): a Tab that landed while the prompt was
+/// still redrawing, or right after a submit, was dead for three seconds.
+const REQ_PARK: Duration = Duration::from_secs(1);
+
 /// How many measured round trips each budget allows for. The echo costs one
 /// round trip and the reply costs one plus the remote `ls`; eight leaves room
 /// for jitter, a loaded remote host and a big directory, and both budgets are
@@ -258,8 +265,10 @@ pub(super) struct CompState {
     /// was declined, and one visible artifact is the most this feature may
     /// ever cost the user.
     stood_down: bool,
-    /// Raw half-typed bytes are sitting in the shell's line buffer: our
-    /// trigger would be appended to the user's command. Cleared by the next
+    /// The user (or a controller) has written to the shell since its last
+    /// prompt: half-typed bytes may sit in its line buffer, or a submitted
+    /// line may be on its way to a command that is about to read the tty.
+    /// Either way our trigger has no prompt to land at. Cleared by the next
     /// prompt.
     dirty: bool,
     /// The in-flight query, if any (one at a time, per terminal).
@@ -291,6 +300,17 @@ pub(super) struct CompState {
     /// echoed in the clear, since `stty -echo` has not run yet — and the
     /// first query's late answer would land while the second one waits.
     owed: bool,
+    /// An ask held for a transient verdict, re-gated on each pump tick until
+    /// it arms or `REQ_PARK` runs out (`Core::pump_parked`). One at a time:
+    /// a newer ask replaces it, and the older asker is told "nothing".
+    parked: Option<Parked>,
+}
+
+/// An ask waiting out a transient gate verdict (see `REQ_PARK`).
+struct Parked {
+    dir: String,
+    client: Weak<ClientConn>,
+    until: Instant,
 }
 
 /// One cached listing, stamped with the world it describes. `rebase` already
@@ -363,6 +383,23 @@ pub(crate) enum CompGate {
     DirtyInput,
     /// A query is already in flight (one at a time).
     InFlight,
+}
+
+impl CompGate {
+    /// "Not right now" rather than "never here": the shell is busy, still
+    /// printing, mid-line, not at a prompt yet, or answering another query.
+    /// Such an ask is parked and retried (`REQ_PARK`), never answered with a
+    /// definitive "nothing" the GUI would cache.
+    pub(crate) fn transient(self) -> bool {
+        matches!(
+            self,
+            CompGate::NotQuiet
+                | CompGate::Busy
+                | CompGate::DirtyInput
+                | CompGate::NotAtPrompt
+                | CompGate::InFlight
+        )
+    }
 }
 
 /// The arm gate (pure, so the whole matrix is table-testable without a PTY).
@@ -609,13 +646,15 @@ impl CompState {
     /// decline that the GUI would cache as a definitive nothing — ending the
     /// wait for an answer already on its way.
     fn join(&mut self, dir: &str, client: Weak<ClientConn>) -> bool {
-        match &mut self.req {
-            Some(r) if r.dir == dir => {
-                r.client = client;
-                true
-            }
-            _ => false,
+        if let Some(r) = self.req.as_mut().filter(|r| r.dir == dir) {
+            r.client = client;
+            return true;
         }
+        if let Some(p) = self.parked.as_mut().filter(|p| p.dir == dir) {
+            p.client = client;
+            return true;
+        }
+        false
     }
 
     /// Who, if anyone, is owed this listing as the answer to their query —
@@ -687,10 +726,15 @@ impl CompState {
         self.owed = false;
     }
 
-    /// Input arrived from the user. A SUBMITTED line leaves no buffer behind
-    /// (the shell is running it; the next prompt clears `dirty` anyway);
-    /// half-typed bytes do, and our trigger must never be appended to them.
-    /// Either way an in-flight query is superseded: the user's keystroke wins.
+    /// Input arrived from the user. ANY input marks the shell dirty until its
+    /// next prompt. Half-typed bytes would have our trigger appended to
+    /// them; a SUBMITTED line is no safer for one round trip — until its echo
+    /// and exec hook come back, the gate still sees a quiet prompt row, and a
+    /// Tab in that window typed ` __tc_cq` into whatever the line started:
+    /// a `sudo` password prompt, a fresh nested shell before it is hooked, a
+    /// `cat > file`. (`nesthook` has always kept waiting after a submit for
+    /// the same reason.) An in-flight query is superseded either way: the
+    /// user's keystroke wins.
     ///
     /// Returns true when the payload must be written NOW, ahead of the
     /// user's bytes: the query is still waiting for its echo, so `__tc_cq`
@@ -699,10 +743,8 @@ impl CompState {
     /// line went into `read` instead — `cd pr<Tab><Enter>` at human speed
     /// silently never ran, and the requested path was `eval`ed in its place
     /// (rig-reproduced). `nesthook_on_input` flushes for the same reason.
-    fn on_input(&mut self, submitted: bool) -> bool {
-        if !submitted {
-            self.dirty = true;
-        }
+    fn on_input(&mut self) -> bool {
+        self.dirty = true;
         // Once the payload is out, only the waiting half is dropped, so the
         // reply (if it comes) lands in the cache and nothing is sent to a
         // client that has moved on; it is still OWED, so nothing else is
@@ -793,15 +835,15 @@ impl Core {
             .on_pre(epoch, depth);
     }
 
-    /// Input arrived from the user (`CompState::on_input`). Both callers
-    /// write the user's bytes AFTER this returns, so a payload flushed here
+    /// Input arrived from the user (`CompState::on_input`). Every caller
+    /// writes the user's bytes AFTER this returns, so a payload flushed here
     /// reaches the shell first — the order `__tc_cq`'s `read`s need.
-    pub(super) fn comp_on_input(&self, id: Uuid, submitted: bool) {
+    pub(super) fn comp_on_input(&self, id: Uuid) {
         let flush = self
             .completion
             .lock()
             .get_mut(&id)
-            .is_some_and(|st| st.on_input(submitted));
+            .is_some_and(CompState::on_input);
         if flush {
             log::info!(
                 "terminal {id}: input arrived while the completion query waited for its echo — \
@@ -867,7 +909,39 @@ impl Core {
             return;
         }
         let verdict = self.comp_arm(client, id, dir, now);
-        if verdict != CompGate::Arm {
+        if verdict.transient() {
+            // A slow link needs longer for the prompt to come back.
+            let park = {
+                let map = self.completion.lock();
+                comp_budget(map.get(&id).and_then(|s| s.echo_rtt), REQ_PARK, REQ_REPLY_MIN)
+            };
+            let replaced = self
+                .completion
+                .lock()
+                .entry(id)
+                .or_default()
+                .parked
+                .replace(Parked {
+                    dir: dir.to_string(),
+                    client: Arc::downgrade(client),
+                    until: now + park,
+                });
+            // Decisive (it explains a Tab that answers late) and bounded by
+            // the GUI's own one-ask-per-directory throttle.
+            log::info!(
+                "terminal {id}: remote completion of {dir} parked ({verdict:?}) — retried on the pump"
+            );
+            if let Some(old) = replaced {
+                self.send_completion(&old.client, id, &old.dir, &old.dir, None);
+            }
+            return;
+        }
+        self.comp_decline(&Arc::downgrade(client), id, dir, verdict);
+    }
+
+    /// Answer an ask with a definitive "nothing" for `verdict`, logging it.
+    fn comp_decline(&self, client: &Weak<ClientConn>, id: Uuid, dir: &str, verdict: CompGate) {
+        {
             // Decisive AND repeat-prone: a user holding Tab in a directory the
             // lane cannot answer would write this every few hundred
             // milliseconds, so only the FIRST of each (directory, verdict) is
@@ -884,9 +958,44 @@ impl Core {
             if fresh {
                 log::info!("terminal {id}: remote completion of {dir} declined ({verdict:?})");
             }
-            // Honest degrade: the GUI learns there is nothing, and stops
-            // asking for a short while (its own negative cache).
-            self.send_completion(&Arc::downgrade(client), id, dir, dir, None);
+        }
+        // Honest degrade: the GUI learns there is nothing, and stops asking
+        // for a short while (its own negative cache).
+        self.send_completion(client, id, dir, dir, None);
+    }
+
+    /// Re-gate every parked ask (`REQ_PARK`): arm it the moment the gate
+    /// says so, decline it on a verdict that is no longer transient or once
+    /// its time is up, and drop it silently if its asker has gone.
+    fn pump_parked(&self, now: Instant) {
+        let ids: Vec<Uuid> = self
+            .completion
+            .lock()
+            .iter()
+            .filter(|(_, s)| s.parked.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            let Some(p) = self.completion.lock().get_mut(&id).and_then(|s| s.parked.take()) else {
+                continue;
+            };
+            let Some(client) = p.client.upgrade() else { continue };
+            let verdict = self.comp_arm(&client, id, &p.dir, now);
+            if verdict == CompGate::Arm {
+                continue;
+            }
+            if verdict.transient() && now < p.until {
+                // Put it back unless a newer ask took the slot meanwhile.
+                let mut map = self.completion.lock();
+                if let Some(st) = map.get_mut(&id) {
+                    if st.parked.is_none() {
+                        st.parked = Some(p);
+                        continue;
+                    }
+                }
+                drop(map);
+            }
+            self.comp_decline(&p.client, id, &p.dir, verdict);
         }
     }
 
@@ -1022,6 +1131,7 @@ impl Core {
             let _ = self.comp_quiet_for(*id, now);
         }
         self.comp_quiet.lock().retain(|id, _| tracked.contains(id));
+        self.pump_parked(now);
         for id in ids {
             let running = {
                 let state = self.state.lock();
@@ -1180,6 +1290,33 @@ mod tests {
 
     fn gate(t: (bool, bool, bool, bool, bool, bool, bool, bool, bool, Duration, bool)) -> CompGate {
         comp_gate(t.0, t.1, t.2, t.3, t.4, t.5, t.6, t.7, t.8, t.9, t.10)
+    }
+
+    /// Which verdicts are "not right now" (parked and retried) and which are
+    /// "never here" (declined at once). A transient one answered with
+    /// "nothing" was cached by the GUI for 3s — a Tab during a prompt redraw
+    /// or right after a submit was dead for three seconds.
+    #[test]
+    fn transient_verdicts_are_retried_not_declined() {
+        use CompGate::*;
+        for v in [NotQuiet, Busy, DirtyInput, NotAtPrompt, InFlight] {
+            assert!(v.transient(), "{v:?} must be parked and retried");
+        }
+        for v in [Arm, NotRunning, NoCapability, WrongShell, StoodDown, AltScreen, Credential] {
+            assert!(!v.transient(), "{v:?} must be answered at once");
+        }
+        // A parked ask joins like an in-flight one: a repeat Tab re-points it
+        // instead of replacing it (which would decline the first asker).
+        let mut st = CompState {
+            parked: Some(Parked {
+                dir: "/srv".into(),
+                client: Weak::new(),
+                until: Instant::now(),
+            }),
+            ..CompState::default()
+        };
+        assert!(st.join("/srv", Weak::new()));
+        assert!(!st.join("/etc", Weak::new()));
     }
 
     /// The gating table: every reason a query is NOT typed, and the ONE
@@ -1594,7 +1731,7 @@ mod tests {
         st.step(ms(10), Some(108));
         st.step(ms(200), Some(108));
         st.begin_reply(ms(200)).unwrap();
-        st.on_input(false);
+        st.on_input();
         assert!(st.req.is_none() && st.busy());
         assert!(st.on_listing(1, 1, "/srv", &listing(&["x"]), ms(500)).is_none());
 
@@ -1627,25 +1764,43 @@ mod tests {
         let t0 = Instant::now();
         let ms = |n| t0 + Duration::from_millis(n);
 
-        // Echo phase, submitted or half-typed: flush, and nobody is answered.
-        for submitted in [true, false] {
-            let mut st = armed("/srv", t0, 100);
-            assert!(st.on_input(submitted), "the payload is owed to the parked shell NOW");
-            assert!(st.req.as_ref().unwrap().client.upgrade().is_none());
-            assert_eq!(st.dirty, !submitted);
-            // ...and it can still go out: the query was not dropped.
-            assert!(st.begin_reply(ms(5)).is_some());
-        }
+        // Echo phase: flush, and nobody is answered.
+        let mut st = armed("/srv", t0, 100);
+        assert!(st.on_input(), "the payload is owed to the parked shell NOW");
+        assert!(st.req.as_ref().unwrap().client.upgrade().is_none());
+        // ...and it can still go out: the query was not dropped.
+        assert!(st.begin_reply(ms(5)).is_some());
 
         // Payload already out: nothing left to flush; the answer is owed.
         let mut st = armed("/srv", t0, 100);
         st.begin_reply(ms(5)).unwrap();
-        assert!(!st.on_input(true));
+        assert!(!st.on_input());
         assert!(st.req.is_none() && st.busy());
 
         // Nothing in flight: nothing to flush.
         let mut st = CompState::default();
-        assert!(!st.on_input(true));
+        assert!(!st.on_input());
+    }
+
+    /// A SUBMITTED line closes the lane until the next prompt, exactly like
+    /// half-typed bytes. For one round trip after a submit the gate still sees
+    /// a quiet prompt row (no exec hook yet, no echo yet), so without this a
+    /// Tab in that window typed ` __tc_cq` into whatever the line started —
+    /// a `sudo` password prompt included. Only the shell's next prompt clears
+    /// it.
+    #[test]
+    fn a_submit_keeps_the_lane_closed_until_the_next_prompt() {
+        let mut st = armed("/srv", Instant::now(), 100);
+        st.req = None;
+        assert!(!st.dirty);
+        st.on_input();
+        assert!(st.dirty, "a submitted line must close the lane");
+        assert_eq!(
+            gate((true, true, true, false, st.busy(), false, false, false, true, Duration::from_secs(1), st.dirty)),
+            CompGate::DirtyInput
+        );
+        st.on_pre(1, 1);
+        assert!(!st.dirty, "the next prompt reopens it");
     }
 
     /// A second ask for the directory already in flight joins it. The GUI

@@ -844,27 +844,10 @@ impl App {
                     self.state.terminal(id).map(|t| t.display_cwd())
                 });
             // remote-completion: the listing cache must EXIST before the
-            // FIRST Tab in a POSIX world. `complete::enumerate` cannot tell a
-            // missing cache from "there is nothing to ask" — both read as the
-            // old silent no-op — and the cache was only ever created BY an
-            // ask, so the lane could never start. That circle is the v0.1.20
-            // field bug (`cd pr<Tab>` inside a real ssh session, nothing,
-            // forever, and nothing in the log either). Created only where the
-            // lane can actually be used, so a purely local terminal still
-            // carries no cache at all.
-            if self.completion_supported()
-                && self
-                    .composers
-                    .get(&id)
-                    .is_some_and(|st| st.remote_lane_possible(prompt_cwd.as_deref()))
-                && !self.comp_cache.contains_key(&id)
-            {
-                self.comp_cache.insert(id, CompCache::default());
-                log::info!(
-                    "terminal {id}: remote completion lane armed (cwd {})",
-                    prompt_cwd.as_deref().unwrap_or("?")
-                );
-            }
+            // FIRST Tab, or that Tab reads as "nothing to ask" and no ask can
+            // ever create it — the v0.1.20 field bug. `comp_cache_for` hands
+            // every terminal one whenever the daemon can answer.
+            let comp_supported = self.completion_supported();
             let mut comp_write = Vec::new();
             let mut comp_request: Option<String> = None;
             let mut spacer_gesture = false;
@@ -880,7 +863,7 @@ impl App {
                 self.composers.get_mut(&id),
                 self.terms.get(&id),
                 self.blocks.get(&id),
-                self.comp_cache.get(&id),
+                comp_cache_for(&mut self.comp_cache, id, comp_supported),
             ) {
                 let out = composer::show(
                     ui,

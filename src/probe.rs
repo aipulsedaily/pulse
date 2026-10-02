@@ -7048,9 +7048,9 @@ impl crate::gui::complete::RemoteDirs for ProbeCompCache {
 /// "there is nothing to ask" — and the entry was only ever created BY an ask.
 /// A closed circle, in every remote shape, with nothing in any log.
 ///
-/// So this asserts, in order: the predicate `central.rs` now keys the cache on
-/// (`remote_lane_possible`), the v0.1.20 dead end with no cache, the ask with
-/// one, the real round trip, the completed draft, and the next candidate.
+/// So this asserts, in order: the v0.1.20 dead end with no cache, the ask
+/// with the empty cache the app now always hands over (`gui::comp_cache_for`),
+/// the real round trip, the completed draft, and the next candidate.
 /// Returns the filled cache so the caller can go on using it.
 fn comp_app_lane(
     c: &mut Conn,
@@ -7092,13 +7092,6 @@ fn comp_app_lane(
     anyhow::ensure!(
         cwd.starts_with('/'),
         "the tracked cwd must be the INNER POSIX one, got {cwd:?}"
-    );
-
-    // THE FIX'S PREDICATE — the whole of what `central.rs` tests before it
-    // creates the cache. False here ⇒ the v0.1.20 dead end, silently.
-    anyhow::ensure!(
-        complete::remote_lane_possible(&fam, Some(cwd.as_str())),
-        "the app would not have created a listing cache for {fam:?} at {cwd}"
     );
 
     let caret = draft.len();
@@ -7418,10 +7411,6 @@ fn case_nested_completion() -> anyhow::Result<()> {
         use crate::gui::composer::ComposerState;
         let mut loc = ComposerState::for_draft("cd pre", crate::gui::complete::Family::Pwsh);
         anyhow::ensure!(
-            !loc.remote_lane_possible(Some("C:\\Windows")),
-            "a local pwsh cwd must not arm the remote lane"
-        );
-        anyhow::ensure!(
             loc.tab_press(Some("C:\\Windows\\__tc_absent__"), 6, 1, Some(&cache))
                 .is_none()
                 && loc.take_comp_request().is_none(),
@@ -7677,6 +7666,36 @@ fn case_nested_completion() -> anyhow::Result<()> {
         }
     }
     anyhow::ensure!(raced, "no submission ever landed inside the echo phase");
+
+    // ── SUBMIT, THEN TAB ─────────────────────────────────────────────────
+    // The mirror image: a Tab right after a submit. For one round trip the
+    // gate still sees a quiet prompt row (no echo, no exec hook yet), and a
+    // trigger typed then lands in whatever the line started — a `sudo`
+    // password prompt included. So a submit closes the lane until the next
+    // prompt; and because that is only "not right now", the ask is parked and
+    // answered once the prompt is back, instead of being declined with a
+    // "nothing" the GUI would cache for three seconds.
+    settle();
+    let typed_before = log_since(log0).matches("remote completion query typed").count();
+    c.send(&C2D::Input {
+        id,
+        bytes: b"true\r".to_vec(),
+    })?;
+    let (_, found, _, entries) = c.await_completion(id, &format!("{root}/a dir"), 15)?;
+    anyhow::ensure!(
+        found && entries.is_empty(),
+        "an ask right after a submit must be answered once the prompt is back, \
+         not declined (found={found}, {} entries)",
+        entries.len()
+    );
+    anyhow::ensure!(
+        log_since(log0).matches("remote completion query typed").count() > typed_before,
+        "the parked ask never armed"
+    );
+    anyhow::ensure!(
+        log_since(log0).contains("parked (DirtyInput)"),
+        "the ask was never held back while the submitted line ran"
+    );
 
     // Tear the scratch tree down, leave the nested world, and prove the
     // outer shell is still healthy.
@@ -12232,23 +12251,20 @@ fn case_cmd_nested_episode() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// nested-death reinstate (field report, second user): when the link under a
-/// typed nested shell DIES while the outer shell stays alive, Pulse must put
-/// the nested world back instead of leaving the user to retype it — and must
-/// replay the opener VERBATIM.
+/// nested-death reinstate, H1: a FIRST connect that fails is a failed
+/// command, not a dropped link, and must never be replayed.
 ///
-/// Driven by a real `ssh` that really exits 255: an unresolvable host is the
-/// same failure class as a dropped link (ssh's documented "255 if an error
-/// occurred"), needs no network, no credentials, and no remote host. The
-/// opener deliberately carries a QUOTED path containing spaces, because the
-/// field opener does (`ssh -i "C:\…\hosting.pem" ubuntu@host`) and the replay
-/// must round-trip it byte-exact.
-fn case_nested_death_reinstate() -> anyhow::Result<()> {
+/// ssh exits 255 for an unresolvable host, a refused connection, a rejected
+/// key and a host-key failure exactly as it does for a dropped link. v0.1.19
+/// replayed all of them — a typo'd `ssh usr@hots` was retyped into the
+/// user's shell at 2s, 10s, then forever, and a revoked key produced failed
+/// logins fast enough to trip fail2ban. (This case used to REQUIRE that
+/// replay, twice.) The opener carries a quoted path with spaces, the field
+/// shape, so it still classifies as a crossing nested shell.
+fn case_nested_failed_connect_is_not_a_death() -> anyhow::Result<()> {
     if !ssh_client_present() {
         return Err(skip("no ssh.exe on PATH".into()));
     }
-    // A host that cannot resolve ⇒ ssh exits 255 immediately, which is
-    // exactly the status a dropped link produces.
     let opener = concat!(
         r#"ssh -i "C:\tc probe keys\nosuch.pem" "#,
         "-o BatchMode=yes -o ConnectTimeout=2 ",
@@ -12260,12 +12276,82 @@ fn case_nested_death_reinstate() -> anyhow::Result<()> {
             && crate::daemon::tracker::crosses_to_posix(&opener),
         "the probe's own opener must classify as a crossing nested shell"
     );
-    anyhow::ensure!(
-        crate::daemon::tracker::nested_end_verdict(Some(&opener), Some(255), false)
-            == crate::daemon::tracker::NestedEnd::Died,
-        "the probe's own opener must read as a death at 255"
-    );
 
+    let log0 = daemon_log_len();
+    let master = master_token()?;
+    let mut c = Conn::open()?;
+    let _ = c.first_snapshot()?;
+    let id = create_probe_terminal(&mut c, "__probe_nest_failconnect__")?;
+    c.send(&C2D::Attach { id, cols: 120, rows: 30 })?;
+    let mut ctl = Conn::open_ctl(&master, None)?;
+    let mut rid = 9800u64;
+    await_hooked_prompt(&mut ctl, &mut rid, id, 90)?;
+    std::thread::sleep(Duration::from_millis(400));
+
+    c.send(&C2D::Input {
+        id,
+        bytes: format!("{opener}\r").into_bytes(),
+    })?;
+    // The episode opens at exec time (that part is right — it is how the
+    // injection gets armed), then ssh fails and the outer prompt returns.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let log = log_since(log0);
+        if log.contains("before its shell was ever reached") {
+            break;
+        }
+        anyhow::ensure!(
+            !log.contains("nested shell died under a live outer shell"),
+            "a failed FIRST connect was armed for replay: {:?}",
+            log.lines().filter(|l| l.contains("nested")).collect::<Vec<_>>()
+        );
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "the failed connect was never judged: {:?}",
+            log.lines().filter(|l| l.contains("nested")).collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // The breadcrumb retires, and nothing is typed on the ladder's first
+    // rungs either (2s, then 10s).
+    c.snapshot_until(30, |s| {
+        s.terminals
+            .iter()
+            .any(|t| t.id == id && t.nested_chain.is_none())
+    })?;
+    std::thread::sleep(Duration::from_secs(4));
+    let log = log_since(log0);
+    anyhow::ensure!(
+        !log.contains("nested shell died under a live outer shell"),
+        "a failed FIRST connect must never be replayed"
+    );
+    anyhow::ensure!(
+        log.matches("nested-shell episode opened").count() == 1,
+        "the opener was typed again: {:?}",
+        log.lines().filter(|l| l.contains("episode opened")).collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
+/// nested-death reinstate (field report, second user): when the link under
+/// an ESTABLISHED nested ssh dies while the outer shell stays alive, Pulse
+/// puts the nested world back, replaying the opener verbatim — and a replay
+/// the server REJECTS ends the ladder instead of feeding fail2ban.
+///
+/// Needs a real sshd (`TC_COMP_SSH_RIG=<a complete ssh opener>`, the same
+/// disposable rig `nested_completion` uses): "established" means the far
+/// side's shell was reached and hooked, which no stand-in can fake. The link
+/// is killed from the far side (`kill -9 $PPID` takes down the session's
+/// sshd), so ssh exits 255 exactly as on a dropped connection.
+fn case_nested_death_reinstate() -> anyhow::Result<()> {
+    let opener = match std::env::var("TC_COMP_SSH_RIG") {
+        Ok(o) if !o.trim().is_empty() => o.trim().to_string(),
+        _ => {
+            return Err(skip(
+                "needs a real sshd: set TC_COMP_SSH_RIG to a complete ssh opener".into(),
+            ))
+        }
+    };
     let log0 = daemon_log_len();
     let master = master_token()?;
     let mut c = Conn::open()?;
@@ -12273,82 +12359,91 @@ fn case_nested_death_reinstate() -> anyhow::Result<()> {
     let id = create_probe_terminal(&mut c, "__probe_nest_death__")?;
     c.send(&C2D::Attach { id, cols: 120, rows: 30 })?;
     let mut ctl = Conn::open_ctl(&master, None)?;
-    let mut rid = 9800u64;
+    let mut rid = 9850u64;
     await_hooked_prompt(&mut ctl, &mut rid, id, 90)?;
     std::thread::sleep(Duration::from_millis(400));
+    let hooked = |n: usize| -> anyhow::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let log = log_since(log0);
+            if log.matches("nested shell hooked (depth 1").count() >= n {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "nested shell hook #{n} never arrived: {:?}",
+                log.lines().filter(|l| l.contains("nested")).collect::<Vec<_>>()
+            );
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    };
 
-    // Type the opener exactly as a user would. pwsh's exec hook witnesses it
-    // and opens the episode; ssh then dies 255 on its own.
+    // Reach the far side.
     c.send(&C2D::Input {
         id,
         bytes: format!("{opener}\r").into_bytes(),
     })?;
+    hooked(1)?;
+    std::thread::sleep(Duration::from_millis(800));
 
-    // THE REGRESSION: pre-fix the breadcrumb was retired the moment the
-    // outer prompt came back ("hooked prompt returned") and nothing replayed.
-    let deadline = Instant::now() + Duration::from_secs(90);
-    loop {
-        let log = log_since(log0);
-        if log.contains("nested shell died under a live outer shell") {
-            break;
-        }
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "a dead nested ssh must arm a replay: {:?}",
-            log.lines()
-                .filter(|l| l.contains("nested"))
-                .collect::<Vec<_>>()
-        );
-        std::thread::sleep(Duration::from_millis(500));
-    }
+    // Drop the link from the far side: ssh exits 255, the outer shell lives.
+    c.send(&C2D::Input {
+        id,
+        bytes: b"kill -9 $PPID\r".to_vec(),
+    })?;
+    // An ESTABLISHED session's death is replayed — verbatim — and the replay
+    // reaches the far side again, which resets the ladder.
+    hooked(2)?;
     let log = log_since(log0);
     anyhow::ensure!(
-        !log.contains("nested-shell breadcrumb retired"),
-        "the breadcrumb must be KEPT across a death, not retired"
+        log.contains("nested shell died under a live outer shell"),
+        "an established session's dropped link must be replayed"
     );
-    // VERBATIM REPLAY: the logged replay line carries the opener byte-exact,
-    // quotes and spaces intact.
     anyhow::ensure!(
         log.contains(&format!("verbatim: {opener}")),
-        "the replay must name the opener byte-exact (quoted key path intact)"
+        "the replay must name the opener byte-exact"
     );
-
-    // The breadcrumb survived in persisted state too, byte-exact.
-    let snap = c.snapshot_until(20, |s| {
-        s.terminals
-            .iter()
-            .any(|t| t.id == id && t.nested_chain.is_some())
-    })?;
-    let chain = snap
-        .terminals
-        .iter()
-        .find(|t| t.id == id)
-        .and_then(|t| t.nested_chain.clone())
-        .expect("breadcrumb kept");
     anyhow::ensure!(
-        chain.cmds == vec![opener.clone()],
-        "the kept chain must be the opener VERBATIM, got {:?}",
-        chain.cmds
+        log.contains("nested replay ladder reset"),
+        "a replay that came back must reset its ladder"
     );
+    std::thread::sleep(Duration::from_millis(800));
 
-    // IDEMPOTENCY / the ladder: the replay fails the same way (the host still
-    // does not resolve), so a SECOND death must climb to attempt 2 rather
-    // than spin or give up.
-    let deadline = Instant::now() + Duration::from_secs(120);
+    // THE AUTH WALL: take the key away, drop the link again. The replay is
+    // refused ("Permission denied (publickey)", exit 255), and the ladder
+    // must stop right there. The key comes back by itself 8s later, so the
+    // rig stays usable — and no later rung may use it.
+    let died_before = log_since(log0).matches("nested shell died under a live outer shell").count();
+    c.send(&C2D::Input {
+        id,
+        bytes: b"setsid sh -c 'sleep 8; mv ~/.ssh/ak.tc-probe ~/.ssh/authorized_keys' >/dev/null 2>&1 </dev/null & mv ~/.ssh/authorized_keys ~/.ssh/ak.tc-probe && kill -9 $PPID\r".to_vec(),
+    })?;
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let log = log_since(log0);
-        if log.contains("(attempt 2,") {
+        if log.contains("nested ssh was refused") {
             break;
         }
         anyhow::ensure!(
             Instant::now() < deadline,
-            "a second death must advance the backoff ladder: {:?}",
-            log.lines()
-                .filter(|l| l.contains("nested shell died"))
-                .collect::<Vec<_>>()
+            "a refused replay must stop the ladder: {:?}",
+            log.lines().filter(|l| l.contains("nested")).collect::<Vec<_>>()
         );
         std::thread::sleep(Duration::from_millis(500));
     }
+    // Past the key's return and the next rungs (2s, 10s): no further replay.
+    std::thread::sleep(Duration::from_secs(14));
+    let log = log_since(log0);
+    anyhow::ensure!(
+        log.matches("nested shell died under a live outer shell").count() == died_before + 1,
+        "the ladder kept replaying after the server refused the key: {:?}",
+        log.lines().filter(|l| l.contains("nested shell died")).collect::<Vec<_>>()
+    );
+    anyhow::ensure!(
+        !log.contains("(attempt 2,"),
+        "a rejected key must never reach a second rung"
+    );
+    delete_terminal(&mut c, id);
     Ok(())
 }
 
@@ -12537,6 +12632,7 @@ pub fn run(case: Option<&str>) -> anyhow::Result<()> {
         ("frame_corrupt_degrade", case_frame_corrupt_degrade),
         ("launcher_claude_cwd", case_launcher_claude_cwd),
         ("cmd_nested_episode", case_cmd_nested_episode),
+        ("nested_failed_connect_is_not_a_death", case_nested_failed_connect_is_not_a_death),
         ("nested_death_reinstate", case_nested_death_reinstate),
         ("nested_exit_is_not_a_death", case_nested_exit_is_not_a_death),
     ];

@@ -318,10 +318,15 @@ fi
 ///     a link to a directory is marked like the local completer's
 ///     follow-the-link `file_type` branch;
 ///   - `head -c` is the ONLY bound: it caps the payload by BYTES, which caps
-///     the OSC body (`blocks::BODY_CAP`) and detects truncation exactly
-///     (over cap ⇒ the listing is dropped and `t:1` is reported, so the GUI
-///     degrades to no-candidates instead of computing a common prefix over a
-///     subset — the over-completion hazard `MATCH_BOUND` guards locally).
+///     the OSC body (`blocks::BODY_CAP`). Truncation is detected EXACTLY by
+///     reading one byte past the cap and counting BYTES (`wc -c`): over cap
+///     ⇒ the listing is dropped and `t:1` is reported, so the GUI degrades to
+///     no-candidates instead of computing a common prefix over a subset —
+///     the over-completion hazard `MATCH_BOUND` guards locally. The earlier
+///     `${#l} -ge CAP` test missed two cuts: `$(…)` strips trailing newlines,
+///     so a cut landing on a line boundary measured one short, and `${#l}`
+///     counts CHARACTERS, so multibyte names undercounted and a cut fragment
+///     arrived marked complete. The `x` sentinel keeps `$(…)` from stripping.
 ///     `ls` still reads and sorts a 50k-entry directory before `head` can
 ///     close the pipe: that is ~100ms ONCE, bounded, and never a wedge;
 ///   - `command -p` on both utilities, like every other utility these hooks
@@ -330,7 +335,7 @@ fi
 ///     `head` without `-c` both yield an empty listing — no candidates, no
 ///     noise, exactly today's behavior.
 const COMP_FN: &str = r#"__tc_comp() {
-  local d l
+  local d l n
   d=$1
   [ -n "$d" ] || d=$PWD
   case $d in
@@ -339,8 +344,10 @@ const COMP_FN: &str = r#"__tc_comp() {
     '~/'*) d=$HOME/${d#'~/'} ;;
     *) d=${PWD%/}/$d ;;
   esac
-  l=$(command -p ls -A -p -L -- "$d" 2>/dev/null | command -p head -c {CBYTES} 2>/dev/null)
-  if [ ${#l} -ge {CBYTES} ]; then
+  l=$(command -p ls -A -p -L -- "$d" 2>/dev/null | command -p head -c {CBYTES1} 2>/dev/null; echo x)
+  l=${l%x}
+  n=$(printf %s "$l" | command -p wc -c 2>/dev/null)
+  if [ "$((n+0))" -gt {CBYTES} ]; then
     __tc_emit comp "{\"d\":\"$(__tc_json_str "$d")\",\"t\":1,\"l\":\"\"}"
   else
     __tc_emit comp "{\"d\":\"$(__tc_json_str "$d")\",\"t\":0,\"l\":\"$(__tc_json_str "$l")\"}"
@@ -394,26 +401,49 @@ const COMP_PREFETCH: &str = r#"  if [ "$PWD" != "$__TC_CD" ]; then __TC_CD=$PWD;
 ///     (`__tc_cq` appears nowhere else), so under the stock
 ///     `HISTCONTROL=ignoreboth` — where the leading space already kept the
 ///     line out of history — it can never delete the user's own command;
-///   - the erase is evaluated BEFORE the answer is emitted and before the
-///     function returns, so the shell repaints its prompt over a clean seam;
-///   - an empty erase blob (the mirror declined) evals to nothing and the
-///     line honestly stays visible — the daemon then stands the lane down
-///     for that terminal rather than ever risk a second artifact.
+///   - the erase runs BEFORE the answer is emitted and before the function
+///     returns, so the shell repaints its prompt over a clean seam. An empty
+///     row (the mirror declined) erases nothing and the line honestly stays
+///     visible — the daemon then stands the lane down for that terminal
+///     rather than ever risk a second artifact;
+///   - NOTHING read here is ever executed. The erase is a row NUMBER the
+///     shell checks is all digits and formats itself, and the request path
+///     only ever reaches `ls` as a quoted argument. Each payload line is
+///     tagged (`COMP_Q_TAG`, `COMP_E_TAG`), and the reader stops at the first
+///     line that is not ours: if anything else ever reaches these `read`s
+///     first — a line the user submitted that slipped past the daemon's
+///     flush — it is handed back to the user's history (Up recalls it) and
+///     nothing is listed, erased or run. The tags are ` #`-led, so a payload
+///     line that ever lands at a live prompt instead is an inert comment.
+///     Before this, the second line went through `eval`: a desync ran the
+///     request path as a command and left the real erase line to run at the
+///     prompt.
 const COMP_QUERY_FN: &str = r#"__tc_cq() {
   __tc_rc=$?
   __tc_at_prompt=0
   local q e h n
   stty -echo 2>/dev/null
   IFS= read -r q
-  IFS= read -r e
+  case $q in ' #tcq:'*) IFS= read -r e ;; esac
   stty echo 2>/dev/null
   h=$(HISTTIMEFORMAT= builtin history 1 2>/dev/null)
   case $h in *__tc_cq*) h=${h#"${h%%[! ]*}"}; n=${h%%[!0-9]*}; [ -n "$n" ] && builtin history -d "$n" 2>/dev/null ;; esac
-  eval "$(printf %s "$e" | command -p base64 -d 2>/dev/null)"
-  __tc_comp "$(printf %s "$q" | command -p base64 -d 2>/dev/null)"
+  case $e in
+    ' #tce:'*) ;;
+    *) [ -n "$q" ] && builtin history -s -- "$q" 2>/dev/null; return $__tc_rc ;;
+  esac
+  e=${e#' #tce:'}
+  case $e in ''|*[!0-9]*) ;; *) printf '\033[%s;1H\033[J' "$e" ;; esac
+  __tc_comp "$(printf %s "${q#' #tcq:'}" | command -p base64 -d 2>/dev/null)"
   return $__tc_rc
 }
 "#;
+
+/// The tags that lead each `__tc_cq` payload line. See `COMP_QUERY_FN`: the
+/// reader acts only on lines that carry them, and the leading ` #` makes a
+/// stray one an inert comment at a prompt.
+pub const COMP_Q_TAG: &str = " #tcq:";
+pub const COMP_E_TAG: &str = " #tce:";
 
 /// Hard byte cap on ONE `comp` listing, as the shell measures it.
 ///
@@ -430,14 +460,18 @@ pub const COMP_MAX_BYTES: usize = 6000;
 /// mirror's erase gate has the easiest possible match to make.
 pub const COMP_READER: &str = " __tc_cq";
 
-/// The two INVISIBLE payload lines `__tc_cq` reads, in order: base64 of the
-/// requested directory (resolved by the shell against its own `$PWD`/`$HOME`)
-/// and base64 of the erase blob (`nested_erase_payload` — empty when the
-/// mirror declined, which evals to nothing).
+/// The two INVISIBLE payload lines `__tc_cq` reads, in order, each tagged:
+/// base64 of the requested directory (resolved by the shell against its own
+/// `$PWD`/`$HOME`), and the 1-based screen row to erase from (empty when the
+/// mirror declined — nothing is erased). Data only: the reader never
+/// executes either line.
 pub fn comp_query_payload(dir: &str, erase_row: Option<usize>) -> [String; 2] {
     [
-        base64_encode(dir.as_bytes()),
-        nested_erase_payload(erase_row),
+        format!("{COMP_Q_TAG}{}", base64_encode(dir.as_bytes())),
+        format!(
+            "{COMP_E_TAG}{}",
+            erase_row.map(|r| r.to_string()).unwrap_or_default()
+        ),
     ]
 }
 
@@ -521,7 +555,12 @@ __tc_emit init "{\"v\":1,\"pid\":$$,\"shell\":\"bash\",\"home\":\"$(__tc_json_st
 /// and the prefetch and is never typed into (`comp_query_supported`).
 fn splice_comp(body: &str, query: bool) -> String {
     body.replace("{COMP_PREFETCH}", COMP_PREFETCH)
-        .replace("{COMP_FN}", &COMP_FN.replace("{CBYTES}", &COMP_MAX_BYTES.to_string()))
+        .replace(
+            "{COMP_FN}",
+            &COMP_FN
+                .replace("{CBYTES1}", &(COMP_MAX_BYTES + 1).to_string())
+                .replace("{CBYTES}", &COMP_MAX_BYTES.to_string()),
+        )
         .replace("{COMP_QUERY_FN}", if query { COMP_QUERY_FN } else { "" })
 }
 
@@ -1181,14 +1220,24 @@ mod tests {
         // it watched being opened). A second copy would drift.
         for (name, body) in [("bash", &bash), ("zsh", &zsh), ("rcfile", &rc)] {
             assert!(body.contains("__tc_comp() {"), "{name}: no lister");
+            // Truncation is judged in BYTES, one byte past the cap, with the
+            // trailing newline kept: a cut on a line boundary or through a
+            // multibyte name must still read as over-cap, never as complete.
+            assert!(
+                body.contains(&format!("head -c {} 2>/dev/null; echo x)", COMP_MAX_BYTES + 1))
+                    && body.contains("command -p wc -c")
+                    && body.contains(&format!("-gt {COMP_MAX_BYTES} ]"))
+                    && !body.contains("${#l}"),
+                "{name}: the listing cap must be checked exactly, in bytes"
+            );
             assert!(
                 body.contains("command -p ls -A -p -L --"),
                 "{name}: the listing must include dotfiles (-A), mark dirs (-p) \
                  and resolve symlinks (-L), via command -p"
             );
             assert!(
-                body.contains(&format!("head -c {}", COMP_MAX_BYTES)),
-                "{name}: the payload byte cap is the only bound on the channel"
+                body.contains(&format!("head -c {}", COMP_MAX_BYTES + 1)),
+                "{name}: the payload byte cap (read one past, to see a cut) is the only bound on the channel"
             );
             assert!(body.contains("__tc_emit comp "), "{name}: no comp verb");
             // The SHELL resolves `~` and relative requests: the GUI must
@@ -1255,16 +1304,22 @@ mod tests {
         // zsh's preexec filters our plumbing by name for the same reason.
         assert!(zsh.contains("case ${1## } in __tc_*) return ;; esac"));
 
-        // The request + erase ride the invisible payload lines, and the erase
-        // is the SAME mirror-gated blob nesthook composes (empty row ⇒ empty
-        // blob ⇒ eval nothing ⇒ the line honestly stays visible).
+        // The request + erase ride the invisible payload lines as tagged DATA:
+        // a base64 path and a bare row number (empty ⇒ nothing is erased ⇒
+        // the line honestly stays visible). Neither is ever executed.
         let [req, erase] = comp_query_payload("/root/src", Some(7));
-        assert_eq!(String::from_utf8(b64_decode(&req)).unwrap(), "/root/src");
-        assert_eq!(
-            String::from_utf8(b64_decode(&erase)).unwrap(),
-            "printf '\\033[7;1H\\033[J'"
-        );
-        assert!(comp_query_payload("/root", None)[1].is_empty());
+        let b64 = req.strip_prefix(COMP_Q_TAG).expect("the request line is tagged");
+        assert_eq!(String::from_utf8(b64_decode(b64)).unwrap(), "/root/src");
+        assert_eq!(erase, format!("{COMP_E_TAG}7"));
+        assert_eq!(comp_query_payload("/root", None)[1], COMP_E_TAG);
+        // The tags are what keep a stray payload line inert at a prompt
+        // (a comment) and what the reader keys on to stop at a foreign line.
+        assert!(COMP_Q_TAG.starts_with(" #") && COMP_E_TAG.starts_with(" #"));
+        let body = &bash[bash.find("__tc_cq() {").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(!body.contains("eval"), "the query reader must never eval what it reads");
+        assert!(body.contains(&format!("' {}'*)", COMP_Q_TAG.trim_start())));
+        assert!(body.contains(&format!("' {}'*)", COMP_E_TAG.trim_start())));
         for l in comp_query_payload(&"/x".repeat(512), Some(1)) {
             assert!(l.len() <= NESTED_LINE_MAX, "a payload line blew the tty cap");
             assert!(!l.contains('\n') && !l.contains('\r'), "a typed line must be ONE line");

@@ -843,29 +843,52 @@ impl Core {
     /// --screen` serializes) — the settled prompt line the credential check
     /// inspects.
     pub(super) fn last_screen_line(&self, id: Uuid) -> Option<String> {
-        use alacritty_terminal::grid::Dimensions;
-        use alacritty_terminal::index::{Column, Line};
-        use alacritty_terminal::term::cell::Flags;
-        let term = self.sessions.lock().get(&id).map(|s| s.term.clone())?;
-        let t = term.lock();
-        let (cols, rows) = (t.columns(), t.screen_lines());
-        for r in (0..rows).rev() {
-            let row = &t.grid()[Line(r as i32)];
-            let mut s = String::with_capacity(cols);
-            for c in 0..cols {
-                let cell = &row[Column(c)];
-                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                    continue;
-                }
-                s.push(cell.c);
-            }
-            let s = s.trim_end().to_string();
-            if !s.is_empty() {
-                return Some(s);
-            }
-        }
-        None
+        self.screen_tail(id, 1).pop()
     }
+
+    /// The last `n` non-blank lines of the live mirror screen, oldest first.
+    pub(super) fn screen_tail(&self, id: Uuid, n: usize) -> Vec<String> {
+        match self.sessions.lock().get(&id).map(|s| s.term.clone()) {
+            Some(term) => term_tail(&term, n),
+            None => Vec::new(),
+        }
+    }
+}
+
+/// The last `n` non-blank lines of a mirror screen, oldest first. Free of
+/// `Core` so a session that is being torn down can still be read.
+pub(super) fn term_tail(
+    term: &alacritty_terminal::sync::FairMutex<
+        alacritty_terminal::Term<super::session::EventProxy>,
+    >,
+    n: usize,
+) -> Vec<String> {
+    use alacritty_terminal::grid::Dimensions;
+    use alacritty_terminal::index::{Column, Line};
+    use alacritty_terminal::term::cell::Flags;
+    let t = term.lock();
+    let (cols, rows) = (t.columns(), t.screen_lines());
+    let mut out = Vec::new();
+    for r in (0..rows).rev() {
+        if out.len() == n {
+            break;
+        }
+        let row = &t.grid()[Line(r as i32)];
+        let mut s = String::with_capacity(cols);
+        for c in 0..cols {
+            let cell = &row[Column(c)];
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            s.push(cell.c);
+        }
+        let s = s.trim_end().to_string();
+        if !s.is_empty() {
+            out.push(s);
+        }
+    }
+    out.reverse();
+    out
 }
 
 #[cfg(test)]

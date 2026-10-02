@@ -394,25 +394,6 @@ pub fn effective_family(fam: &Family, cwd: Option<&str>) -> Family {
     }
 }
 
-/// Whether this terminal's Tab can need the REMOTE lane at all: a POSIX
-/// world is live in front of the user (`effective_family`), or it is WSL —
-/// whose local UNC leg can still fall THROUGH to the hook channel (a nested
-/// root shell's `/root`, a default-distro terminal with no UNC name).
-///
-/// The app reads it to make sure the listing cache EXISTS before the first
-/// Tab, and that is not a nicety: `enumerate` cannot tell a cache that is
-/// merely EMPTY from "there is no remote lane here" (`remote: None` ⇒
-/// `Nothing`), and the cache used to be created only BY an ask — so the ask
-/// that would have created it could never be parked. That circle is the
-/// v0.1.20 field bug: `cd pr<Tab>` inside a real ssh session did nothing,
-/// forever, and silently.
-pub fn remote_lane_possible(fam: &Family, cwd: Option<&str>) -> bool {
-    matches!(
-        effective_family(fam, cwd),
-        Family::Remote | Family::Wsl { .. }
-    )
-}
-
 fn plan_win(fam: &Family, cwd: Option<&str>, home: Option<&str>, value: &str) -> Option<Plan> {
     // Token separator style wins for rendered dirs; default Windows `\`.
     let sep = if value.contains('/') && !value.contains('\\') {
@@ -533,12 +514,22 @@ struct EnumOut {
 
 /// ONE streaming read_dir: retain prefix matches only, count the total.
 /// `capped` = the dir exceeds `cap` entries (⇒ common-prefix-only mode).
-fn enum_dir(dir: &Path, prefix: &str, ci: bool, posix_hidden: bool, cap: usize) -> Option<EnumOut> {
+fn enum_dir(
+    dir: &Path,
+    prefix: &str,
+    ci: bool,
+    posix_hidden: bool,
+    cap: usize,
+) -> Result<EnumOut, LocalMiss> {
     let want_hidden = prefix.starts_with('.');
     let pfx_lc = if ci { Some(prefix.to_lowercase()) } else { None };
     let mut matches: Vec<Entry> = Vec::new();
     let mut total = 0usize;
-    for ent in std::fs::read_dir(dir).ok()? {
+    let entries = std::fs::read_dir(dir).map_err(|e| match e.kind() {
+        std::io::ErrorKind::PermissionDenied => LocalMiss::Denied,
+        _ => LocalMiss::Unreadable,
+    })?;
+    for ent in entries {
         let Ok(ent) = ent else { continue };
         total += 1;
         // Non-Unicode names can't be rendered into the draft — skip.
@@ -569,7 +560,7 @@ fn enum_dir(dir: &Path, prefix: &str, ci: bool, posix_hidden: bool, cap: usize) 
             .unwrap_or(false);
         matches.push(Entry { name, dir: dir_flag });
         if matches.len() > MATCH_BOUND {
-            return None; // unbounded haystack — silent no-op (honest)
+            return Err(LocalMiss::Overflow); // unbounded haystack — silent no-op (honest)
         }
     }
     // Dirs first, then files; alphabetical, case-insensitive within groups.
@@ -578,7 +569,7 @@ fn enum_dir(dir: &Path, prefix: &str, ci: bool, posix_hidden: bool, cap: usize) 
             .cmp(&a.dir)
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
-    Some(EnumOut {
+    Ok(EnumOut {
         matches,
         capped: total > cap,
     })
@@ -586,7 +577,7 @@ fn enum_dir(dir: &Path, prefix: &str, ci: bool, posix_hidden: bool, cap: usize) 
 
 /// UNC targets (`\\wsl.localhost\…`, network shares) can stall for seconds —
 /// enumerate them on a throwaway thread with a hard budget; local dirs run
-/// inline (bounded by the cap machinery). Timeout ⇒ None (this Tab no-ops;
+/// inline (bounded by the cap machinery). Timeout ⇒ `TimedOut` (this Tab no-ops;
 /// the orphan thread finishes into a dropped channel).
 fn enum_budgeted(
     dir: PathBuf,
@@ -594,7 +585,7 @@ fn enum_budgeted(
     ci: bool,
     posix_hidden: bool,
     cap: usize,
-) -> Option<EnumOut> {
+) -> Result<EnumOut, LocalMiss> {
     if !dir.as_os_str().to_string_lossy().starts_with("\\\\") {
         return enum_dir(&dir, &prefix, ci, posix_hidden, cap);
     }
@@ -602,7 +593,33 @@ fn enum_budgeted(
     std::thread::spawn(move || {
         let _ = tx.send(enum_dir(&dir, &prefix, ci, posix_hidden, cap));
     });
-    rx.recv_timeout(UNC_BUDGET).ok().flatten()
+    rx.recv_timeout(UNC_BUDGET).unwrap_or(Err(LocalMiss::TimedOut))
+}
+
+/// Why a LOCAL listing produced nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalMiss {
+    /// The Windows side may not read it — a root-owned `/root` over the WSL
+    /// share, seen from a nested root shell that can.
+    Denied,
+    /// Missing, not a directory, or any other read error.
+    Unreadable,
+    /// The UNC share did not answer inside `UNC_BUDGET`.
+    TimedOut,
+    /// More than `MATCH_BOUND` matches.
+    Overflow,
+}
+
+/// May a WSL plan whose local view came up empty-handed ask the shell? Only
+/// when the Windows side was DENIED — the nested root shell's `/root`, the
+/// case the fall-through exists for. Every other miss is something the
+/// shell would answer the same way (missing, a match flood) or a cold share
+/// that answers next time (a timeout), and typing a query into the user's
+/// shell for those buys nothing while widening every risk the query lane
+/// carries. A default-distro terminal with no UNC name never gets here: its
+/// plan is `Dir::Remote` from the start.
+fn local_miss_asks(miss: LocalMiss) -> bool {
+    miss == LocalMiss::Denied
 }
 
 /// remote-completion: the same filter/order over a listing the shell already
@@ -647,9 +664,8 @@ enum Enumerated {
 
 /// Resolve a plan's target to candidates. The LOCAL legs are byte-for-byte
 /// the pre-remote path (one `read_dir`, same budget, same caps); the remote
-/// leg is a cache lookup; the WSL leg tries local first and only falls
-/// through when the Windows-side view cannot answer at all (no such
-/// directory, or EACCES — a nested root shell's `/root` over the UNC share).
+/// leg is a cache lookup; the WSL leg tries local first and falls through
+/// to the shell only when the Windows side was denied (`local_miss_asks`).
 fn enumerate(
     plan: &Plan,
     cap: usize,
@@ -671,8 +687,8 @@ fn enumerate(
             plan.posix_hidden,
             cap,
         ) {
-            Some(out) => Enumerated::Found(out),
-            None => Enumerated::Nothing,
+            Ok(out) => Enumerated::Found(out),
+            Err(_) => Enumerated::Nothing,
         },
         Dir::Remote(dir) => ask(dir),
         Dir::LocalThenRemote(fs, dir) => match enum_budgeted(
@@ -682,8 +698,9 @@ fn enumerate(
             plan.posix_hidden,
             cap,
         ) {
-            Some(out) => Enumerated::Found(out),
-            None => ask(dir),
+            Ok(out) => Enumerated::Found(out),
+            Err(miss) if local_miss_asks(miss) => ask(dir),
+            Err(_) => Enumerated::Nothing,
         },
     }
 }
@@ -725,13 +742,39 @@ fn quote_token(fam: &Family, t: &str) -> String {
                 '\'', '"', '`', '$', '&', '|', ';', '(', ')', '<', '>', '*', '?', '[', ']',
                 '{', '}', '!', '#', '~', '\\',
             ];
-            if t.chars().any(char::is_whitespace) || t.contains(SPECIAL) {
-                super::drop::bash_single_quote(t)
+            // A leading `~` / `~user` stays BARE: the shell expands it only
+            // unquoted, so `'~/pr2/'` names a directory literally called `~`
+            // and the most common remote gesture (`cd ~/<Tab>`) produced a
+            // command that fails. Only the remainder is quoted, if it needs it.
+            let (home, rest) = split_tilde(t);
+            if rest.chars().any(char::is_whitespace) || rest.contains(SPECIAL) {
+                format!("{home}{}", super::drop::bash_single_quote(rest))
             } else {
                 t.to_string()
             }
         }
         Family::Other => super::drop::other_quote(t),
+    }
+}
+
+/// Split a POSIX token's leading tilde prefix — `~/`, `~user/`, or a bare
+/// `~`/`~user` — from the rest. Only a login-name-shaped user part counts,
+/// mirroring what bash will actually expand; anything else has no prefix.
+fn split_tilde(t: &str) -> (&str, &str) {
+    let Some(after) = t.strip_prefix('~') else {
+        return ("", t);
+    };
+    let (user, end) = match after.find('/') {
+        Some(i) => (&after[..i], i + 2),
+        None => (after, t.len()),
+    };
+    if user
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        t.split_at(end)
+    } else {
+        ("", t)
     }
 }
 
@@ -1526,7 +1569,7 @@ mod tests {
         // no remote world", and that second clause was the field bug: a
         // terminal that very much HAS a remote world also arrives here,
         // because the app's cache was created only BY an ask. See
-        // `remote_lane_possible` and `an_empty_cache_asks_a_missing_one_cannot`.
+        // `gui::comp_cache_for` and `an_empty_cache_asks_a_missing_one_cannot`.
         assert!(matches!(
             start(&r, Some("/root"), None, "cd x", 4, ENUM_CAP, None),
             Start::None
@@ -1557,8 +1600,8 @@ mod tests {
     /// so the ask that would have created it was never produced — a closed
     /// circle, in every remote shape, with nothing in any log.
     ///
-    /// `remote_lane_possible` is what breaks it: the app now creates the
-    /// cache from the tracked cwd, before any Tab.
+    /// `gui::comp_cache_for` is what breaks it: the app now hands every
+    /// terminal a cache, before any Tab.
     #[test]
     fn an_empty_cache_asks_a_missing_one_cannot() {
         let r = Family::Remote;
@@ -1594,43 +1637,45 @@ mod tests {
         assert_eq!(c.step(1).0, "cd prod.log");
     }
 
-    /// Which terminals must be handed a listing cache before their first Tab
-    /// — the predicate the app keys the fix on. It must say YES for every
-    /// shape that can reach `Dir::Remote`, and NO for every purely local one
-    /// (which must keep carrying no cache at all).
+    /// A remote `~` completion must stay expandable: the tilde prefix is
+    /// emitted bare and only the remainder is quoted. Quoting the whole token
+    /// (`cd '~/pr2/'`) names a directory literally called `~`.
     #[test]
-    fn remote_lane_possible_follows_the_tracked_cwd() {
-        // The field shape: a pwsh/cmd terminal that typed `ssh host`. The
-        // SPAWN family never changes; the POSIX cwd is the whole witness.
-        for fam in [Family::Pwsh, Family::Cmd, Family::Other] {
-            assert!(
-                remote_lane_possible(&fam, Some("/home/dev")),
-                "{fam:?} with a posix cwd is a remote world"
-            );
-            assert!(
-                remote_lane_possible(&fam, Some("/root")),
-                "{fam:?} inside a nested sudo su is still remote"
-            );
-            // Purely local: no cache, exactly as before.
-            assert!(!remote_lane_possible(&fam, Some(r"C:\Users\dev")));
-            assert!(!remote_lane_possible(&fam, None));
+    fn a_tilde_parent_stays_unquoted() {
+        for fam in [Family::Remote, Family::Wsl { distro: None }] {
+            let rem = FakeRemote::default()
+                .with("~", &[("pr2", true), ("my dir", true)])
+                .with("~dev", &[("pr2", true)]);
+            let done = |draft: &str| match start(
+                &fam,
+                Some("/home/dev"),
+                None,
+                draft,
+                draft.len(),
+                ENUM_CAP,
+                Some(&rem),
+            ) {
+                Start::Edit { draft, .. } => draft,
+                Start::Cycle(mut c) => c.step(1).0,
+                _ => panic!("{fam:?}: {draft} did not complete"),
+            };
+            assert_eq!(done("cd ~/pr"), "cd ~/pr2/", "{fam:?}");
+            assert_eq!(done("cd ~/my"), "cd ~/'my dir/'", "{fam:?}");
+            assert_eq!(done("cd ~dev/pr"), "cd ~dev/pr2/", "{fam:?}");
         }
-        // An ssh-PROGRAM terminal (`family_for(ShellFamily::Ssh)`) is remote
-        // before it has reported any cwd at all — `cd /et<Tab>` there needs
-        // the lane with cwd None.
-        assert!(remote_lane_possible(&Family::Remote, None));
-        // WSL keeps its local UNC leg but can still fall through to the hook
-        // channel (`/root` under a nested root shell, a default distro with
-        // no UNC name), so it needs the cache too — including inside `/mnt`,
-        // where a `~` token in the same draft can still ask.
-        assert!(remote_lane_possible(
-            &Family::Wsl { distro: Some("Ubuntu-24.04".into()) },
-            Some("/home/dev")
-        ));
-        assert!(remote_lane_possible(&Family::Wsl { distro: None }, Some("/mnt/c")));
-        // A WSL terminal needs it even before it reports a cwd.
-        assert!(remote_lane_possible(&Family::Wsl { distro: None }, None));
+        assert_eq!(split_tilde("~/a b/"), ("~/", "a b/"));
+        assert_eq!(split_tilde("~dev/x"), ("~dev/", "x"));
+        assert_eq!(split_tilde("~"), ("~", ""));
+        assert_eq!(split_tilde("~$(x)/y"), ("", "~$(x)/y"), "not a login name: no prefix");
+        assert_eq!(split_tilde("/a/~b"), ("", "/a/~b"));
+    }
 
+    /// The two WSL shapes the shell answers: `~` (the GUI cannot know a
+    /// distro home) and a default distro's own filesystem (no UNC name to
+    /// build). A `/mnt` cwd the Windows side can enumerate never leaves the
+    /// local lane.
+    #[test]
+    fn wsl_asks_the_shell_only_where_windows_cannot_see() {
         // The two WSL shapes the lane actually answers, now that the cache
         // exists for them. `~` goes straight to the shell (the GUI cannot
         // know a distro home), and a DEFAULT distro has no UNC name to build,
@@ -1683,18 +1728,21 @@ mod tests {
         };
         assert_eq!(out.matches.len(), 1);
         assert_eq!(out.matches[0].name, "local_only");
-        // An UNREADABLE local half (EACCES / missing — a root-owned /root
-        // over the UNC share) falls through to the shell.
+        // A MISSING local half is the shell's answer too — no query is typed
+        // into the user's shell for it, cache or not.
         let p = Plan {
             dir: Dir::LocalThenRemote(dir.join("nope"), "/home/z".into()),
             ..p
         };
-        let Enumerated::Found(out) = enumerate(&p, ENUM_CAP, Some(&rem)) else {
-            panic!("expected the remote fallback");
-        };
-        assert_eq!(out.matches[0].name, "remote_only");
-        // ...and with no cache, the old honest no-op.
+        assert!(matches!(enumerate(&p, ENUM_CAP, Some(&rem)), Enumerated::Nothing));
         assert!(matches!(enumerate(&p, ENUM_CAP, None), Enumerated::Nothing));
+        // Only a DENIED local view (a root-owned /root over the share, read
+        // from a nested root shell) may ask the shell. A cold share's timeout
+        // and a match flood never do.
+        assert!(local_miss_asks(LocalMiss::Denied));
+        for miss in [LocalMiss::Unreadable, LocalMiss::TimedOut, LocalMiss::Overflow] {
+            assert!(!local_miss_asks(miss), "{miss:?} must not type a query");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

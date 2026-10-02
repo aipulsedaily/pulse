@@ -481,6 +481,11 @@ impl Core {
             e.opener
         );
         drop(map);
+        // nested-death reinstate: the far side was REACHED. Only now is this
+        // episode's death a dropped link rather than a failed command.
+        if let Some(l) = self.nested_life.lock().get_mut(&id) {
+            l.established = true;
+        }
         // nested-death reinstate: the nested world is BACK and talking. Any
         // replay ladder this terminal was climbing has succeeded, so the next
         // death starts again at the first rung instead of inheriting an

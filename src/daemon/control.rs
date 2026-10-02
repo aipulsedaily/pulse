@@ -492,7 +492,14 @@ impl Core {
     }
 
     /// Bytes to the PTY via the session writer — the exact `C2D::Input` path,
-    /// nothing else (mirror purity).
+    /// nothing else (mirror purity), INCLUDING its three notifications. A
+    /// controller's bytes reach the same shell a user's do, so they must stop
+    /// a chain re-establish or nested replay from typing into the middle of
+    /// them, keep a hook injection's waiting rules, and flush and close the
+    /// completion lane. Without them a `tc run` during a completion query's
+    /// echo phase was read by `__tc_cq` as its request, and a `tc send`
+    /// half line was invisible to the dirty-input gate, so the next Tab
+    /// appended ` __tc_cq` to it and ran it.
     fn write_pty(&self, id: Uuid, bytes: &[u8]) -> Result<(), (&'static str, String)> {
         // SLEEP S9: input never wakes — an INPUT-scoped token must not be
         // able to spawn processes, and a typo'd send must not resume a
@@ -506,6 +513,10 @@ impl Core {
             }
             Some(false) => {}
         }
+        self.cancel_reestablish(id, "controller input");
+        let submitted = bytes.last().is_some_and(|b| *b == b'\r' || *b == b'\n');
+        self.nesthook_on_input(id, submitted);
+        self.comp_on_input(id);
         let writer = self.sessions.lock().get(&id).map(|s| s.writer.clone());
         match writer {
             Some(w) => {

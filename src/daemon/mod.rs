@@ -459,6 +459,14 @@ impl StateSaveDebounce {
     }
 }
 
+/// One live nested episode (`Core::nested_life`).
+#[derive(Debug, Clone, Copy)]
+struct NestedLife {
+    opened: Instant,
+    /// Its nested shell reported its hooks (`nesthook_on_init`).
+    established: bool,
+}
+
 pub struct Core {
     state: Mutex<SharedState>,
     sessions: Mutex<HashMap<Uuid, Session>>,
@@ -547,6 +555,11 @@ pub struct Core {
     /// so it never gives up on its own. Reset when the nested world comes
     /// back (its own hooks report in) and when the user cancels.
     nested_retry: Mutex<HashMap<Uuid, u32>>,
+    /// nested-death reinstate: the live nested episode's own record (LEAF
+    /// lock) — when it opened, and whether its shell was ever REACHED (its
+    /// hooks reported in). Only an established episode's death is a dropped
+    /// link worth replaying; one that never got there is a failed command.
+    nested_life: Mutex<HashMap<Uuid, NestedLife>>,
     /// nested-shell-hooks: in-flight hook injections (LEAF lock): terminal →
     /// phase state. Armed by `open_nested_chain` the moment a nested-shell
     /// episode is WITNESSED in an already-hooked terminal, driven by
@@ -1276,6 +1289,12 @@ impl Core {
             }
             removed = sessions.remove(&id);
         }
+        // The dying session's last screen lines, read before it drops: the
+        // reconnect ladder stops on an auth wall it can only see here.
+        let tail = removed
+            .as_ref()
+            .map(|s| reestablish::term_tail(&s.term, 8))
+            .unwrap_or_default();
         // Session drop closes the ConPTY (cross-process) — do it OUTSIDE the
         // sessions mutex, like every other blockable per-session syscall.
         drop(removed);
@@ -1305,7 +1324,7 @@ impl Core {
                 self.report_error(&format!("failed to save state on exit: {e}"));
             }
         }
-        self.maybe_schedule_reconnect(id, code, expected, hooks_were_live);
+        self.maybe_schedule_reconnect(id, code, expected, hooks_were_live, &tail);
         // F2: a dying session ends any in-flight chain re-establish (the
         // relaunch re-arms from the persisted breadcrumb when one survives).
         self.cancel_reestablish(id, "session exited");
@@ -2409,6 +2428,15 @@ impl Core {
             }
         }
         self.nested_open.lock().insert(id);
+        // Every opener — typed by the user or replayed by the ladder —
+        // starts unproven: nothing has been reached yet.
+        self.nested_life.lock().insert(
+            id,
+            NestedLife {
+                opened: Instant::now(),
+                established: false,
+            },
+        );
         let changed = {
             let mut state = self.state.lock();
             let Some(t) = state.terminal_mut(id) else { return };
@@ -2500,10 +2528,24 @@ impl Core {
                 t.shell_cfg.as_ref().is_none_or(|c| c.auto_reestablish),
             )
         };
+        let life = self.nested_life.lock().remove(&id);
         // A ladder already climbing loosens the verdict for repeat failures
         // only — see `nested_end_verdict` on PowerShell's `$LASTEXITCODE`
-        // repeat-collapse.
-        let ladder_live = self.nested_retry.lock().contains_key(&id);
+        // repeat-collapse — and only while its latest replay has not proved
+        // itself by staying up (`ladder_still_live`).
+        let mut ladder_live = self.nested_retry.lock().contains_key(&id);
+        if ladder_live
+            && !reconnect::ladder_still_live(
+                true,
+                life.map_or(Duration::ZERO, |l| l.opened.elapsed()),
+            )
+        {
+            self.nested_retry.lock().remove(&id);
+            ladder_live = false;
+            log::info!(
+                "terminal {id}: nested replay ladder reset — the replayed session stayed up"
+            );
+        }
         let verdict =
             tracker::nested_end_verdict(steps.first().map(String::as_str), pre_exit, ladder_live);
         if verdict != tracker::NestedEnd::Died {
@@ -2511,6 +2553,29 @@ impl Core {
                 "terminal {id}: nested episode ended ({verdict:?}, exit {pre_exit:?}) — retiring"
             );
             return false;
+        }
+        let tail = self.screen_tail(id, 8);
+        match reconnect::nested_replay_call(
+            life.is_some_and(|l| l.established),
+            ladder_live,
+            &tail,
+        ) {
+            reconnect::ReplayCall::Replay => {}
+            reconnect::ReplayCall::NeverEstablished => {
+                log::info!(
+                    "terminal {id}: nested ssh ended (exit {pre_exit:?}) before its shell was ever \
+                     reached — a failed connection, not a dropped link; not replaying"
+                );
+                return false;
+            }
+            reconnect::ReplayCall::AuthWall(wall) => {
+                log::info!(
+                    "terminal {id}: nested ssh was refused ({wall}) — not replaying; retrying \
+                     would only repeat a failed login"
+                );
+                self.nested_retry.lock().remove(&id);
+                return false;
+            }
         }
         if !opt_in {
             log::info!(
@@ -2607,6 +2672,7 @@ impl Core {
         // ladder with it — there is nothing left to replay, and the next
         // death must start at the first rung.
         self.nested_retry.lock().remove(&id);
+        self.nested_life.lock().remove(&id);
         // nested-shell-hooks: the nested world is gone, so its injection
         // bookkeeping is too (the tokens themselves were already retired by
         // `pop_nested_below` when the outer shell spoke).
@@ -3890,10 +3956,10 @@ impl Core {
                 let submitted = bytes.last().is_some_and(|b| *b == b'\r' || *b == b'\n');
                 self.nesthook_on_input(id, submitted);
                 // remote-completion: the user's keystroke supersedes any
-                // in-flight query, and half-typed bytes mark the shell's line
-                // buffer dirty so the next query declines rather than append
-                // our trigger to their command.
-                self.comp_on_input(id, submitted);
+                // in-flight query (flushing a payload the shell is parked on
+                // ahead of these bytes), and the shell is dirty until its
+                // next prompt so no trigger lands in a line or a command.
+                self.comp_on_input(id);
                 // Clone the writer Arc out and write OUTSIDE the sessions
                 // mutex (SubmitCommand's pattern): a full ConPTY input pipe
                 // (app stopped reading stdin) blocks write_all indefinitely,
@@ -4090,9 +4156,9 @@ impl Core {
         // A composer submission is a whole line: the injection keeps waiting
         // for the prompt that comes back after it (nested-shell-hooks).
         self.nesthook_on_input(id, true);
-        // remote-completion: a submission supersedes any in-flight query
-        // and leaves no line buffer behind (see `comp_on_input`).
-        self.comp_on_input(id, true);
+        // remote-completion: a submission supersedes any in-flight query and
+        // closes the lane until the next prompt (see `comp_on_input`).
+        self.comp_on_input(id);
         if let Err(msg) = validate_submit_command(&cmd) {
             log::warn!("SubmitCommand for {id} refused: {msg}");
             if let Some(f) = frame_bytes(&D2C::Error {
@@ -5104,6 +5170,7 @@ pub fn run() -> anyhow::Result<()> {
         reconnects: Mutex::new(HashMap::new()),
         reestablish: Mutex::new(HashMap::new()),
         nested_retry: Mutex::new(HashMap::new()),
+        nested_life: Mutex::new(HashMap::new()),
         nesthooks: Mutex::new(HashMap::new()),
         completion: Mutex::new(HashMap::new()),
         comp_quiet: Mutex::new(HashMap::new()),
