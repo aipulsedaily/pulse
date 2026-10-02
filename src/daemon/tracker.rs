@@ -594,8 +594,62 @@ fn cd_head_tail(cmd: &str) -> Option<(&str, &str)> {
 /// larger than sudo's and a wrong skip could turn a finite command into a
 /// false "interactive shell" verdict.
 pub fn nested_shell_cmd(cmd: &str) -> bool {
-    let argv: Vec<&str> = cmd.split_whitespace().collect();
+    let owned = split_ws_quoted(cmd);
+    let argv: Vec<&str> = owned.iter().map(String::as_str).collect();
     nested_shell_argv(&argv)
+}
+
+/// Tokenise a typed command line for the nested-shell classifiers:
+/// whitespace separates words, **except inside a double-quoted run**, and the
+/// quote characters themselves are dropped.
+///
+/// Field bug (second user): his opener is
+/// `ssh -i "C:\…\hosting.pem" ubuntu@52.201.138.138`. Tokenised with
+/// `split_whitespace` — which both classifiers used — the quoted key path
+/// shatters into three words, so `ssh_interactive_login` consumed `"C:\tc`
+/// as `-i`'s value, read `probe` as the destination, saw tokens after it,
+/// and returned false. A perfectly ordinary opener was therefore never
+/// classified as a nested shell at all: no breadcrumb, no hook injection, no
+/// recovery. Any flag value containing a space hit this — `-i`, `-F`, `-o`,
+/// and `wsl --cd "C:\my dir"` alike.
+///
+/// Deliberately NOT a full shell splitter. `split_cmdline` eats backslashes,
+/// which would destroy the Windows-path stems this classifier reads
+/// (`C:\Windows\System32\OpenSSH\ssh.exe`); the whole value of this one is
+/// that it touches nothing but quotes. An unbalanced quote degrades to
+/// "rest of the line is one token", which is conservative in the same
+/// direction as everything else here.
+///
+/// As a free consequence the `split_whitespace` caveat documented on
+/// `nested_shell_argv` is gone too: `FOO="a b" sudo su` now strips its env
+/// prefix correctly instead of failing closed.
+fn split_ws_quoted(cmd: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote = false;
+    let mut started = false;
+    for ch in cmd.chars() {
+        match ch {
+            '"' => {
+                in_quote = !in_quote;
+                started = true; // `""` is a real (empty) argument
+            }
+            c if c.is_whitespace() && !in_quote => {
+                if started {
+                    out.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        out.push(cur);
+    }
+    out
 }
 
 fn nested_shell_argv(argv: &[&str]) -> bool {
@@ -794,7 +848,11 @@ fn box_enter(args: &[&str]) -> bool {
 /// Callers must still check `nested_shell_cmd` — this only names the family
 /// of opener, never that the argv is interactive.
 pub fn crosses_to_posix(cmd: &str) -> bool {
-    let words: Vec<&str> = cmd.split_whitespace().collect();
+    // Same tokeniser as `nested_shell_cmd` — the two verdicts gate each
+    // other at every call site, so they must never disagree about where the
+    // words are (see `split_ws_quoted`).
+    let owned = split_ws_quoted(cmd);
+    let words: Vec<&str> = owned.iter().map(String::as_str).collect();
     // env-prefix-cli: skipped here for the same reason as in
     // `nested_shell_argv`, and it MUST be skipped in both or neither —
     // every caller evaluates the two together (`nested_shell_cmd(cmd) &&
@@ -810,6 +868,106 @@ pub fn crosses_to_posix(cmd: &str) -> bool {
         stem.as_str(),
         "ssh" | "wsl" | "docker" | "podman" | "kubectl" | "oc" | "distrobox" | "toolbox"
     )
+}
+
+/// How a nested-shell episode ended, as far as the daemon can HONESTLY tell.
+///
+/// The question matters because the two endings want opposite treatment: a
+/// session the user closed must never be resurrected, and a session a dead
+/// link took away is exactly what the user wants back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NestedEnd {
+    /// The user left on purpose (`exit`, `logout`, Ctrl-D). Retire the
+    /// breadcrumb — today's behaviour, unchanged.
+    Deliberate,
+    /// The transport failed under a session that was still in use. The
+    /// breadcrumb is kept and the opener is replayed on a backoff ladder.
+    Died,
+    /// Not determinable on this path. Treated exactly like `Deliberate` for
+    /// anything automatic — never resurrect on a guess — but the caller may
+    /// still keep a manual affordance.
+    Unknown,
+}
+
+/// Decide why a nested episode ended, from the opener that started it and the
+/// exit status the OUTER shell reported for that opener.
+///
+/// `exit` is the `e` field of the token-checked `pre` that renders the outer
+/// prompt again: the outer shell's status for the command that opened the
+/// nested world. `None` means the family cannot report one at all — cmd.exe
+/// is the permanent case (`bootstrap::cmd_prompt_value`: a `PROMPT` macro
+/// cannot expand `%ERRORLEVEL%` at render time, so its pre payload is the
+/// constant `{"e":null,"n":0}`; probe `cmd_hooks` pins it).
+///
+/// Only `ssh` is read as DIED, and only on its documented failure status:
+///
+/// > ssh exits with the exit status of the remote command, or 255 if an
+/// > error occurred.
+///
+/// So 255 is "ssh itself could not keep the connection" — a dropped link,
+/// a timed-out TCP session after a laptop sleep, a refused reconnect. Every
+/// other status belongs to the remote side (`exit 3` in the remote shell
+/// returns 3) and is therefore the user's own doing. Other crossing openers
+/// (`wsl`, `docker exec`) are deliberately NOT given a death verdict: a
+/// local container or distro going away is not a transport failure, and
+/// re-entering it automatically is not what "my connection dropped" means.
+///
+/// `ladder_live` says a replay ladder is ALREADY climbing for this terminal,
+/// and it loosens exactly one thing: a non-zero status that is not 255 also
+/// reads as a death. That is not a guess, it is the PowerShell hook's own
+/// documented behaviour. `bootstrap.rs`'s prompt wrapper trusts
+/// `$LASTEXITCODE` only when the just-run pipeline CHANGED it, because the
+/// variable persists across later cmdlets and would otherwise make every
+/// cmdlet inherit the previous native command's code. The residual it names:
+///
+/// > a native command repeating the previous native code reads as
+/// > "unchanged" and folds to `$?` (still correctly FAILED, only the exact
+/// > code differs)
+///
+/// A replayed `ssh` failing the same way twice is precisely that case: the
+/// first drop reports 255, the identical second one folds to 1. Without this
+/// the ladder would stop after a single attempt against a host that is still
+/// down — the exact situation it exists for. Exit 0 is still never a death,
+/// in or out of a ladder, so a user who gets back in and then logs out
+/// properly ends it.
+///
+/// Conservative by construction: the failure mode of this function is to
+/// decline to resurrect, never to resurrect something the user closed. The
+/// loosening needs a ladder that a strict 255 already started.
+pub fn nested_end_verdict(
+    opener: Option<&str>,
+    exit: Option<i64>,
+    ladder_live: bool,
+) -> NestedEnd {
+    let Some(opener) = opener else {
+        return NestedEnd::Unknown;
+    };
+    let owned = split_ws_quoted(opener);
+    let words: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let argv = strip_env_prefix(&words).unwrap_or_default();
+    let Some(first) = argv.first() else {
+        return NestedEnd::Unknown;
+    };
+    if cmd_stem(first) != "ssh" {
+        // Not a transport we know how to judge; ending is just ending.
+        return match exit {
+            Some(_) => NestedEnd::Deliberate,
+            None => NestedEnd::Unknown,
+        };
+    }
+    match exit {
+        // A clean logout is the user's doing, always — a live ladder does
+        // not change that, it ends it.
+        Some(0) => NestedEnd::Deliberate,
+        Some(255) => NestedEnd::Died,
+        // See the `$LASTEXITCODE` note above: an identical repeat folds to 1,
+        // so mid-ladder any failure continues the ladder.
+        Some(_) if ladder_live => NestedEnd::Died,
+        Some(_) => NestedEnd::Deliberate,
+        // cmd.exe: exit codes are permanently unavailable (D7). We know the
+        // ssh ended; we cannot know why. Never auto-replay on that.
+        None => NestedEnd::Unknown,
+    }
 }
 
 /// F1: is `key` an enabled CLI adapter? Gates the nested-beacon mint — a
@@ -2464,6 +2622,204 @@ mod tests {
     }
 
     /// Nested-cli-resume regression (hypothesis c): re-witnessing the SAME
+    /// FIELD BUG (second user): his opener is
+    /// `ssh -i "C:\…\hosting.pem" ubuntu@52.201.138.138`. Tokenised with
+    /// `split_whitespace` the quoted key path shattered, `-i` ate `"C:\…`,
+    /// the next word read as the destination, and the whole opener failed to
+    /// classify — so no breadcrumb, no hook injection, no recovery, for an
+    /// entirely ordinary ssh command. Every flag value containing a space hit
+    /// this.
+    #[test]
+    fn quoted_flag_values_do_not_break_nested_classification() {
+        for opener in [
+            r#"ssh -i "C:\Users\dad\keys\hosting.pem" ubuntu@52.201.138.138"#,
+            r#"ssh -i "C:\my keys\hosting.pem" ubuntu@52.201.138.138"#,
+            r#"ssh -F "C:\ssh config\config" -p 8022 root@192.168.1.110"#,
+            r#"ssh -o "ProxyCommand=connect -H h:1 %h %p" user@host"#,
+        ] {
+            assert!(
+                nested_shell_cmd(opener),
+                "must classify as an interactive nested shell: {opener}"
+            );
+            assert!(
+                crosses_to_posix(opener),
+                "and as crossing into a POSIX world: {opener}"
+            );
+        }
+        // The unquoted forms keep working exactly as before.
+        assert!(nested_shell_cmd("ssh ubuntu@52.201.138.138"));
+        assert!(nested_shell_cmd("ssh -p 8022 root@192.168.1.110"));
+        assert!(nested_shell_cmd(r"ssh -i C:\keys\k.pem user@host"));
+    }
+
+    /// The tokeniser must not break the things it was kept simple for:
+    /// backslashes are never interpreted, so Windows path stems still read.
+    #[test]
+    fn quoted_tokeniser_leaves_windows_paths_alone() {
+        assert_eq!(
+            split_ws_quoted(r"C:\Windows\System32\OpenSSH\ssh.exe host"),
+            vec![r"C:\Windows\System32\OpenSSH\ssh.exe", "host"]
+        );
+        // A quoted program path now reads as ONE token, so its stem resolves.
+        assert_eq!(
+            split_ws_quoted(r#""C:\Program Files\Git\bin\bash.exe" -l"#),
+            vec![r"C:\Program Files\Git\bin\bash.exe", "-l"]
+        );
+        assert!(nested_shell_cmd(r#""C:\Program Files\OpenSSH\ssh.exe" user@host"#));
+        // Plain lines are unchanged.
+        assert_eq!(split_ws_quoted("sudo su"), vec!["sudo", "su"]);
+        assert_eq!(split_ws_quoted("  wsl   -d  Ubuntu "), vec!["wsl", "-d", "Ubuntu"]);
+        assert_eq!(split_ws_quoted(""), Vec::<String>::new());
+        // An empty quoted argument is a real argument.
+        assert_eq!(split_ws_quoted(r#"ssh -o "" host"#), vec!["ssh", "-o", "", "host"]);
+        // An unbalanced quote degrades to "the rest is one token" rather than
+        // dropping anything.
+        assert_eq!(split_ws_quoted(r#"ssh "unclosed host"#), vec!["ssh", "unclosed host"]);
+    }
+
+    /// The documented `split_whitespace` caveat on `nested_shell_argv` — a
+    /// quoted env-assignment value defeating the prefix strip — is gone as a
+    /// consequence, and both classifiers agree about it.
+    #[test]
+    fn quoted_env_prefix_values_now_strip() {
+        assert!(nested_shell_cmd(r#"FOO="a b" sudo su"#));
+        assert!(nested_shell_cmd(r#"FOO="a b" ssh user@host"#));
+        assert!(crosses_to_posix(r#"FOO="a b" ssh user@host"#));
+        assert_eq!(
+            nested_end_verdict(Some(r#"FOO="a b" ssh user@host"#), Some(255), false),
+            NestedEnd::Died
+        );
+    }
+
+    /// A finite remote command must STILL be refused — the looser tokeniser
+    /// must not turn `ssh host ls` into a nested shell.
+    #[test]
+    fn quoted_tokeniser_keeps_finite_commands_out() {
+        assert!(!nested_shell_cmd("ssh user@host ls"));
+        assert!(!nested_shell_cmd(r#"ssh -i "C:\my keys\k.pem" user@host ls -la"#));
+        assert!(!nested_shell_cmd(r#"ssh -i "C:\my keys\k.pem" user@host "uptime""#));
+        // A flag-value miss at the end is still a refusal, never a guess.
+        assert!(!nested_shell_cmd(r#"ssh -i "C:\my keys\k.pem""#));
+    }
+
+    /// nested-death reinstate: the DIED-vs-DELIBERATE verdict. The whole
+    /// recovery hangs on this being conservative — a false "died" resurrects
+    /// a session the user closed on purpose, which is the one thing the
+    /// feature must never do.
+    #[test]
+    fn nested_end_verdict_only_resurrects_a_failed_ssh() {
+        use NestedEnd::*;
+        // ssh's documented convention: 255 means ssh itself failed — a
+        // dropped link, a timed-out TCP session after a laptop sleep.
+        assert_eq!(nested_end_verdict(Some("ssh user@host"), Some(255), false), Died);
+        assert_eq!(
+            nested_end_verdict(Some("ssh -p 8022 root@192.168.1.110"), Some(255), false),
+            Died
+        );
+        // The field opener with a quoted key path containing spaces.
+        assert_eq!(
+            nested_end_verdict(
+                Some(r#"ssh -i "C:\keys\my host\hosting.pem" ubuntu@52.201.138.138"#),
+                Some(255),
+                false
+            ),
+            Died
+        );
+
+        // A clean logout is the user's doing — never resurrect it.
+        assert_eq!(nested_end_verdict(Some("ssh user@host"), Some(0), false), Deliberate);
+        // So is any other status: that one belongs to the REMOTE command
+        // (`exit 3` in the remote shell returns 3), not to the transport.
+        for code in [1, 2, 3, 126, 127, 130] {
+            assert_eq!(
+                nested_end_verdict(Some("ssh user@host"), Some(code), false),
+                Deliberate,
+                "exit {code} is the remote side's, not a transport failure"
+            );
+        }
+
+        // No status at all (cmd.exe: `%ERRORLEVEL%` cannot be expanded by a
+        // PROMPT macro, D7) is UNKNOWN — and unknown never auto-replays.
+        assert_eq!(nested_end_verdict(Some("ssh user@host"), None, false), Unknown);
+
+        // Non-ssh crossings are never a transport failure: a distro or a
+        // container going away is not "my connection dropped".
+        assert_eq!(nested_end_verdict(Some("wsl -d Ubuntu"), Some(255), false), Deliberate);
+        assert_eq!(nested_end_verdict(Some("wsl"), Some(1), false), Deliberate);
+        assert_eq!(
+            nested_end_verdict(Some("docker exec -it c bash"), Some(255), false),
+            Deliberate
+        );
+        assert_eq!(nested_end_verdict(Some("sudo su"), Some(255), false), Deliberate);
+
+        // Nothing recorded ⇒ nothing to judge.
+        assert_eq!(nested_end_verdict(None, Some(255), false), Unknown);
+        assert_eq!(nested_end_verdict(Some("   "), Some(255), false), Unknown);
+    }
+
+    /// A ladder already climbing must survive the SECOND identical failure.
+    ///
+    /// Found by probe `nested_death_reinstate` against a real ssh: the first
+    /// drop reports 255, the replay fails the same way, and PowerShell's hook
+    /// reports **1** — because `bootstrap.rs`'s prompt wrapper only trusts
+    /// `$LASTEXITCODE` when the pipeline CHANGED it, and an identical repeat
+    /// reads as unchanged and folds to `$?`. With a strict 255 rule the
+    /// ladder stopped after one attempt against a host that was still down,
+    /// which is the exact case it exists for.
+    #[test]
+    fn a_live_ladder_survives_the_repeat_exit_code_collapse() {
+        use NestedEnd::*;
+        let ssh = Some("ssh user@host");
+        // Rung 1 is strict: only ssh's own 255 may START a ladder.
+        assert_eq!(nested_end_verdict(ssh, Some(255), false), Died);
+        assert_eq!(nested_end_verdict(ssh, Some(1), false), Deliberate);
+        // Once climbing, the folded repeat continues it.
+        assert_eq!(nested_end_verdict(ssh, Some(1), true), Died);
+        assert_eq!(nested_end_verdict(ssh, Some(255), true), Died);
+        assert_eq!(nested_end_verdict(ssh, Some(3), true), Died);
+        // But a CLEAN logout ends it, ladder or no ladder: the user got back
+        // in and left on purpose.
+        assert_eq!(nested_end_verdict(ssh, Some(0), true), Deliberate);
+        // And the loosening never reaches a non-ssh opener or a family with
+        // no exit status at all.
+        assert_eq!(nested_end_verdict(Some("wsl -d Ubuntu"), Some(1), true), Deliberate);
+        assert_eq!(nested_end_verdict(ssh, None, true), Unknown);
+    }
+
+    /// The env-prefix form the v0.1.18 CLI work introduced must reach the
+    /// same verdict as the bare opener — `nested_shell_cmd`/`crosses_to_posix`
+    /// both strip it, and a classifier that disagreed with them would replay
+    /// chains the injection never armed for (or refuse ones it did).
+    #[test]
+    fn nested_end_verdict_sees_through_an_env_prefix() {
+        assert_eq!(
+            nested_end_verdict(Some("FOO=1 ssh user@host"), Some(255), false),
+            NestedEnd::Died
+        );
+        assert_eq!(
+            nested_end_verdict(Some("FOO=1 BAR=2 ssh user@host"), Some(0), false),
+            NestedEnd::Deliberate
+        );
+        // Exactly the openers the injection classifies, and no others.
+        for opener in ["ssh host", "FOO=1 ssh host"] {
+            assert!(
+                nested_shell_cmd(opener) && crosses_to_posix(opener),
+                "{opener} must classify as a crossing nested shell"
+            );
+        }
+    }
+
+    /// A `.exe` stem and an absolute path must not change the verdict —
+    /// `cmd_stem` is what both classifiers use, so this keeps them aligned.
+    #[test]
+    fn nested_end_verdict_normalises_the_ssh_stem() {
+        assert_eq!(nested_end_verdict(Some("ssh.exe host"), Some(255), false), NestedEnd::Died);
+        assert_eq!(
+            nested_end_verdict(Some(r"C:\Windows\System32\OpenSSH\ssh.exe host"), Some(255), false),
+            NestedEnd::Died
+        );
+    }
+
     /// opener preserves the recorded chain — deeper hops AND the
     /// beacon-witnessed cli_cwd survive a re-establish cycle; a different
     /// opener still replaces (newest witnessed chain wins); no prior chain

@@ -71,6 +71,16 @@ fn reconnect_backoff_after(attempts_done: u32, manual: bool) -> Option<Duration>
     }
 }
 
+/// nested-death reinstate: the delay before replaying a nested opener after
+/// `attempts_done` failed replays. Deliberately the ssh ladder's own table in
+/// MANUAL mode — 2s, 10s, 30s, then 30s forever — because the ask is the same
+/// one the manual ladder answers ("keep trying until my server is back") and
+/// the terminal underneath is alive the whole time, so there is no Dead state
+/// to fall back to and nothing to give up to.
+pub(super) fn reconnect_backoff_after_for_nested(attempts_done: u32) -> Duration {
+    reconnect_backoff_after(attempts_done, true).unwrap_or(MANUAL_BACKOFF_CEILING)
+}
+
 /// The pure ssh auto-reconnect qualification (maybe_schedule_reconnect owns
 /// the witnesses): NOT deliberate, NOT a clean remote exit (code 0 = the
 /// user typed `exit`), the dying connection had HOOKED (bootstrap ran ⇒

@@ -480,6 +480,14 @@ impl Core {
             "terminal {id}: nested shell hooked (depth {depth}, opener {}) — blocks, cwd and CLI attribution now live inside it",
             e.opener
         );
+        drop(map);
+        // nested-death reinstate: the nested world is BACK and talking. Any
+        // replay ladder this terminal was climbing has succeeded, so the next
+        // death starts again at the first rung instead of inheriting an
+        // hours-old backoff.
+        if self.nested_retry.lock().remove(&id).is_some() {
+            log::info!("terminal {id}: nested replay ladder reset — the nested shell is back");
+        }
     }
 
     /// What `reestablish` needs before typing the inner-CLI resume.
