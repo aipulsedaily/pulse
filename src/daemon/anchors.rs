@@ -476,9 +476,13 @@ fn scan_events(region: &[u8], region_base: u64) -> Vec<(u64, EvKind)> {
                 HookVerb::Pre { .. } => EvKind::Pre,
                 // D* 133;A is a live-close anchor only; restore slots stay
                 // keyed on the 133;B prompt-end rows.
+                // remote-completion: a `comp` listing carries no position
+                // in the command/prompt narrative at all — it is side-channel
+                // data, so restore slots ignore it exactly like `init`.
                 HookVerb::Init { .. }
                 | HookVerb::Beacon { .. }
-                | HookVerb::PromptStart => continue,
+                | HookVerb::PromptStart
+                | HookVerb::Comp { .. } => continue,
             };
             events.push((abs + ev.offset_in_chunk as u64, kind));
         }

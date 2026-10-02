@@ -489,6 +489,42 @@ impl Conn {
         anyhow::bail!("no BlockText reply for offset {start_off} within {secs}s")
     }
 
+    /// remote-completion: ask for one directory listing and await the
+    /// requester-only `D2C::Completion` reply (same shape as `BlockText`).
+    ///
+    /// Returns (dir the shell resolved, found, truncated, entries) — a
+    /// `found: false` reply is the honest "nothing", which is a real answer
+    /// the caller asserts on, not a failure to wait longer for.
+    #[allow(clippy::type_complexity)]
+    fn await_completion(
+        &mut self,
+        id: Uuid,
+        dir: &str,
+        secs: u64,
+    ) -> anyhow::Result<(String, bool, bool, Vec<crate::protocol::CompEntry>)> {
+        self.send(&C2D::RequestCompletion {
+            id,
+            dir: dir.to_string(),
+        })?;
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < deadline {
+            if let Ok(D2C::Completion {
+                id: rid,
+                asked,
+                dir: resolved,
+                found,
+                trunc,
+                entries,
+            }) = self.recv()
+            {
+                if rid == id && asked == dir {
+                    return Ok((resolved, found, trunc, entries));
+                }
+            }
+        }
+        anyhow::bail!("no Completion reply for {dir} within {secs}s")
+    }
+
     /// The daemon answers a Ping — its client loop is still healthy.
     fn assert_alive(&mut self) -> anyhow::Result<()> {
         self.send(&C2D::Ping)?;
@@ -6984,6 +7020,360 @@ fn case_wsl_nested_hooks() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// remote-completion `nested_completion` — the live pin for the feature, in
+/// a REAL nested POSIX shell, end to end through a real ConPTY.
+///
+/// The field bug: Tab did nothing once the user was inside a remote shell.
+/// Completion is a local `read_dir` against the tracked cwd, and once that
+/// cwd is a POSIX path on another machine there is no local call that can
+/// answer — so `plan_win` returned None and the Tab was a silent no-op. The
+/// only honest source is the shell standing in the directory, and this probe
+/// asserts that both lanes to it work and that neither is visible.
+///
+/// It runs in exactly the field-reported SHAPE: an ordinary hooked PWSH
+/// terminal that typed a CROSSING opener, with `wsl -d <distro>` standing in
+/// for `ssh host` — the same class (a Windows-family terminal one step from a
+/// POSIX world, hooked by `nesthook`'s injection, reporting a POSIX `$PWD`),
+/// with no network, no host key and no password, exactly the substitution
+/// `pwsh_typed_nested_hooks` already makes. So the terminal's `ShellFamily`
+/// is Pwsh throughout, which is the whole point: the completer must follow
+/// the tracked cwd, not the spawn. The real ssh link is field-proven on a
+/// disposable rig.
+///
+/// Asserts:
+///   - PREFETCH: a `cd` inside the nested shell publishes that directory's
+///     listing with no request and no typing at all, and the entries carry
+///     the dir/file split `ls -p` reports (which is what the dirs-first
+///     ordering and the completed trailing separator are built on);
+///   - QUERY: a directory the prefetch never visited is answered by the
+///     bash-only typed lane, and `~` is resolved BY THE SHELL (the GUI never
+///     guesses a remote home);
+///   - the BOUND: a directory over `COMP_MAX_BYTES` comes back truncated
+///     with NO entries — never a subset, which would over-complete;
+///   - QUIET: the query's trigger line is nowhere in the daemon's own replay
+///     reconstruction, nowhere in the block records (so nowhere in the
+///     sidebar, block history or the Ctrl-R corpus), and nowhere in bash's
+///     interactive history;
+///   - the unanswerable case degrades honestly rather than hanging.
+fn case_nested_completion() -> anyhow::Result<()> {
+    let Some(distro) = wsl_probe_distro() else {
+        return Err(skip("no WSL distro in the Lxss registry".into()));
+    };
+    let opener = format!("wsl -d {distro}");
+    anyhow::ensure!(
+        crate::daemon::tracker::crosses_to_posix(&opener),
+        "the probe's own opener must classify as a crossing nested shell"
+    );
+    let log0 = daemon_log_len();
+    let master = master_token()?;
+    let mut c = Conn::open()?;
+    let _ = c.first_snapshot()?;
+    // A PWSH terminal — the field-reported family. It stays Pwsh forever.
+    let id = create_probe_terminal(&mut c, "__probe_comp_typed__")?;
+    c.send(&C2D::Attach { id, cols: 120, rows: 30 })?;
+    let mut ctl = Conn::open_ctl(&master, None)?;
+    let mut rid = 4950u64;
+    await_hooked_prompt(&mut ctl, &mut rid, id, 90)?;
+    std::thread::sleep(Duration::from_millis(400));
+    let outer_pids = hook_shell_pids(log0, id);
+
+    // The typed crossing opener — a WITNESSED episode from the pwsh exec
+    // hook, which is what arms the injection that makes the POSIX world one
+    // hop away completion-capable.
+    c.send(&C2D::Input {
+        id,
+        bytes: format!("{opener}\r").into_bytes(),
+    })?;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let pids = hook_shell_pids(log0, id);
+        if pids.iter().any(|p| !outer_pids.contains(p)) {
+            break;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "the crossed shell never reported its own hooks: {:?}",
+            log_since(log0)
+                .lines()
+                .filter(|l| l.contains("nested"))
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    anyhow::ensure!(
+        log_since(log0).contains("nested shell hooked (depth 1"),
+        "the injection never reported success"
+    );
+    // THE PRECONDITION the field report is made of: the terminal's tracked
+    // cwd is now a POSIX path on the far side, while its family is still
+    // pwsh. Everything local in the completer answers None here.
+    let posix_cwd = || -> String {
+        Conn::open()
+            .ok()
+            .and_then(|mut cc| cc.first_snapshot().ok())
+            .and_then(|st| {
+                st.terminals
+                    .iter()
+                    .find(|t| t.id == id)
+                    .and_then(|t| t.live_cwd.clone())
+            })
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        let cwd = posix_cwd();
+        if cwd.starts_with('/') {
+            break;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "the tracked cwd must be the INNER POSIX one, got {cwd:?}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    // A scratch tree with one of every shape the completer distinguishes:
+    // directories, files, a dotfile, a spacey name, a symlink TO a directory
+    // (`ls -L -p` must mark it as a directory, like the local completer's
+    // follow-the-link branch), and a child directory the prefetch will never
+    // visit. Under /tmp, removed at the end — no home, profile or rc file is
+    // read or written anywhere in this probe.
+    let root = "/tmp/__pulse_probe_comp__";
+    let setup = format!(
+        "rm -rf {root}; mkdir -p {root}/alpha/deeper {root}/bravo {root}/huge && \
+         : > {root}/notes.txt && : > {root}/.hidden && mkdir -p '{root}/a dir' && \
+         ln -sfn {root}/bravo {root}/linkdir && : > {root}/alpha/deeper/leaf.txt && \
+         i=0; while [ $i -lt 400 ]; do : > {root}/huge/padded_name_entry_$i; i=$((i+1)); done;          echo TC_COMP_SETUP"
+    );
+    match ctl_run_retry(
+        &mut ctl,
+        &mut rid,
+        id,
+        &setup,
+        Some(RunWait { timeout_ms: 60_000, tail_bytes: 4096 }),
+        90,
+    )? {
+        CtlBody::RunDone { output, .. } => anyhow::ensure!(
+            output.contains("TC_COMP_SETUP"),
+            "scratch tree setup failed: {output:?}"
+        ),
+        other => anyhow::bail!("setup returned {other:?}"),
+    }
+
+    // ── PREFETCH ─────────────────────────────────────────────────────────
+    // A `cd` is all it takes: the prompt hook publishes the new cwd's
+    // listing on the channel it already uses, so the FIRST Tab there is a
+    // cache hit. Nothing is typed, so there is nothing to erase or scrub.
+    match ctl_run_retry(
+        &mut ctl,
+        &mut rid,
+        id,
+        &format!("cd {root} && echo TC_COMP_CD"),
+        Some(RunWait { timeout_ms: 30_000, tail_bytes: 4096 }),
+        60,
+    )? {
+        CtlBody::RunDone { output, .. } => anyhow::ensure!(
+            output.contains("TC_COMP_CD"),
+            "cd into the scratch tree failed: {output:?}"
+        ),
+        other => anyhow::bail!("cd returned {other:?}"),
+    }
+    std::thread::sleep(Duration::from_millis(600));
+    let (resolved, found, trunc, entries) = c.await_completion(id, root, 20)?;
+    anyhow::ensure!(found && !trunc, "the prefetch must answer {root}");
+    anyhow::ensure!(resolved == root, "resolved {resolved:?} for {root}");
+    let dir_of = |n: &str| entries.iter().find(|e| e.name == n).map(|e| e.dir);
+    for (name, want_dir) in [
+        ("alpha", true),
+        ("bravo", true),
+        ("huge", true),
+        ("a dir", true),
+        ("linkdir", true), // a symlink TO a directory completes as one
+        ("notes.txt", false),
+        (".hidden", false), // -A keeps dotfiles; the GUI applies the rule
+    ] {
+        anyhow::ensure!(
+            dir_of(name) == Some(want_dir),
+            "{name}: expected dir={want_dir}, listing was {:?}",
+            entries.iter().map(|e| (&e.name, e.dir)).collect::<Vec<_>>()
+        );
+    }
+    anyhow::ensure!(
+        !entries.iter().any(|e| e.name == "." || e.name == ".."),
+        "`.`/`..` must never be candidates"
+    );
+    // The prefetch cost nothing in the user's shell: no query was typed.
+    anyhow::ensure!(
+        !log_since(log0).contains("remote completion query typed"),
+        "the prefetch must not type anything"
+    );
+
+    // Each query's own seam — the echo, the erase and the repainted prompt —
+    // re-bases the output-quiescence clock the gate reads, so back-to-back
+    // queries need a settle gap. Human Tab cadence always has one; a probe
+    // firing them in a tight loop does not, and a declined query is the
+    // honest no-op, not a failure.
+    let settle = || std::thread::sleep(Duration::from_millis(700));
+
+    // ── QUERY ────────────────────────────────────────────────────────────
+    // A directory the prefetch never visited (`cd alpha/deeper/<Tab>` is the
+    // gesture) goes to the shell through the typed lane.
+    let (resolved, found, _, entries) =
+        c.await_completion(id, &format!("{root}/alpha/deeper"), 25)?;
+    anyhow::ensure!(found, "the query lane must answer a non-cwd directory");
+    anyhow::ensure!(resolved.ends_with("/alpha/deeper"), "resolved {resolved:?}");
+    anyhow::ensure!(
+        entries.iter().any(|e| e.name == "leaf.txt" && !e.dir),
+        "query listing {:?}",
+        entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+    );
+    // The answer itself is the proof that the QUERY lane ran: the prefetch
+    // only ever publishes `$PWD`, and this directory was never the cwd. (The
+    // lane also logs a line per query, but at DEBUG — asserting on it would
+    // make this case pass or fail by log level.)
+    // `~` is resolved by the SHELL: the GUI has no way to know a remote home
+    // and must never guess one.
+    settle();
+    let (home, found, _, _) = c.await_completion(id, "~", 25)?;
+    anyhow::ensure!(found, "`~` must be answerable");
+    anyhow::ensure!(
+        home.starts_with('/') && home != "~",
+        "`~` must come back as the shell's own absolute $HOME, got {home:?}"
+    );
+
+    // ── THE BOUND ────────────────────────────────────────────────────────
+    // 400 entries at ~22 bytes each blow COMP_MAX_BYTES: the shell DROPS the
+    // listing rather than send a subset, and the answer says so. A common
+    // prefix over a subset would over-complete, which is worse than no
+    // completion at all. (The cap is on BYTES, not entries — a 900-entry
+    // directory of short names rides the channel fine.)
+    settle();
+    let (_, found, trunc, entries) =
+        c.await_completion(id, &format!("{root}/huge"), 25)?;
+    anyhow::ensure!(found && trunc, "an over-cap directory must report truncated");
+    anyhow::ensure!(
+        entries.is_empty(),
+        "a truncated listing must carry NO entries, got {}",
+        entries.len()
+    );
+
+    // ── HONEST DEGRADE ───────────────────────────────────────────────────
+    // A directory that does not exist answers "nothing" promptly — it never
+    // hangs the asker and never invents a candidate.
+    settle();
+    let (_, found, _, entries) =
+        c.await_completion(id, &format!("{root}/nope"), 25)?;
+    anyhow::ensure!(
+        entries.is_empty(),
+        "a missing directory produced candidates: {:?}",
+        entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+    );
+    let _ = found; // an empty listing is a legitimate answer for it
+
+    // ── QUIET ────────────────────────────────────────────────────────────
+    // `replay` is the daemon's own reconstruction — the exact bytes a fresh
+    // attach paints — so this covers the live view, the scrollback and a
+    // restore in one shot.
+    let text = strip_ansi(&String::from_utf8_lossy(&c.replay(id)?));
+    anyhow::ensure!(
+        !text.contains("__tc_cq"),
+        "the query trigger survived into the render: {:?}",
+        text.lines().filter(|l| l.contains("__tc_cq")).collect::<Vec<_>>()
+    );
+    // The request itself rides an INVISIBLE payload line (echo already off),
+    // so its base64 must appear nowhere. Asserted on the base64 — the
+    // plaintext path legitimately appears, because the probe's own `mkdir`
+    // was a real command the shell echoed.
+    let req_b64 =
+        crate::daemon::bootstrap::comp_query_payload(&format!("{root}/alpha/deeper"), None)[0]
+            .clone();
+    anyhow::ensure!(req_b64.len() > 24, "a request payload should not be this short");
+    anyhow::ensure!(
+        !text.contains(&req_b64[..24]),
+        "the base64 request was ECHOED into the scrollback"
+    );
+    // The user's own adjacent output is untouched by the erase.
+    anyhow::ensure!(
+        text.contains("TC_COMP_CD"),
+        "the erase ate real output that came after it"
+    );
+    // Not a BLOCK either: the sidebar, block history and the composer's
+    // Ctrl-R/ghost corpus are all built from these records.
+    let recs = c.await_blocks(id, 10, |_| true)?;
+    anyhow::ensure!(
+        !recs.iter().any(|r| r.cmd.contains("__tc_")),
+        "a completion query was recorded as a block: {:?}",
+        recs.iter().map(|r| r.cmd.as_str()).collect::<Vec<_>>()
+    );
+    // ...and not in the nested shell's interactive history. The bracket keeps
+    // THIS command's own entry from matching the pattern it greps for.
+    match ctl_run_retry(
+        &mut ctl,
+        &mut rid,
+        id,
+        "builtin history | grep -c '__tc_c[q]' || true",
+        Some(RunWait { timeout_ms: 30_000, tail_bytes: 4096 }),
+        60,
+    )? {
+        CtlBody::RunDone { output, .. } => anyhow::ensure!(
+            output.lines().any(|l| l.trim() == "0"),
+            "a completion query was left in bash history: {output:?}"
+        ),
+        other => anyhow::bail!("history check returned {other:?}"),
+    }
+
+    // Tear the scratch tree down, leave the nested world, and prove the
+    // outer shell is still healthy.
+    let _ = ctl_run_retry(
+        &mut ctl,
+        &mut rid,
+        id,
+        &format!("cd / && rm -rf {root} && echo TC_COMP_CLEAN"),
+        Some(RunWait { timeout_ms: 30_000, tail_bytes: 4096 }),
+        60,
+    )?;
+    c.send(&C2D::Input {
+        id,
+        bytes: b"exit\r".to_vec(),
+    })?;
+    let _ = c.snapshot_until(30, |s| {
+        s.terminals
+            .iter()
+            .any(|t| t.id == id && t.nested_chain.is_none())
+    })?;
+    // Back in the LOCAL pwsh shell: nothing about the remote lane leaked
+    // into it, and the outer hooks still work (the nested token retired with
+    // the shell that owned it — no stale-token rejection).
+    match ctl_run_retry(
+        &mut ctl,
+        &mut rid,
+        id,
+        "Write-Output TC_COMP_BACK",
+        Some(RunWait { timeout_ms: 30_000, tail_bytes: 4096 }),
+        60,
+    )? {
+        CtlBody::RunDone { exit, output, .. } => {
+            anyhow::ensure!(exit == Some(0), "outer exit {exit:?}");
+            anyhow::ensure!(output.contains("TC_COMP_BACK"), "outer output {output:?}");
+        }
+        other => anyhow::bail!("Run after exit returned {other:?}"),
+    }
+    anyhow::ensure!(
+        !log_since(log0).contains("wrong token rejected"),
+        "a hook token was rejected during completion traffic"
+    );
+    anyhow::ensure!(
+        !log_since(log0).contains("the completion query line stays visible"),
+        "the mirror declined the erase — the query lane stood itself down"
+    );
+    c.assert_alive()?;
+
+    ensure_no_new_panics(log0)?;
+    delete_terminal(&mut c, id);
+    Ok(())
+}
+
 /// typed-ssh-nested `pwsh_typed_nested_hooks` — the regression pin for the
 /// FIELD REPORT this branch exists for: in an ordinary hooked LOCAL
 /// PowerShell terminal the user typed `ssh 203.0.113.10`, the remote login
@@ -11767,6 +12157,7 @@ pub fn run(case: Option<&str>) -> anyhow::Result<()> {
         ("wsl_composer_semantics", case_wsl_composer_semantics),
         ("wsl_nested_shell", case_wsl_nested_shell),
         ("wsl_nested_hooks", case_wsl_nested_hooks),
+        ("nested_completion", case_nested_completion),
         ("pwsh_typed_nested_hooks", case_pwsh_typed_nested_hooks),
         ("wsl_hostile_prompt_command", case_wsl_hostile_prompt_command),
         ("wsl_restore", case_wsl_restore),

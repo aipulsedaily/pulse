@@ -20,7 +20,7 @@ pub const MAX_FRAME: u32 = 32 * 1024 * 1024;
 /// This build's protocol generation — the single source for `DaemonInfo::
 /// proto` and `C2D::Hello2::proto`. History lives at the `proto:` field in
 /// `daemon::run` (src\daemon\mod.rs).
-pub const PROTO: u32 = 13;
+pub const PROTO: u32 = 14;
 
 /// Client -> Daemon
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,6 +208,41 @@ pub enum C2D {
     /// APPENDED at the enum's end (the C2D tail; proto 12 → 13): bincode
     /// encodes variants positionally.
     RetryReconnect { id: Uuid },
+
+    /// remote-completion (proto 14): "what is in this directory, as the
+    /// shell standing in it sees it?" — the composer's Tab completer asking
+    /// for a listing it cannot possibly take itself, because the directory
+    /// is on another machine (a typed `ssh host`, a `sudo su` inside it, an
+    /// ssh-program terminal).
+    ///
+    /// `dir` is a POSIX path, absolute or relative to the shell's own
+    /// `$PWD`, and `~` is allowed: the SHELL resolves all three, so the GUI
+    /// never guesses a remote home. The daemon answers from its prefetch
+    /// cache when it can (`D2C::Completion`, same frame as the request for
+    /// the common `cd`-then-Tab case) and otherwise asks the shell on the
+    /// hook channel. Strictly a side channel: it never queues, delays or
+    /// alters a submission, and a missing answer degrades to no candidates.
+    ///
+    /// The GUI gates the send on the daemon generation (an older daemon
+    /// drops the connection on an undecodable C2D variant — the
+    /// color-tag/sleep skew pattern).
+    ///
+    /// APPENDED at the enum's end (the C2D tail; proto 13 → 14): bincode
+    /// encodes variants positionally.
+    RequestCompletion { id: Uuid, dir: String },
+}
+
+/// remote-completion: one directory entry as the remote shell reported it.
+/// `dir` comes from `ls -p`'s trailing slash with symlinks resolved (`-L`),
+/// which is what keeps the GUI's dirs-first ordering and trailing-separator
+/// behaviour identical to the local `read_dir` path.
+///
+/// Lives here rather than in `daemon::completion` because `protocol.rs`
+/// compiles into pulse-ctl, which has no daemon module.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompEntry {
+    pub name: String,
+    pub dir: bool,
 }
 
 /// One session's dimensions as written by `C2D::DebugDump`. The three pairs
@@ -319,6 +354,29 @@ pub enum D2C {
     ///
     /// APPENDED at the enum's end: bincode encodes variants positionally.
     ReplayAnchors { id: Uuid, items: Vec<AnchorHint> },
+    /// remote-completion (proto 14): the reply to `C2D::RequestCompletion` —
+    /// sent to the REQUESTER only, never broadcast (like `D2C::BlockText`),
+    /// so it can never reach a client too old to decode it.
+    ///
+    /// `asked` echoes the request verbatim: that string is the GUI's cache
+    /// key and the token it matches a late answer against, and it is the only
+    /// way to pair a reply with a request for `~` or a relative path. `dir` is
+    /// what the shell actually resolved and listed. `found: false` is the
+    /// honest "there is nothing for you" — unknown directory, gate declined,
+    /// query timed out — and the GUI degrades to no candidates, exactly as it
+    /// behaved before this lane existed. `trunc` means the directory blew the
+    /// payload cap and `entries` is deliberately empty: a cycle (or a common
+    /// prefix) over a subset would over-complete.
+    ///
+    /// APPENDED at the enum's end: bincode encodes variants positionally.
+    Completion {
+        id: Uuid,
+        asked: String,
+        dir: String,
+        found: bool,
+        trunc: bool,
+        entries: Vec<CompEntry>,
+    },
 }
 
 /// `AnchorHint.kind`: the row is a recorded block's prompt+command row; join

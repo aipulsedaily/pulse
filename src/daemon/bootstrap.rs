@@ -294,7 +294,168 @@ fi
 /// nested-shell injection (`nested_injection`) — one body, zero drift
 /// between the shell Pulse spawned and a shell it witnessed being spawned
 /// inside it.
-const BASH_HOOKS: &str = r#"__TC_TOK='{TOKEN}'; __TC_N=0; __tc_at_prompt=0
+/// remote-completion: the directory LISTER, spliced verbatim into BOTH hook
+/// bodies (one body, zero drift — the same discipline `BASH_HOOKS` itself
+/// follows across the login rcfile and the nested injection).
+///
+/// It answers ONE question — "what is in this directory?" — as a single
+/// `comp` payload on the hook channel the daemon already reads, which is the
+/// only honest way to enumerate a directory that lives on another machine:
+/// ask the shell that is sitting on it. A local `read_dir` cannot see a
+/// remote host's filesystem at all, and that is exactly why Tab did nothing
+/// inside a typed `ssh host` (`gui::complete::plan_win` needs a
+/// drive-lettered cwd; the tracked cwd there is a POSIX path on the far side
+/// of the link).
+///
+/// Every piece is load-bearing:
+///   - `~`/relative requests are resolved BY THE SHELL, against its own
+///     `$PWD` and `$HOME`. The GUI never guesses a remote home (the v1
+///     `plan_wsl` `~` no-op existed for exactly that reason);
+///   - `ls -A` includes dotfiles (the GUI applies the posix hidden rule
+///     itself, so the shell must not pre-filter), `-p` marks DIRECTORIES
+///     with a trailing `/` (the dirs-first ordering and the completed
+///     trailing separator both need the split) and `-L` resolves symlinks so
+///     a link to a directory is marked like the local completer's
+///     follow-the-link `file_type` branch;
+///   - `head -c` is the ONLY bound: it caps the payload by BYTES, which caps
+///     the OSC body (`blocks::BODY_CAP`) and detects truncation exactly
+///     (over cap ⇒ the listing is dropped and `t:1` is reported, so the GUI
+///     degrades to no-candidates instead of computing a common prefix over a
+///     subset — the over-completion hazard `MATCH_BOUND` guards locally).
+///     `ls` still reads and sorts a 50k-entry directory before `head` can
+///     close the pipe: that is ~100ms ONCE, bounded, and never a wedge;
+///   - `command -p` on both utilities, like every other utility these hooks
+///     use, so a clobbered `$PATH` can neither break nor spoof the answer;
+///   - stderr is discarded on both legs: an unreadable directory and a
+///     `head` without `-c` both yield an empty listing — no candidates, no
+///     noise, exactly today's behavior.
+const COMP_FN: &str = r#"__tc_comp() {
+  local d l
+  d=$1
+  [ -n "$d" ] || d=$PWD
+  case $d in
+    /*) ;;
+    '~') d=$HOME ;;
+    '~/'*) d=$HOME/${d#'~/'} ;;
+    *) d=${PWD%/}/$d ;;
+  esac
+  l=$(command -p ls -A -p -L -- "$d" 2>/dev/null | command -p head -c {CBYTES} 2>/dev/null)
+  if [ ${#l} -ge {CBYTES} ]; then
+    __tc_emit comp "{\"d\":\"$(__tc_json_str "$d")\",\"t\":1,\"l\":\"\"}"
+  else
+    __tc_emit comp "{\"d\":\"$(__tc_json_str "$d")\",\"t\":0,\"l\":\"$(__tc_json_str "$l")\"}"
+  fi
+}
+"#;
+
+/// remote-completion: the prompt-hook PREFETCH, spliced into both `__tc_pre`
+/// bodies right after the cwd report.
+///
+/// It fires only when `$PWD` CHANGED since the last emission, which is the
+/// whole cost argument: a `cd` pays one `ls` and one payload, and every other
+/// prompt pays one string compare. Prefetching on EVERY prompt was rejected —
+/// it would add a filesystem operation to the user's prompt forever (a dead
+/// NFS mount would then hang every prompt, and a 50k-entry cwd would add
+/// ~100ms to each one) to buy freshness the on-demand lane already provides.
+/// Prefetching the cwd specifically is what makes the FIRST `cd <Tab>` in a
+/// remote shell instant — the field-reported gesture — with no typing into
+/// the user's shell at all: no echo, no erase, no history entry, nothing to
+/// gate, because nothing is injected.
+const COMP_PREFETCH: &str = r#"  if [ "$PWD" != "$__TC_CD" ]; then __TC_CD=$PWD; __tc_comp ""; fi
+"#;
+
+/// remote-completion: the on-demand QUERY reader — bash only (see
+/// `comp_query_supported`).
+///
+/// The daemon types ` __tc_cq` (eight bytes, one row at any width) and then
+/// writes two INVISIBLE payload lines: the base64 request path and the
+/// base64 erase blob. The shape is `NESTED_READER`'s, proven in the field,
+/// for the same reason: a tty echoes bytes when they ARRIVE, so the only line
+/// that can ever be seen is the one that turns echo off, and the daemon aims
+/// a mirror-verified erase at exactly that line.
+///
+/// What is NEW here, and what makes a per-Tab query acceptable where a
+/// per-Tab hook injection would not be:
+///   - `$?` is captured FIRST and returned LAST, so the prompt the shell
+///     repaints shows the status of the USER's last command, not ours — a
+///     `$?`-colored prompt must not turn green because someone pressed Tab.
+///     The variable is `__tc_`-prefixed and assigned WITHOUT `local` on
+///     purpose: `__tc_debug`'s name guard matches on `$BASH_COMMAND`, and
+///     `local __tc_rc=$?` would read as `local …` and slip the guard while the
+///     exec latch is still armed;
+///   - `__tc_at_prompt=0` comes next, before anything else. The shell is already
+///     hooked, so without it the DEBUG trap would open a block for our own
+///     plumbing and the query would land in the sidebar, the block history
+///     and the Ctrl-R corpus. The assignment itself is `__tc_`-prefixed, so
+///     `__tc_debug`'s existing name guard filters it and it consumes nothing;
+///     every command after it is suppressed by the disarmed latch;
+///   - the history scrub is the `BASH_HIST_SCRUB` gate, re-stated for this
+///     line: `history -d` runs ONLY when the last entry is actually ours
+///     (`__tc_cq` appears nowhere else), so under the stock
+///     `HISTCONTROL=ignoreboth` — where the leading space already kept the
+///     line out of history — it can never delete the user's own command;
+///   - the erase is evaluated BEFORE the answer is emitted and before the
+///     function returns, so the shell repaints its prompt over a clean seam;
+///   - an empty erase blob (the mirror declined) evals to nothing and the
+///     line honestly stays visible — the daemon then stands the lane down
+///     for that terminal rather than ever risk a second artifact.
+const COMP_QUERY_FN: &str = r#"__tc_cq() {
+  __tc_rc=$?
+  __tc_at_prompt=0
+  local q e h n
+  stty -echo 2>/dev/null
+  IFS= read -r q
+  IFS= read -r e
+  stty echo 2>/dev/null
+  h=$(HISTTIMEFORMAT= builtin history 1 2>/dev/null)
+  case $h in *__tc_cq*) h=${h#"${h%%[! ]*}"}; n=${h%%[!0-9]*}; [ -n "$n" ] && builtin history -d "$n" 2>/dev/null ;; esac
+  eval "$(printf %s "$e" | command -p base64 -d 2>/dev/null)"
+  __tc_comp "$(printf %s "$q" | command -p base64 -d 2>/dev/null)"
+  return $__tc_rc
+}
+"#;
+
+/// Hard byte cap on ONE `comp` listing, as the shell measures it.
+///
+/// It bounds the whole channel: hex-encoding doubles it, and
+/// `7717;<16-hex token>;comp;<hex>` plus the `{"d":…,"t":…,"l":"…"}` envelope
+/// must still fit `blocks::BODY_CAP` (16 KiB) or the scanner would drop the
+/// body — pinned by `comp_payload_fits_the_osc_body_cap`. 6000 bytes of
+/// `ls -p` output is ~400 names at a realistic average length, well past the
+/// point where an inline cycle is useful.
+pub const COMP_MAX_BYTES: usize = 6000;
+
+/// remote-completion: the typed trigger line. Eight bytes — it cannot wrap at
+/// any terminal width, so its echo is always exactly one row and the
+/// mirror's erase gate has the easiest possible match to make.
+pub const COMP_READER: &str = " __tc_cq";
+
+/// The two INVISIBLE payload lines `__tc_cq` reads, in order: base64 of the
+/// requested directory (resolved by the shell against its own `$PWD`/`$HOME`)
+/// and base64 of the erase blob (`nested_erase_payload` — empty when the
+/// mirror declined, which evals to nothing).
+pub fn comp_query_payload(dir: &str, erase_row: Option<usize>) -> [String; 2] {
+    [
+        base64_encode(dir.as_bytes()),
+        nested_erase_payload(erase_row),
+    ]
+}
+
+/// Which shells the on-demand query lane may be armed for: bash ONLY, and
+/// only on the shell's OWN `init` report of what it is — never a guess.
+///
+/// zsh is deliberately excluded. Everything the lane needs exists there
+/// (`__tc_comp` is in `ZSH_HOOKS` too, so zsh prefetches exactly like bash),
+/// except a way to keep the typed line out of history: zsh ships
+/// `histignorespace` OFF, it has no `history -d`, and turning the option on
+/// would silently change how the USER's own space-prefixed commands are
+/// recorded — shell tampering by any honest reading. So a zsh shell gets the
+/// prefetch lane and nothing is typed into it, ever.
+pub fn comp_query_supported(shell: &str) -> bool {
+    shell == "bash"
+}
+
+const BASH_HOOKS: &str = r#"__TC_TOK='{TOKEN}'; __TC_N=0; __tc_at_prompt=0; __TC_CD=
 __tc_emit() {
   local hex; hex=$(printf %s "$2" | command -p od -v -An -tx1 | command -p tr -d ' \n')
   printf '\033]7717;%s;%s;%s\007' "$__TC_TOK" "$1" "$hex"
@@ -317,8 +478,9 @@ __tc_pre() {
   __TC_N=$((__TC_N+1))
   __tc_emit pre "{\"e\":$e,\"n\":$__TC_N,\"d\":\"$(__tc_json_str "$PWD")\"}"
   printf '\033]9;9;%s\007' "$PWD"
-  __tc_wrap_ps1
+{COMP_PREFETCH}  __tc_wrap_ps1
 }
+{COMP_FN}{COMP_QUERY_FN}
 __tc_histn() {
   local h; h=$(HISTTIMEFORMAT= builtin history 1 2>/dev/null)
   h=${h#"${h%%[! ]*}"}
@@ -354,10 +516,32 @@ trap '__tc_debug' DEBUG
 __tc_emit init "{\"v\":1,\"pid\":$$,\"shell\":\"bash\",\"home\":\"$(__tc_json_str "$HOME")\",\"user\":\"$(__tc_json_str "$USER")\"}"
 "#;
 
+/// Resolve the remote-completion placeholders in a hook body. `query` adds
+/// the on-demand reader (`COMP_QUERY_FN`) — bash only; zsh gets the lister
+/// and the prefetch and is never typed into (`comp_query_supported`).
+fn splice_comp(body: &str, query: bool) -> String {
+    body.replace("{COMP_PREFETCH}", COMP_PREFETCH)
+        .replace("{COMP_FN}", &COMP_FN.replace("{CBYTES}", &COMP_MAX_BYTES.to_string()))
+        .replace("{COMP_QUERY_FN}", if query { COMP_QUERY_FN } else { "" })
+}
+
+/// The bash hook body as SHIPPED — `BASH_HOOKS` with the remote-completion
+/// pieces spliced in. `{TOKEN}` is deliberately left for the caller (the
+/// login rcfile and the nested injection each substitute their own).
+fn bash_hooks_body() -> String {
+    splice_comp(BASH_HOOKS, true)
+}
+
+/// The zsh hook body as SHIPPED (nested injection only — Pulse's own spawns
+/// exec bash).
+fn zsh_hooks_body() -> String {
+    splice_comp(ZSH_HOOKS, false)
+}
+
 /// The login rcfile template, composed from the prelude + the shared hook
 /// body. Byte-identical to the pre-split constant (goldens pin it).
 fn bash_template() -> String {
-    format!("{BASH_PRELUDE}{BASH_HOOKS}{{RESTORE_TRAILING}}")
+    format!("{BASH_PRELUDE}{}{{RESTORE_TRAILING}}", bash_hooks_body())
 }
 
 
@@ -681,7 +865,7 @@ pub fn ssh_remote_command(rc: &[u8]) -> String {
 ///     arithmetic stays correct.
 ///
 /// Only ever delivered by the nested injection: Pulse's own spawns exec bash.
-const ZSH_HOOKS: &str = r#"__TC_TOK='{TOKEN}'; __TC_N=0
+const ZSH_HOOKS: &str = r#"__TC_TOK='{TOKEN}'; __TC_N=0; __TC_CD=
 __tc_emit() {
   local hex; hex=$(printf %s "$2" | command -p od -v -An -tx1 | command -p tr -d ' \n')
   printf '\033]7717;%s;%s;%s\007' "$__TC_TOK" "$1" "$hex"
@@ -697,9 +881,10 @@ __tc_pre() {
   __TC_N=$((__TC_N+1))
   __tc_emit pre "{\"e\":$e,\"n\":$__TC_N,\"d\":\"$(__tc_json_str "$PWD")\"}"
   printf '\033]9;9;%s\007' "$PWD"
-  [[ $PROMPT == *$'\033]133;A'* ]] || PROMPT=$'%{\033]133;A\a%}'"$PROMPT"$'%{\033]133;B\a%}'
+{COMP_PREFETCH}  [[ $PROMPT == *$'\033]133;A'* ]] || PROMPT=$'%{\033]133;A\a%}'"$PROMPT"$'%{\033]133;B\a%}'
 }
-__tc_preexec() {
+{COMP_FN}__tc_preexec() {
+  case ${1## } in __tc_*) return ;; esac
   local c=${1:0:2000}
   __tc_emit exec "{\"c\":\"$(__tc_json_str "$c")\"}"
 }
@@ -760,7 +945,17 @@ pub const NESTED_LINE_MAX: usize = 3500;
 ///
 /// Pure POSIX: it has to parse in whatever shell the nested world turned out
 /// to be, before that shell has told us what it is.
-const NESTED_READER: &str = " stty -echo 2>/dev/null;IFS= read -r __pulse_b;IFS= read -r __pulse_z;IFS= read -r __pulse_e;stty echo 2>/dev/null;__pulse_h=;[ -n \"$BASH_VERSION\" ]&&__pulse_h=$__pulse_b;[ -n \"$ZSH_VERSION\" ]&&__pulse_h=$__pulse_z;eval \"$(printf %s \"$__pulse_e\"|base64 -d 2>/dev/null)\";eval \"$(printf %s \"$__pulse_h\"|base64 -d 2>/dev/null)\";unset __pulse_b __pulse_z __pulse_e __pulse_h";
+///   - the BASH body arrives in TWO lines (`__pulse_b` + `__pulse_c`),
+///     rejoined before decoding. base64 is ASCII and splitting the ENCODED
+///     text anywhere rejoins byte-exact, so this is pure framing — and it is
+///     load-bearing: `NESTED_LINE_MAX` is a hard tty limit, the bash body is
+///     the one that grows (remote-completion's lister and query reader pushed
+///     it past the cap as a single line), and a payload line that the line
+///     discipline silently truncates would eval to garbage. The arity is
+///     FIXED at four lines in every branch — an empty continuation is still a
+///     line `read` consumes — so an unknown shell can never fall out of step
+///     and start executing base64 as commands.
+const NESTED_READER: &str = " stty -echo 2>/dev/null;IFS= read -r __pulse_b;IFS= read -r __pulse_c;IFS= read -r __pulse_z;IFS= read -r __pulse_e;stty echo 2>/dev/null;__pulse_h=;[ -n \"$BASH_VERSION\" ]&&__pulse_h=$__pulse_b$__pulse_c;[ -n \"$ZSH_VERSION\" ]&&__pulse_h=$__pulse_z;eval \"$(printf %s \"$__pulse_e\"|base64 -d 2>/dev/null)\";eval \"$(printf %s \"$__pulse_h\"|base64 -d 2>/dev/null)\";unset __pulse_b __pulse_c __pulse_z __pulse_e __pulse_h";
 
 /// The erase payload: an absolute cursor move to the row the echoed reader
 /// line STARTS on, then erase-to-end-of-display. The shell's next prompt then
@@ -809,8 +1004,12 @@ pub struct NestedInjection {
 /// for THIS nested shell (its own, alongside the outer shell's; see
 /// `blocks::BlockStore::push_nested_token`).
 pub fn nested_injection(token: &str) -> NestedInjection {
-    let bash = format!("{}{}", BASH_HOOKS.replace("{TOKEN}", token), BASH_HIST_SCRUB);
-    let zsh = ZSH_HOOKS.replace("{TOKEN}", token);
+    let bash = format!(
+        "{}{}",
+        bash_hooks_body().replace("{TOKEN}", token),
+        BASH_HIST_SCRUB
+    );
+    let zsh = zsh_hooks_body().replace("{TOKEN}", token);
     NestedInjection {
         reader: NESTED_READER.to_string(),
         bash_b64: base64_encode(bash.as_bytes()),
@@ -820,9 +1019,16 @@ pub fn nested_injection(token: &str) -> NestedInjection {
 }
 
 impl NestedInjection {
-    /// The three payload lines, in the order `NESTED_READER` reads them.
-    pub fn payload_lines(&self) -> [&str; 3] {
-        [&self.bash_b64, &self.zsh_b64, &self.erase_b64]
+    /// The four payload lines, in the order `NESTED_READER` reads them: the
+    /// bash body split in half, the zsh body, the erase blob.
+    ///
+    /// The split point is arbitrary BY DESIGN — base64 is ASCII, so any byte
+    /// index is a char boundary and the reader's `$__pulse_b$__pulse_c`
+    /// rejoins the two halves byte-exact. Halving keeps both lines far under
+    /// `NESTED_LINE_MAX` with room for the hook body to keep growing.
+    pub fn payload_lines(&self) -> [&str; 4] {
+        let (a, b) = self.bash_b64.split_at(self.bash_b64.len() / 2);
+        [a, b, &self.zsh_b64, &self.erase_b64]
     }
     /// Every line fits the canonical-mode limit.
     pub fn within_line_limit(&self) -> bool {
@@ -961,6 +1167,110 @@ mod tests {
         }
     }
 
+    /// remote-completion — the shell-side contract: the lister is in BOTH
+    /// hook bodies and in BOTH deliveries, it is bounded, and the query lane
+    /// is quiet, bash-only, and invisible to every record Pulse keeps.
+    #[test]
+    fn comp_snippet_goldens() {
+        let bash = bash_hooks_body();
+        let zsh = zsh_hooks_body();
+        let rc = bash_template();
+
+        // ONE lister, in every POSIX body and in both deliveries — the login
+        // rcfile (the shell Pulse spawned) and the nested injection (a shell
+        // it watched being opened). A second copy would drift.
+        for (name, body) in [("bash", &bash), ("zsh", &zsh), ("rcfile", &rc)] {
+            assert!(body.contains("__tc_comp() {"), "{name}: no lister");
+            assert!(
+                body.contains("command -p ls -A -p -L --"),
+                "{name}: the listing must include dotfiles (-A), mark dirs (-p) \
+                 and resolve symlinks (-L), via command -p"
+            );
+            assert!(
+                body.contains(&format!("head -c {}", COMP_MAX_BYTES)),
+                "{name}: the payload byte cap is the only bound on the channel"
+            );
+            assert!(body.contains("__tc_emit comp "), "{name}: no comp verb");
+            // The SHELL resolves `~` and relative requests: the GUI must
+            // never guess a remote $HOME.
+            assert!(body.contains("d=$HOME"), "{name}: ~ must resolve shell-side");
+            assert!(body.contains("d=${PWD%/}/$d"), "{name}: relative must anchor at $PWD");
+            // Prefetch: on a cwd CHANGE only — never a filesystem operation
+            // at every prompt (a dead mount would then hang every prompt).
+            assert!(
+                body.contains(r#"if [ "$PWD" != "$__TC_CD" ]; then __TC_CD=$PWD; __tc_comp ""; fi"#),
+                "{name}: the prefetch must be cwd-change gated"
+            );
+            assert!(body.contains("__TC_CD="), "{name}: the prefetch latch is uninitialized");
+            // Exactly one `ls` per emission, and exactly one emission per
+            // call: the listing is never built by a per-entry fork.
+            assert_eq!(body.matches("command -p ls").count(), 1, "{name}: one ls");
+            assert_eq!(body.matches("__tc_emit comp ").count(), 2, "{name}: trunc + full");
+            // The lister is invoked from the prefetch, plus the query reader
+            // where one exists (bash) — nowhere else.
+            let want = if name == "zsh" { 1 } else { 2 };
+            assert_eq!(
+                body.matches("__tc_comp ").count(),
+                want,
+                "{name}: unexpected lister call sites"
+            );
+        }
+
+        // The QUERY lane is bash-only: zsh ships `histignorespace` off and
+        // has no `history -d`, and turning the option on would change how the
+        // USER's own commands are recorded.
+        assert!(bash.contains("__tc_cq() {"), "bash has no query reader");
+        assert!(!zsh.contains("__tc_cq"), "zsh must never be typed into");
+        assert!(comp_query_supported("bash") && !comp_query_supported("zsh"));
+
+        // QUIET, by the same three mechanisms `nesthook` uses.
+        assert!(COMP_READER.starts_with(' '), "leading space (ignorespace) missing");
+        assert!(COMP_READER.len() <= 16, "the trigger must not be able to wrap");
+        assert!(COMP_READER.trim() == "__tc_cq");
+        assert!(bash.contains("stty -echo"), "the request would be echoed");
+        assert!(bash.contains("builtin history -d"), "history scrub missing");
+        assert!(
+            bash.contains("case $h in *__tc_cq*)"),
+            "the scrub must only ever delete OUR line"
+        );
+        // ...and the latch is disarmed FIRST, or the DEBUG trap would open a
+        // block for Pulse's own plumbing: the query would land in the
+        // sidebar, the block history and the Ctrl-R corpus.
+        let body_at = bash.find("__tc_cq() {").unwrap();
+        let rc = bash[body_at..].find("__tc_rc=$?").unwrap();
+        let disarm = bash[body_at..].find("__tc_at_prompt=0").unwrap();
+        let stty = bash[body_at..].find("stty -echo").unwrap();
+        assert!(rc < disarm, "`$?` must be captured before anything clobbers it");
+        assert!(disarm < stty, "the exec latch must be disarmed before anything else");
+        // ...and handed back, so a `$?`-colored prompt does not turn green
+        // because someone pressed Tab. Both names are `__tc_`-prefixed so
+        // `__tc_debug`'s guard filters them while the latch is still armed.
+        assert!(bash[body_at..].contains("return $__tc_rc"));
+        for stmt in ["local __tc_rc", "rc=$?"] {
+            assert!(
+                !bash[body_at..].contains(&format!("local {stmt}")),
+                "a `local` assignment would slip the exec-latch name guard"
+            );
+        }
+        // zsh's preexec filters our plumbing by name for the same reason.
+        assert!(zsh.contains("case ${1## } in __tc_*) return ;; esac"));
+
+        // The request + erase ride the invisible payload lines, and the erase
+        // is the SAME mirror-gated blob nesthook composes (empty row ⇒ empty
+        // blob ⇒ eval nothing ⇒ the line honestly stays visible).
+        let [req, erase] = comp_query_payload("/root/src", Some(7));
+        assert_eq!(String::from_utf8(b64_decode(&req)).unwrap(), "/root/src");
+        assert_eq!(
+            String::from_utf8(b64_decode(&erase)).unwrap(),
+            "printf '\\033[7;1H\\033[J'"
+        );
+        assert!(comp_query_payload("/root", None)[1].is_empty());
+        for l in comp_query_payload(&"/x".repeat(512), Some(1)) {
+            assert!(l.len() <= NESTED_LINE_MAX, "a payload line blew the tty cap");
+            assert!(!l.contains('\n') && !l.contains('\r'), "a typed line must be ONE line");
+        }
+    }
+
     /// nested-shell-hooks — the injection payload contract. Everything a
     /// nested shell needs is in the SAME hook body the login rcfile uses
     /// (one body, zero drift), the family switch is decided by the shell
@@ -975,7 +1285,7 @@ mod tests {
         // anything past N_TTY_BUF_SIZE (4096). Everything stays under
         // NESTED_LINE_MAX with room to spare.
         assert!(inj.within_line_limit(), "a line exceeded the canonical-mode cap");
-        for l in [inj.reader.as_str(), &inj.bash_b64, &inj.zsh_b64] {
+        for l in [inj.reader.as_str()].into_iter().chain(inj.payload_lines()) {
             assert!(l.len() <= NESTED_LINE_MAX, "line too long: {}", l.len());
             assert!(!l.contains('\n') && !l.contains('\r'), "a typed line must be ONE line");
         }
@@ -984,7 +1294,20 @@ mod tests {
         // an empty one still occupies its payload line so the reader's third
         // `read` always has something to consume.
         assert!(inj.erase_b64.is_empty(), "the erase must be composed at send time");
-        assert_eq!(inj.payload_lines().len(), 3);
+        assert_eq!(inj.payload_lines().len(), 4);
+        // The bash body is FRAMED across two lines and rejoins byte-exact —
+        // the reader concatenates before decoding, so the split point is
+        // arbitrary and the ARITY is what has to be fixed (an unknown shell
+        // that fell out of step would start executing base64 as commands).
+        let lines = inj.payload_lines();
+        assert_eq!(format!("{}{}", lines[0], lines[1]), inj.bash_b64);
+        assert!(inj.reader.contains(r#"__pulse_h=$__pulse_b$__pulse_c"#));
+        assert!(inj.reader.contains("$BASH_VERSION") && inj.reader.contains("$ZSH_VERSION"));
+        assert_eq!(
+            inj.reader.matches("read -r").count(),
+            inj.payload_lines().len(),
+            "every payload line must be consumed in every shell branch"
+        );
         let with_erase = NestedInjection {
             erase_b64: nested_erase_payload(Some(12)),
             ..inj.clone()
@@ -1011,17 +1334,16 @@ mod tests {
         assert!(off < on && on < evl, "echo must be restored BEFORE the eval runs");
 
         // Family switch: decided by the shell, never guessed daemon-side, and
-        // ALL THREE payload lines are consumed on every path (an unknown shell
-        // can never execute base64 as a command).
-        assert!(inj.reader.contains("$BASH_VERSION") && inj.reader.contains("$ZSH_VERSION"));
-        assert_eq!(inj.reader.matches("read -r").count(), 3, "every payload line must be read");
+        // EVERY payload line is consumed on every path (an unknown shell can
+        // never execute base64 as a command) — asserted against the arity
+        // above, so adding a line can never silently desynchronize them.
         // The erase is evaluated FIRST and by EVERY family — a shell we
         // cannot hook still gets its screen cleaned up.
         let erase_at = inj.reader.find("$__pulse_e\"|base64").unwrap();
         let body_at = inj.reader.find("$__pulse_h\"|base64").unwrap();
         assert!(erase_at < body_at, "the erase must run before the hook body");
         assert!(
-            !inj.reader[..erase_at].contains("BASH_VERSION\" ]&&__pulse_h=$__pulse_b;[ -n \"$ZSH_VERSION\" ]&&__pulse_h=$__pulse_z;eval \"$(printf %s \"$__pulse_h"),
+            !inj.reader[..erase_at].contains("$__pulse_h\"|base64"),
             "the erase eval must not sit behind the family switch"
         );
         // ...and the reader line itself is POSIX: no [[ ]], no (( )), no
@@ -1048,8 +1370,8 @@ mod tests {
         // The bash body is the SHIPPED hook body verbatim (no second copy to
         // drift), plus the history scrub.
         assert!(
-            bash.starts_with(&BASH_HOOKS.replace("{TOKEN}", "cafebabe12345678")),
-            "the injected bash body must be BASH_HOOKS verbatim"
+            bash.starts_with(&bash_hooks_body().replace("{TOKEN}", "cafebabe12345678")),
+            "the injected bash body must be the SHIPPED bash hook body verbatim"
         );
         assert!(bash.contains("builtin history -d"), "history scrub missing");
         assert!(

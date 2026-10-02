@@ -25,6 +25,9 @@ use egui::{
 use uuid::Uuid;
 
 use super::complete;
+/// remote-completion: the listing-cache trait `show` takes, re-exported so a
+/// call site needs only this module.
+pub use super::complete::RemoteDirs;
 use super::term_backend::{HookCounters, Reclaim, TermBackend};
 use crate::state::BlockRec;
 
@@ -794,6 +797,18 @@ pub struct HistSearch {
     saved: String,
 }
 
+/// remote-completion: the Tab press a remote listing is owed to.
+#[derive(Debug, Clone)]
+struct TabWait {
+    /// The draft the Tab was pressed on, byte-exact. Anything else means the
+    /// user moved on and the answer is no longer wanted.
+    draft: String,
+    caret_byte: usize,
+    /// Direction and count, so a late answer completes the way the press
+    /// asked (Shift+Tab still lands on the LAST candidate).
+    delta: i64,
+}
+
 pub struct ComposerState {
     pub mode: ComposerMode,
     pub draft: String,
@@ -813,6 +828,14 @@ pub struct ComposerState {
     /// (typing, recall, submit, reclaim, insert) commits the shown candidate
     /// by invalidating the cycle lazily at the next Tab/Esc.
     tab: Option<complete::TabCycle>,
+    /// remote-completion: a Tab whose directory lives on another machine and
+    /// had no listing yet. Retried by `tab_retry` while the draft is still
+    /// byte-identical to what it was pressed on; dropped the instant anything
+    /// else happens. Never persisted, never a lock, never in the submit path.
+    tab_wait: Option<TabWait>,
+    /// remote-completion: the directory `tab_press`/`tab_retry` wants listed,
+    /// drained by the app into `C2D::RequestCompletion`.
+    comp_request: Option<String>,
     /// SLEEP §7.3: the terminal's persisted asleep flag, stamped by the app
     /// from every Snapshot (and at composer creation). Drives the gate's
     /// Blocked(Asleep), on_exited's reason pick, and the `☾ asleep` +
@@ -990,6 +1013,8 @@ impl Default for ComposerState {
             cli_session: false,
             is_cmd: false,
             fam: complete::Family::Pwsh,
+            tab_wait: None,
+            comp_request: None,
             tab: None,
             asleep: false,
             is_ssh: false,
@@ -2636,22 +2661,45 @@ impl ComposerState {
         self.tab.as_ref().is_some_and(|c| c.matches(&self.draft))
     }
 
+    /// The completion family for the world the terminal is IN right now —
+    /// not the one it was spawned in (remote-completion;
+    /// `complete::effective_family`). A typed `ssh host` keeps a Pwsh
+    /// `ShellFamily` forever while a POSIX shell sits in front of the user,
+    /// and the tracked cwd is the witness that says so.
+    fn tab_fam(&self, cwd: Option<&str>) -> complete::Family {
+        complete::effective_family(&self.fam, cwd)
+    }
+
     /// One frame's Tab traffic: `delta` = net presses (+forward/−reverse,
     /// several per frame under key repeat). Returns the caret (in CHARS) to
     /// place after the completed token when the draft changed; None = the
-    /// consumed Tab did nothing (empty draft, ssh, no candidates — NEVER a
-    /// literal tab either way). `cwd` = the terminal's tracked cwd
-    /// (live_cwd else meta.cwd — posix verbatim for WSL); `caret_byte` =
-    /// the editor caret as a byte offset into the draft.
-    pub fn tab_press(&mut self, cwd: Option<&str>, caret_byte: usize, delta: i64) -> Option<usize> {
+    /// consumed Tab did nothing (empty draft, no candidates, a remote
+    /// directory not yet listed — NEVER a literal tab in any of them).
+    /// `cwd` = the terminal's tracked cwd (live_cwd else meta.cwd — posix
+    /// verbatim for WSL and for any remote world); `caret_byte` = the editor
+    /// caret as a byte offset into the draft; `remote` = the app's cache of
+    /// listings the hooked remote shell has reported.
+    ///
+    /// A remote cache MISS parks the request in `comp_request` (the app ships
+    /// it to the daemon) and returns None. Nothing waits on it: the next
+    /// frames call `tab_retry`, and if the answer lands while the draft is
+    /// still byte-identical the completion applies then. Any keystroke in
+    /// between simply makes the draft differ, which abandons it — the user
+    /// always wins.
+    pub fn tab_press(
+        &mut self,
+        cwd: Option<&str>,
+        caret_byte: usize,
+        delta: i64,
+        remote: Option<&dyn complete::RemoteDirs>,
+    ) -> Option<usize> {
         if self.search.is_some() {
             // Ctrl-R overlay open: the Tab cycle is dead (Tier-2b
             // suppression interplay — the draft is the QUERY right now;
             // path-completing it would corrupt the stash contract).
             return None;
         }
-        if delta == 0 || matches!(self.fam, complete::Family::Ssh) {
-            // ssh: no local view of the remote fs — silent no-op (spec).
+        if delta == 0 {
             return None;
         }
         if self.draft.trim().is_empty() {
@@ -2666,14 +2714,16 @@ impl ComposerState {
             }
             self.tab = None; // edited since — that committed the candidate
         }
+        self.tab_wait = None;
         let home = std::env::var("USERPROFILE").ok();
         match complete::start(
-            &self.fam,
+            &self.tab_fam(cwd),
             cwd,
             home.as_deref(),
             &self.draft,
             caret_byte,
             complete::ENUM_CAP,
+            remote,
         ) {
             complete::Start::Cycle(mut cyc) => {
                 let (draft, caret) = cyc.step(delta);
@@ -2690,8 +2740,80 @@ impl ComposerState {
                 self.recall = None;
                 Some(caret)
             }
+            complete::Start::Request(dir) => {
+                self.comp_request = Some(dir);
+                self.tab_wait = Some(TabWait {
+                    draft: self.draft.clone(),
+                    caret_byte,
+                    delta,
+                });
+                None
+            }
             complete::Start::None => None,
         }
+    }
+
+    /// remote-completion: a Tab that could not be answered yet, retried once
+    /// its listing has landed. Called every frame before the Tab keys are
+    /// read, and it fires AT MOST once per request: a differing draft (the
+    /// user typed, submitted, recalled) drops the wait, and so does an answer
+    /// that still yields nothing. Returns the caret exactly like `tab_press`.
+    ///
+    /// The one behaviour this adds over the old no-op is a completion that
+    /// appears a frame or two after the Tab instead of on it. That is the
+    /// honest cost of a directory on another machine, and it never touches
+    /// the submit path: `comp_request` is a side channel, and a pending wait
+    /// holds no lock, no byte and no key.
+    pub(crate) fn tab_retry(
+        &mut self,
+        cwd: Option<&str>,
+        remote: Option<&dyn complete::RemoteDirs>,
+    ) -> Option<usize> {
+        let w = self.tab_wait.as_ref()?;
+        if w.draft != self.draft || self.search.is_some() {
+            self.tab_wait = None;
+            return None;
+        }
+        let (caret_byte, delta) = (w.caret_byte, w.delta);
+        let home = std::env::var("USERPROFILE").ok();
+        match complete::start(
+            &self.tab_fam(cwd),
+            cwd,
+            home.as_deref(),
+            &self.draft,
+            caret_byte,
+            complete::ENUM_CAP,
+            remote,
+        ) {
+            complete::Start::Cycle(mut cyc) => {
+                self.tab_wait = None;
+                let (draft, caret) = cyc.step(delta);
+                self.draft = draft;
+                self.tab = Some(cyc);
+                self.recall = None;
+                Some(caret)
+            }
+            complete::Start::Edit { draft, caret } => {
+                self.tab_wait = None;
+                self.draft = draft;
+                self.tab = None;
+                self.recall = None;
+                Some(caret)
+            }
+            // Still unanswered: keep waiting (the app's own negative cache
+            // and the daemon's bounded timeout both end this, never a spin).
+            complete::Start::Request(_) => None,
+            complete::Start::None => {
+                self.tab_wait = None;
+                None
+            }
+        }
+    }
+
+    /// Drain the directory the completer wants listed (remote-completion).
+    /// The app ships it as `C2D::RequestCompletion`; nothing blocks on it.
+    pub(crate) fn take_comp_request(&mut self) -> Option<String> {
+        self.comp_request.take()
     }
 
     /// Esc mid-cycle: restore the original token and end the cycle. The
@@ -2953,7 +3075,7 @@ fn relative_path_token(fam: &complete::Family, raw: &str) -> bool {
         return false; // URL, not a path (git clone https://…)
     }
     if raw.starts_with('/')
-        && matches!(fam, complete::Family::Wsl { .. } | complete::Family::Ssh)
+        && matches!(fam, complete::Family::Wsl { .. } | complete::Family::Remote)
     {
         return false; // posix-absolute on a posix fs
     }
@@ -3345,6 +3467,12 @@ pub struct ComposerOutput {
     /// enters the existing bounded reconnect supervision by explicit user
     /// consent, no hooks_were_live gate.
     pub retry_reconnect: bool,
+    /// remote-completion: a directory the Tab completer needs listed by the
+    /// shell that is standing in it — the app ships it as
+    /// `C2D::RequestCompletion` (proto-gated) and nothing waits on the
+    /// answer. Absent on every frame that asks for nothing, which is all of
+    /// them for a purely local terminal.
+    pub comp_request: Option<String>,
     /// C2: the collapsed strip's hover-peek overlay is showing this frame
     /// (render-only — an alpha-faded translucent band floating over the
     /// grid's bottom rows; no geometry, no interaction). Surfaced so tests
@@ -3623,6 +3751,10 @@ pub fn show(
     font: FontId,
     cover_line: Option<i32>,
     prompt_cwd: Option<&str>,
+    // remote-completion: the app's cache of listings the hooked remote shell
+    // has reported for this terminal. None for a terminal with no remote
+    // world (every local lane answers from `read_dir` and never consults it).
+    remote: Option<&dyn complete::RemoteDirs>,
 ) -> ComposerOutput {
     let mut out = ComposerOutput {
         write: Vec::new(),
@@ -3635,6 +3767,7 @@ pub fn show(
         cancel_reconnect: false,
         retry_reconnect: false,
         strip_peek: false,
+        comp_request: None,
     };
     let now = Instant::now();
     let inputs = state.gate_inputs(backend, recs, running, now);
@@ -4217,6 +4350,14 @@ pub fn show(
                     ui.input_mut(|i| i.count_and_consume_key(Modifiers::SHIFT, Key::Tab)) as i64;
                 let fwd =
                     ui.input_mut(|i| i.count_and_consume_key(Modifiers::NONE, Key::Tab)) as i64;
+                // remote-completion: a Tab that was owed a remote listing
+                // applies the moment the answer lands, and only while the
+                // draft is still byte-identical to the press (`tab_retry`).
+                // Ahead of the key reads so a fresh press this frame always
+                // supersedes the stale wait.
+                if let Some(caret) = state.tab_retry(prompt_cwd, remote) {
+                    set_caret_chars(ui.ctx(), ed_id, caret);
+                }
                 if state.tab_active() && ui.input(|i| i.key_pressed(Key::Escape)) {
                     ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
                     if let Some(caret) = state.tab_escape() {
@@ -4224,10 +4365,16 @@ pub fn show(
                     }
                 } else if fwd != back {
                     let caret_byte = caret_byte_of(ui.ctx(), ed_id, &state.draft);
-                    if let Some(caret) = state.tab_press(prompt_cwd, caret_byte, fwd - back) {
+                    if let Some(caret) =
+                        state.tab_press(prompt_cwd, caret_byte, fwd - back, remote)
+                    {
                         set_caret_chars(ui.ctx(), ed_id, caret);
                     }
                 }
+                // remote-completion: whatever the two calls above asked for.
+                // Drained HERE, the only place a request can originate, so no
+                // early-return path can strand one in the state.
+                out.comp_request = state.take_comp_request();
                 // Belt: strip any Tab press that slipped the exact-modifier
                 // counts (Ctrl+Tab and friends) — egui's multiline arm would
                 // still insert `\t` for them.
@@ -5434,16 +5581,16 @@ mod tests {
             recall: Some((RecallSrc::History, "stash".into())),
             ..Default::default()
         };
-        let caret = st.tab_press(Some(cwd), 3, 1).unwrap();
+        let caret = st.tab_press(Some(cwd), 3, 1, None).unwrap();
         assert_eq!(st.draft, r"cd alpha\");
         assert_eq!(caret, 9);
         assert!(st.tab_active());
         // Completion forks recall exactly like typing (§6.2).
         assert!(st.recall.is_none());
         // Repeat Tab cycles forward; Shift+Tab walks back.
-        st.tab_press(Some(cwd), 0, 1).unwrap();
+        st.tab_press(Some(cwd), 0, 1, None).unwrap();
         assert_eq!(st.draft, r"cd bravo\");
-        st.tab_press(Some(cwd), 0, -1).unwrap();
+        st.tab_press(Some(cwd), 0, -1, None).unwrap();
         assert_eq!(st.draft, r"cd alpha\");
         // Esc restores the original token byte-exact and ends the cycle.
         let caret = st.tab_escape().unwrap();
@@ -5452,10 +5599,10 @@ mod tests {
         assert!(!st.tab_active());
         // Typing mid-cycle commits the candidate: the stale cycle drops and
         // the next Tab re-plans from the edited token (no matches here).
-        st.tab_press(Some(cwd), 3, 1).unwrap();
+        st.tab_press(Some(cwd), 3, 1, None).unwrap();
         st.draft.push('X');
         assert!(!st.tab_active());
-        assert_eq!(st.tab_press(Some(cwd), st.draft.len(), 1), None);
+        assert_eq!(st.tab_press(Some(cwd), st.draft.len(), 1, None), None);
         assert_eq!(st.draft, r"cd alpha\X");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5465,16 +5612,155 @@ mod tests {
     #[test]
     fn tab_no_ops_on_empty_draft_and_ssh() {
         let mut st = ComposerState::default();
-        assert_eq!(st.tab_press(Some(r"C:\"), 0, 1), None);
+        assert_eq!(st.tab_press(Some(r"C:\"), 0, 1, None), None);
         st.draft = "   ".into();
-        assert_eq!(st.tab_press(Some(r"C:\"), 3, 1), None);
+        assert_eq!(st.tab_press(Some(r"C:\"), 3, 1, None), None);
         assert_eq!(st.draft, "   ");
-        st.fam = complete::Family::Ssh;
+        st.fam = complete::Family::Remote;
         st.draft = "cat x".into();
-        assert_eq!(st.tab_press(Some("/home/z"), 5, 1), None);
+        assert_eq!(st.tab_press(Some("/home/z"), 5, 1, None), None);
         assert_eq!(st.draft, "cat x");
         // No cycle ⇒ tab_escape declines (the Esc chain proceeds).
         assert_eq!(st.tab_escape(), None);
+    }
+
+    /// remote-completion: a hand-built listing cache, so the composer's
+    /// async contract is testable with no daemon, PTY or network.
+    #[derive(Default)]
+    struct FakeRemote {
+        dirs: std::collections::HashMap<String, complete::RemoteListing>,
+    }
+
+    impl FakeRemote {
+        fn answer(&mut self, dir: &str, names: &[(&str, bool)]) {
+            self.dirs.insert(
+                dir.to_string(),
+                complete::RemoteListing {
+                    entries: names
+                        .iter()
+                        .map(|(n, d)| complete::Entry {
+                            name: n.to_string(),
+                            dir: *d,
+                        })
+                        .collect(),
+                    trunc: false,
+                },
+            );
+        }
+    }
+
+    impl complete::RemoteDirs for FakeRemote {
+        fn listing(&self, dir: &str) -> Option<complete::RemoteListing> {
+            self.dirs.get(dir).cloned()
+        }
+        fn declined(&self, _: &str) -> bool {
+            false
+        }
+    }
+
+    /// A composer sitting on `draft`, nothing else touched.
+    fn drafted(draft: &str) -> ComposerState {
+        ComposerState {
+            draft: draft.to_string(),
+            ..ComposerState::default()
+        }
+    }
+
+    /// remote-completion, the field-reported gesture: a pwsh terminal that
+    /// typed `ssh host` and `cd`'d on the far side. The composer's family is
+    /// still Pwsh and must never be the thing that decides — the tracked cwd
+    /// is.
+    ///
+    /// The whole async contract is here: a cold Tab ASKS and changes nothing,
+    /// the answer makes the SAME press complete on a later frame, and a warm
+    /// cache completes on the press itself.
+    #[test]
+    fn tab_completes_inside_a_typed_ssh_asynchronously() {
+        let mut st = drafted("cd ");
+        assert_eq!(st.fam, complete::Family::Pwsh, "the SPAWN family is pwsh");
+        let mut rem = FakeRemote::default();
+
+        // Cold: nothing to complete yet, so the Tab is inert (exactly the
+        // old behaviour) and the directory is parked for the app to ask for.
+        assert_eq!(st.tab_press(Some("/root"), 3, 1, Some(&rem)), None);
+        assert_eq!(st.draft, "cd ", "an unanswered Tab never edits the draft");
+        assert_eq!(st.take_comp_request().as_deref(), Some("/root"));
+        assert_eq!(st.take_comp_request(), None, "drained exactly once");
+        // Still nothing: the retry keeps waiting rather than giving up or
+        // re-asking (the app owns the send, and it dedupes).
+        assert_eq!(st.tab_retry(Some("/root"), Some(&rem)), None);
+        assert_eq!(st.take_comp_request(), None, "a retry never re-asks");
+
+        // The answer lands → the parked press completes, in the direction it
+        // was pressed in.
+        rem.answer("/root", &[("bots", true), ("alpha", true)]);
+        let caret = st.tab_retry(Some("/root"), Some(&rem)).unwrap();
+        assert_eq!(st.draft, "cd alpha/");
+        assert_eq!(caret, st.draft.chars().count());
+        assert!(st.tab_active(), "it is a live cycle, not a one-shot");
+        // ...and cycling from there is ordinary local cycle machinery.
+        assert!(st.tab_press(Some("/root"), 9, 1, Some(&rem)).is_some());
+        assert_eq!(st.draft, "cd bots/");
+
+        // Warm cache: a fresh press completes on the press, no ask at all.
+        let mut st = drafted("cd al");
+        let caret = st.tab_press(Some("/root"), 5, 1, Some(&rem)).unwrap();
+        assert_eq!(st.draft, "cd alpha/");
+        assert_eq!(caret, 9);
+        assert_eq!(st.take_comp_request(), None);
+
+        // A LOCAL cwd in the same terminal is untouched by any of it: the
+        // Windows lane runs, and the remote cache is never consulted.
+        let mut st = drafted("cd al");
+        assert_eq!(st.tab_press(Some(r"C:\nope\xyz"), 5, 1, Some(&rem)), None);
+        assert_eq!(st.take_comp_request(), None, "a local plan never asks");
+    }
+
+    /// The user always wins: a keystroke (or a submit, or Ctrl-R) between
+    /// the Tab and the answer abandons the wait, and the late answer must
+    /// never rewrite a draft that has moved on.
+    #[test]
+    fn a_keystroke_supersedes_a_pending_remote_tab() {
+        let mut rem = FakeRemote::default();
+        let mut st = drafted("cd ");
+        assert_eq!(st.tab_press(Some("/root"), 3, 1, Some(&rem)), None);
+        assert_eq!(st.take_comp_request().as_deref(), Some("/root"));
+        // They kept typing.
+        st.draft.push('b');
+        rem.answer("/root", &[("bots", true), ("alpha", true)]);
+        assert_eq!(
+            st.tab_retry(Some("/root"), Some(&rem)),
+            None,
+            "the press was for a draft that no longer exists"
+        );
+        assert_eq!(st.draft, "cd b", "the late answer never touched it");
+        // The wait is gone, so a second frame does nothing either.
+        assert_eq!(st.tab_retry(Some("/root"), Some(&rem)), None);
+        // A fresh press on the NEW draft completes from the same cache.
+        st.tab_press(Some("/root"), 4, 1, Some(&rem)).unwrap();
+        assert_eq!(st.draft, "cd bots/");
+
+        // Ctrl-R open: the draft IS the query, and a pending wait must not
+        // path-complete it (the Tier-2b suppression contract).
+        let mut st = drafted("cd ");
+        let cold = FakeRemote::default();
+        st.tab_press(Some("/root"), 3, 1, Some(&cold));
+        let _ = st.take_comp_request();
+        st.search = Some(HistSearch {
+            sel: 0,
+            saved: String::new(),
+        });
+        assert_eq!(st.tab_retry(Some("/root"), Some(&rem)), None);
+        assert_eq!(st.draft, "cd ");
+        st.search = None;
+
+        // Shift+Tab's direction survives the round trip: a reverse press
+        // lands on the LAST candidate when the answer arrives.
+        let mut st = drafted("cd ");
+        st.tab_press(Some("/root"), 3, -1, Some(&cold));
+        let _ = st.take_comp_request();
+        st.tab_retry(Some("/root"), Some(&rem)).unwrap();
+        assert_eq!(st.draft, "cd bots/", "reverse entry = the last candidate");
     }
 
     fn raw_inputs() -> GateInputs {
@@ -5720,6 +6006,7 @@ mod tests {
                         false,
                         overlay,
                         FontId::monospace(13.0),
+                        None,
                         None,
                         None,
                     ));
@@ -6209,6 +6496,7 @@ mod tests {
                         FontId::monospace(13.0),
                         None,
                         None,
+                        None,
                     ));
                 });
             });
@@ -6314,6 +6602,7 @@ mod tests {
                         collapsed,
                         false,
                         FontId::monospace(13.0),
+                        None,
                         None,
                         None,
                     ));
@@ -7017,6 +7306,7 @@ mod tests {
                         false, // collapsed (C2): strip visible in this headless rig
                         false,
                         FontId::monospace(13.0),
+                        None,
                         None,
                         None,
                     ));
@@ -8308,6 +8598,7 @@ mod tests {
                         FontId::monospace(13.0),
                         None,
                         Some(&cwd), // the SAME cwd Tab and the ghost share
+                        None,
                     ));
                 });
             });
@@ -8515,7 +8806,7 @@ mod tests {
         st.search_begin();
         st.draft = "cd ".into(); // a query that WOULD complete if allowed
         assert_eq!(
-            st.tab_press(Some(cwd), 3, 1),
+            st.tab_press(Some(cwd), 3, 1, None),
             None,
             "Tab cycle must be blocked while the search overlay is open"
         );
@@ -8546,7 +8837,7 @@ mod tests {
             draft: "cd ".into(),
             ..Default::default()
         };
-        assert!(st.tab_press(Some(cwd), 3, 1).is_some());
+        assert!(st.tab_press(Some(cwd), 3, 1, None).is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -8615,6 +8906,7 @@ mod tests {
                         false,
                         false,
                         FontId::monospace(13.0),
+                        None,
                         None,
                         None,
                     ));
@@ -10370,6 +10662,7 @@ mod tests {
                         false,
                         false,
                         FontId::monospace(13.0),
+                        None,
                         None,
                         None,
                     ));

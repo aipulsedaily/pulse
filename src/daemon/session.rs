@@ -737,9 +737,15 @@ pub fn spawn(
                                 // 133;A only anchors the deferred block
                                 // close (on_block_event below); the prompt
                                 // latch is 133;B's alone.
+                                // remote-completion: a `comp` is emitted
+                                // from INSIDE the prompt hook (prefetch) or by
+                                // a query that disarmed the exec latch first —
+                                // either way the prompt-end latch is none of
+                                // its business, like Init.
                                 super::blocks::HookVerb::Init { .. }
                                 | super::blocks::HookVerb::Beacon { .. }
-                                | super::blocks::HookVerb::PromptStart => {}
+                                | super::blocks::HookVerb::PromptStart
+                                | super::blocks::HookVerb::Comp { .. } => {}
                             }
                             ingest_core.on_block_event(
                                 id,
