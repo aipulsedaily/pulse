@@ -152,6 +152,31 @@ pub(crate) fn comp_rtt_fold(prev: Option<Duration>, sample: Duration) -> Duratio
     }
 }
 
+/// Could a `comp` listing of `answered` be the shell's reply to a query for
+/// `asked`? It mirrors `__tc_comp`'s own resolution (`bootstrap::COMP_FN`),
+/// which reports the directory it actually listed: an absolute request comes
+/// back verbatim, `~` comes back as `$HOME`, `~/x` as `$HOME/x`, and anything
+/// else as `${PWD%/}/<asked>`.
+///
+/// This is what keeps an answer out of the wrong directory KEY. A listing
+/// that arrives while a query waits is not necessarily its answer — a
+/// previous query's late reply, or a prefetch from a `cd` still in flight on
+/// a slow link, can land in that window — and whatever answers the query is
+/// filed under the spelling that was ASKED. Without this check `/srv`'s
+/// entries could be cached, and completed, as the contents of `/etc`.
+pub(crate) fn answers_query(asked: &str, answered: &str) -> bool {
+    if asked.starts_with('/') {
+        answered == asked
+    } else if asked == "~" {
+        answered.starts_with('/')
+    } else {
+        let tail = asked.strip_prefix("~/").unwrap_or(asked);
+        answered
+            .strip_suffix(tail)
+            .is_some_and(|head| head.starts_with('/') && head.ends_with('/'))
+    }
+}
+
 /// A cached listing is served for this long. The cwd's entry is REPLACED by
 /// the prefetch on every `cd`, so this bounds staleness only for other
 /// directories and for files the last command created in place — the honest
@@ -254,6 +279,18 @@ pub(super) struct CompState {
     /// changes (a `sudo su` does not move the host) and cleared on a new
     /// spawn (which may be a different host entirely).
     echo_rtt: Option<Duration>,
+    /// A query was given up on AFTER its payload went out — the budget ran
+    /// out, or the user's keystroke dropped the waiting half — so `__tc_cq`
+    /// may still be running in the shell, and its answer is still coming.
+    ///
+    /// Nothing else is typed into the shell until it is back at a prompt
+    /// (`on_pre`). The gate cannot see this on its own: `__tc_cq` hides its
+    /// own block (`__tc_at_prompt=0`), its prompt row still reads as a
+    /// prompt, and a slow `ls` keeps the journal quiet. A second trigger
+    /// would then be typed into a shell still busy with ours — its payload
+    /// echoed in the clear, since `stty -echo` has not run yet — and the
+    /// first query's late answer would land while the second one waits.
+    owed: bool,
 }
 
 /// One cached listing, stamped with the world it describes. `rebase` already
@@ -413,6 +450,7 @@ impl CompState {
             // to be measured again. A DEPTH change does not touch it: a
             // `sudo su` is the same machine over the same transport.
             self.echo_rtt = None;
+            self.owed = false;
             return;
         }
         if self.depth != depth {
@@ -426,6 +464,9 @@ impl CompState {
             self.capable.retain(|d| *d <= depth);
             self.req = None;
             self.last_decline = None;
+            // A shell at a different depth spoke: the one that owed an
+            // answer has either exited or is back at a prompt.
+            self.owed = false;
         }
     }
 
@@ -470,38 +511,215 @@ impl CompState {
         self.capable.contains(&self.depth)
     }
 
+    /// A query is outstanding in this shell — in flight, or abandoned with
+    /// its answer still owed (`owed`). The gate's `in_flight` input.
+    fn busy(&self) -> bool {
+        self.req.is_some() || self.owed
+    }
+
+    /// Advance the in-flight query by one pump tick, given the journal's
+    /// length now (`None` = unreadable, read as unchanged).
+    ///
+    /// Pure — no PTY and no clock of its own — so the whole latency policy is
+    /// testable end to end on a synthetic timeline; `pump_completion` is this
+    /// plus the writes it asks for.
+    ///
+    /// The echo phase's quiet arm means "the echo came back AND has settled",
+    /// and the first half is not implied by the second: the journal is just
+    /// as quiet while the trigger is still in flight, so on any link slower
+    /// than `REQ_ECHO_QUIET` an unconditional quiet test fired before the
+    /// echo existed — the payload went out blind, the mirror had no line to
+    /// vouch for, nothing was erased, and the lane stood itself down for the
+    /// whole spawn (rig-reproduced at 300ms of one-way delay). The deadline
+    /// arm stays absolute: `__tc_cq` is blocked in two `read`s, and a shell
+    /// left waiting is the one outcome worse than a missing completion.
+    fn step(&mut self, now: Instant, journal_len: Option<u64>) -> Step {
+        let Some(r) = self.req.as_mut() else {
+            return Step::Wait;
+        };
+        match &mut r.phase {
+            ReqPhase::AwaitEcho {
+                sent,
+                last_len,
+                last_change,
+                rtt,
+            } => {
+                if let Some(len) = journal_len.filter(|l| l != last_len) {
+                    *last_len = len;
+                    *last_change = now;
+                    // The FIRST byte back is the link measurement the lane
+                    // budgets from: the trigger went out at `sent` and has
+                    // just returned — one round trip through the pty, the
+                    // transport and the remote tty.
+                    if rtt.is_none() {
+                        let m = now.duration_since(*sent);
+                        *rtt = Some(m);
+                        self.echo_rtt = Some(comp_rtt_fold(self.echo_rtt, m));
+                    }
+                }
+                let deadline =
+                    comp_budget(self.echo_rtt, REQ_ECHO_DEADLINE_MIN, REQ_ECHO_DEADLINE_MAX);
+                let settled = rtt.is_some() && now.duration_since(*last_change) >= REQ_ECHO_QUIET;
+                if settled || now.duration_since(*sent) >= deadline {
+                    Step::SendPayload
+                } else {
+                    Step::Wait
+                }
+            }
+            ReqPhase::AwaitReply { sent, budget } => {
+                if now.duration_since(*sent) >= *budget {
+                    Step::Abandon
+                } else {
+                    Step::Wait
+                }
+            }
+        }
+    }
+
+    /// The payload is going out: move to `AwaitReply` with the budget this
+    /// link earned. The answer comes back along the same path the echo just
+    /// did, plus the remote `ls`, so the budget derives from what this link
+    /// measured moments ago. None when no query is still waiting for its
+    /// echo (it was dropped in the meantime) — then nothing may be written.
+    fn begin_reply(&mut self, now: Instant) -> Option<Duration> {
+        let budget = comp_budget(self.echo_rtt, REQ_REPLY_MIN, REQ_REPLY_MAX);
+        let r = self.req.as_mut()?;
+        if !matches!(r.phase, ReqPhase::AwaitEcho { .. }) {
+            return None;
+        }
+        r.phase = ReqPhase::AwaitReply { sent: now, budget };
+        Some(budget)
+    }
+
+    /// Give up on the in-flight query (`comp_cancel`). If its payload is
+    /// already out, the shell WILL still answer it, so that answer is owed
+    /// and the lane stays closed until the shell is back at a prompt.
+    fn abandon(&mut self) -> Option<CompReq> {
+        let r = self.req.take()?;
+        if matches!(r.phase, ReqPhase::AwaitReply { .. }) {
+            self.owed = true;
+        }
+        Some(r)
+    }
+
+    /// A second ask for the directory already being asked for — the GUI
+    /// re-asks once its own in-flight dedupe (`COMP_INFLIGHT`, 3s) expires,
+    /// and a slow link's budget is longer than that. It joins the query in
+    /// flight: the answer goes to this asker, instead of an `InFlight`
+    /// decline that the GUI would cache as a definitive nothing — ending the
+    /// wait for an answer already on its way.
+    fn join(&mut self, dir: &str, client: Weak<ClientConn>) -> bool {
+        match &mut self.req {
+            Some(r) if r.dir == dir => {
+                r.client = client;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Who, if anyone, is owed this listing as the answer to their query —
     /// and how long they waited for it.
     ///
     /// This is a SAFETY boundary, not a convenience. A listing answers a
-    /// query only while that query is still in flight AND its payload has
-    /// actually gone out. Once `comp_cancel` has taken the request (the
-    /// budget ran out, the terminal went away) or `comp_on_input` has dropped
-    /// the waiting half (the user typed, submitted, or opened Ctrl-R), there
-    /// is no target: a late listing is filed in the cache and sent to NOBODY,
-    /// so it can never be applied to a draft that has moved on. A request
-    /// still in `AwaitEcho` is not a target either — its payload is not out,
-    /// so this listing is a prefetch, not its answer.
+    /// query only while that query is still in flight, its payload has
+    /// actually gone out, AND it is a listing of the directory that query
+    /// asked for (`answers_query`). Once `abandon` has taken the request (the
+    /// budget ran out, the terminal went away) or `on_input` has dropped the
+    /// waiting half (the user typed, submitted, or opened Ctrl-R), there is
+    /// no target: a late listing is filed in the cache under its own
+    /// directory and sent to NOBODY, so it can never be applied to a draft
+    /// that has moved on. A request still in `AwaitEcho` is not a target
+    /// either — its payload is not out, so this listing is a prefetch.
     ///
-    /// The other two halves of the same property live elsewhere and are
-    /// already pinned: the cache is keyed by (spawn generation, hook depth)
-    /// so an answer can never be served into a later world (`cache_valid`),
-    /// and a shell whose token was rotated away cannot be heard at all
-    /// (`BlockStore::classify_token`).
+    /// The other halves of the same property: `owed` keeps a second query
+    /// from being typed while the first one's answer is still coming, the
+    /// cache is keyed by (spawn generation, hook depth) so an answer is never
+    /// served into a later world (`cache_valid`), and a shell whose token was
+    /// rotated away cannot be heard at all (`BlockStore::classify_token`).
     fn take_reply_target(
         &mut self,
+        answered: &str,
         now: Instant,
     ) -> Option<(Weak<ClientConn>, String, Duration)> {
-        let (client, asked, waited) = match self.req.as_ref()?.phase {
-            ReqPhase::AwaitReply { sent, .. } => {
-                let r = self.req.as_ref()?;
-                (r.client.clone(), r.dir.clone(), now.duration_since(sent))
-            }
-            ReqPhase::AwaitEcho { .. } => return None,
+        let r = self.req.as_ref()?;
+        let ReqPhase::AwaitReply { sent, .. } = r.phase else {
+            return None;
         };
-        self.req = None;
-        Some((client, asked, waited))
+        if !answers_query(&r.dir, answered) {
+            return None;
+        }
+        let r = self.req.take()?;
+        Some((r.client, r.dir, now.duration_since(sent)))
     }
+
+    /// A token-checked `comp` landed: file it, and resolve the query it
+    /// answers if there is one (`take_reply_target`).
+    fn on_listing(
+        &mut self,
+        epoch: u32,
+        depth: usize,
+        dir: &str,
+        listing: &CompDir,
+        now: Instant,
+    ) -> Option<(Weak<ClientConn>, String, Duration)> {
+        self.rebase(epoch, depth);
+        self.capable.insert(depth);
+        self.insert(dir.to_string(), listing.clone(), now);
+        let reply = self.take_reply_target(dir, now);
+        // File it under the SPELLING that was asked for as well, when the
+        // shell resolved it to something else (`~`, a relative path). The
+        // next identical ask is then a cache hit instead of a second line
+        // typed into the user's shell for an answer already in hand.
+        if let Some((_, asked, _)) = reply.as_ref().filter(|(_, a, _)| a != dir) {
+            self.insert(asked.clone(), listing.clone(), now);
+        }
+        reply
+    }
+
+    /// A prompt returned at `depth`: the shell's line buffer is empty again,
+    /// any `__tc_cq` that was still running has finished (its `comp` is
+    /// emitted before it returns, so an owed answer has landed by now), and
+    /// every world deeper than `depth` is gone.
+    fn on_pre(&mut self, epoch: u32, depth: usize) {
+        self.rebase(epoch, depth);
+        self.dirty = false;
+        self.owed = false;
+    }
+
+    /// Input arrived from the user. A SUBMITTED line leaves no buffer behind
+    /// (the shell is running it; the next prompt clears `dirty` anyway);
+    /// half-typed bytes do, and our trigger must never be appended to them.
+    /// Either way an in-flight query is superseded: the user's keystroke wins.
+    fn on_input(&mut self, submitted: bool) {
+        if !submitted {
+            self.dirty = true;
+        }
+        // Phase 2 must NOT be abandoned — the shell is parked in our `read`
+        // builtins and the pump still owes it two lines. Only the waiting
+        // half is dropped, so the reply (if it comes) lands in the cache and
+        // nothing is sent to a client that has moved on; it is still OWED,
+        // so nothing else is typed until the shell is back at a prompt.
+        if let Some(r) = &mut self.req {
+            if matches!(r.phase, ReqPhase::AwaitReply { .. }) {
+                self.req = None;
+                self.owed = true;
+            } else {
+                r.client = Weak::new();
+            }
+        }
+    }
+}
+
+/// What the query engine owes one terminal on this pump tick
+/// (`CompState::step`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Wait,
+    /// The echo is back and settled (or the deadline hit): write the payload.
+    SendPayload,
+    /// The reply budget ran out.
+    Abandon,
 }
 
 impl Core {
@@ -530,27 +748,13 @@ impl Core {
         let entries = parse_listing(list);
         let n = entries.len();
         let listing = CompDir { entries, trunc };
-        let (reply, dir_owned) = {
-            let mut map = self.completion.lock();
-            let st = map.entry(id).or_default();
-            st.rebase(epoch, depth);
-            st.capable.insert(depth);
-            st.insert(dir.to_string(), listing.clone(), now);
-            // The in-flight query is resolved by the ANSWER, not by the path
-            // it asked for: the shell reports what it actually listed, and a
-            // `~`/relative request resolves to something the GUI never spelled.
-            let reply = st.take_reply_target(now);
-            // File it under the SPELLING that was asked for as well, when the
-            // shell resolved it to something else (`~`, a relative path). The
-            // next identical ask is then a cache hit instead of a second line
-            // typed into the user's shell for an answer already in hand.
-            if let Some((_, asked, _)) = &reply {
-                if asked != dir {
-                    st.insert(asked.clone(), listing.clone(), now);
-                }
-            }
-            (reply, dir.to_string())
-        };
+        let reply = self
+            .completion
+            .lock()
+            .entry(id)
+            .or_default()
+            .on_listing(epoch, depth, dir, &listing, now);
+        let dir_owned = dir.to_string();
         // A listing that ANSWERS a query is decisive (it closes the loop a
         // field report asks about) and rare — one per Tab that reached the
         // shell. An unsolicited one is the prefetch, which fires on every
@@ -573,32 +777,17 @@ impl Core {
     /// A prompt returned at `depth`: the shell's line buffer is empty again,
     /// and every world deeper than `depth` is gone.
     pub(super) fn comp_on_pre(&self, id: Uuid, epoch: u32, depth: usize) {
-        let mut map = self.completion.lock();
-        let st = map.entry(id).or_default();
-        st.rebase(epoch, depth);
-        st.dirty = false;
+        self.completion
+            .lock()
+            .entry(id)
+            .or_default()
+            .on_pre(epoch, depth);
     }
 
-    /// Input arrived from the user. A SUBMITTED line leaves no buffer behind
-    /// (the shell is running it; the next prompt clears `dirty` anyway);
-    /// half-typed bytes do, and our trigger must never be appended to them.
-    /// Either way an in-flight query is superseded: the user's keystroke wins.
+    /// Input arrived from the user (`CompState::on_input`).
     pub(super) fn comp_on_input(&self, id: Uuid, submitted: bool) {
-        let mut map = self.completion.lock();
-        let Some(st) = map.get_mut(&id) else { return };
-        if !submitted {
-            st.dirty = true;
-        }
-        // Phase 2 must NOT be abandoned — the shell is parked in our `read`
-        // builtins and the pump still owes it two lines. Only the waiting
-        // half is dropped, so the reply (if it comes) lands in the cache and
-        // nothing is sent to a client that has moved on.
-        if let Some(r) = &mut st.req {
-            if matches!(r.phase, ReqPhase::AwaitReply { .. }) {
-                st.req = None;
-            } else {
-                r.client = Weak::new();
-            }
+        if let Some(st) = self.completion.lock().get_mut(&id) {
+            st.on_input(submitted);
         }
     }
 
@@ -646,6 +835,17 @@ impl Core {
         comp_log(&format!(
             "terminal {id}: remote completion cache miss for {dir} (epoch {epoch}, depth {depth})"
         ));
+        let joined = self
+            .completion
+            .lock()
+            .get_mut(&id)
+            .is_some_and(|st| st.join(dir, Arc::downgrade(client)));
+        if joined {
+            comp_log(&format!(
+                "terminal {id}: remote completion of {dir} is already being asked — joined"
+            ));
+            return;
+        }
         let verdict = self.comp_arm(client, id, dir, now);
         if verdict != CompGate::Arm {
             // Decisive AND repeat-prone: a user holding Tab in a directory the
@@ -721,7 +921,7 @@ impl Core {
                 st.capable_here() && hooks_live,
                 st.bash_here(),
                 st.stood_down,
-                st.req.is_some(),
+                st.busy(),
                 open_block,
                 alt,
                 credential,
@@ -813,91 +1013,19 @@ impl Core {
                 self.comp_cancel(id, "terminal is no longer running");
                 continue;
             }
-            let phase = {
-                let map = self.completion.lock();
-                match map.get(&id) {
-                    Some(s) => match s.req.as_ref().map(|r| &r.phase) {
-                        Some(&ReqPhase::AwaitEcho {
-                            sent,
-                            last_len,
-                            last_change,
-                            rtt,
-                        }) => Some(Ok((sent, last_len, last_change, s.echo_rtt, rtt.is_some()))),
-                        Some(&ReqPhase::AwaitReply { sent, budget }) => Some(Err((sent, budget))),
-                        None => None,
-                    },
-                    None => None,
-                }
-            };
-            match phase {
-                Some(Ok((sent, last_len, last_change, rtt, echoed))) => {
-                    let len = self.journal_len(id).unwrap_or(last_len);
-                    let (quiet_for, echoed) = if len != last_len {
-                        self.comp_rebase_echo(id, len, now);
-                        (Duration::ZERO, true)
-                    } else {
-                        (now.duration_since(last_change), echoed)
-                    };
-                    // The quiet arm means "the echo came back AND has settled"
-                    // — and the first half is not implied by the second. The
-                    // journal is also quiet while the trigger is still in
-                    // flight, so on any link slower than REQ_ECHO_QUIET the
-                    // old unconditional test fired before the echo existed:
-                    // the payload went out blind, the mirror had no line to
-                    // vouch for, nothing was erased and the lane stood itself
-                    // down for the whole spawn. Rig-reproduced at 300ms of
-                    // one-way delay — the FIRST Tab retired the lane and every
-                    // later one was declined `StoodDown`.
-                    //
-                    // The deadline arm stays absolute: `__tc_cq` is blocked in
-                    // two `read`s, and a shell left waiting is the one outcome
-                    // worse than a missing completion. It scales with the link
-                    // this terminal has shown us, because reaching it before
-                    // the echo lands is what costs the lane.
-                    let deadline =
-                        comp_budget(rtt, REQ_ECHO_DEADLINE_MIN, REQ_ECHO_DEADLINE_MAX);
-                    if now.duration_since(sent) >= deadline
-                        || (echoed && quiet_for >= REQ_ECHO_QUIET)
-                    {
-                        self.comp_send_payload(id);
-                    }
-                }
-                Some(Err((sent, budget))) if now.duration_since(sent) >= budget => {
-                    self.comp_cancel(id, "the shell did not answer in time");
-                }
-                Some(Err(_)) => {}
-                None => {}
+            // Read outside the completion lock: it is a LEAF, and the journal
+            // lives behind its own.
+            let len = self.journal_len(id);
+            let step = self
+                .completion
+                .lock()
+                .get_mut(&id)
+                .map_or(Step::Wait, |st| st.step(now, len));
+            match step {
+                Step::SendPayload => self.comp_send_payload(id),
+                Step::Abandon => self.comp_cancel(id, "the shell did not answer in time"),
+                Step::Wait => {}
             }
-        }
-    }
-
-    /// Output arrived while the trigger's echo was awaited. Besides re-basing
-    /// the quiet clock, the FIRST such byte is the link measurement this whole
-    /// lane budgets from: the trigger went out at `sent` and has just come
-    /// back, which is one round trip through the pty, the transport and the
-    /// remote tty.
-    fn comp_rebase_echo(&self, id: Uuid, len: u64, now: Instant) {
-        let mut map = self.completion.lock();
-        let Some(st) = map.get_mut(&id) else { return };
-        let Some(r) = st.req.as_mut() else { return };
-        let mut sample = None;
-        if let ReqPhase::AwaitEcho {
-            sent,
-            last_len,
-            last_change,
-            rtt,
-        } = &mut r.phase
-        {
-            *last_len = len;
-            *last_change = now;
-            if rtt.is_none() {
-                let m = now.duration_since(*sent);
-                *rtt = Some(m);
-                sample = Some(m);
-            }
-        }
-        if let Some(m) = sample {
-            st.echo_rtt = Some(comp_rtt_fold(st.echo_rtt, m));
         }
     }
 
@@ -924,18 +1052,8 @@ impl Core {
         {
             let mut map = self.completion.lock();
             let Some(st) = map.get_mut(&id) else { return };
-            let Some(r) = st.req.as_mut() else { return };
-            if !matches!(r.phase, ReqPhase::AwaitEcho { .. }) {
+            let Some(budget) = st.begin_reply(Instant::now()) else {
                 return;
-            }
-            // The answer has to come back along the same path the echo just
-            // did, plus the remote `ls`, so the budget is derived from what
-            // this link measured moments ago (`comp_budget`) and carried on
-            // the phase — the pump then just compares against it.
-            let budget = comp_budget(st.echo_rtt, REQ_REPLY_MIN, REQ_REPLY_MAX);
-            r.phase = ReqPhase::AwaitReply {
-                sent: Instant::now(),
-                budget,
             };
             comp_log(&format!(
                 "terminal {id}: remote completion payload written for {dir} \
@@ -970,7 +1088,7 @@ impl Core {
     fn comp_cancel(&self, id: Uuid, why: &str) {
         let taken = {
             let mut map = self.completion.lock();
-            map.get_mut(&id).and_then(|s| s.req.take())
+            map.get_mut(&id).and_then(CompState::abandon)
         };
         if let Some(r) = taken {
             // The budget it was given goes in the line: a lane that keeps
@@ -1289,69 +1407,230 @@ mod tests {
         assert!(r.unwrap() < ms(60), "decayed to {:?}", r.unwrap());
     }
 
-    /// A late answer — one that arrives after the lane gave up on it — is
-    /// FILED and sent to NOBODY. The three ways it could go wrong are all
-    /// shut: no client is told, no draft is touched, and the (epoch, depth)
-    /// key keeps it out of a later world.
-    #[test]
-    fn an_abandoned_query_has_no_one_left_to_answer() {
-        let now = Instant::now();
+    /// A hooked bash at depth 1 that has proved the verb, with a query for
+    /// `dir` just typed at `at` (journal length `len`) — the state
+    /// `comp_arm` leaves behind on `CompGate::Arm`.
+    fn armed(dir: &str, at: Instant, len: u64) -> CompState {
         let mut st = CompState::default();
-        st.rebase(1, 0);
-        // Nothing in flight at all.
-        assert!(st.take_reply_target(now).is_none());
-
-        // In flight, but the payload has not gone out: this listing is a
-        // prefetch, not the answer, and must not resolve the query.
+        st.rebase(1, 1);
+        st.shells.insert(1, "bash".into());
+        st.capable.insert(1);
         st.req = Some(CompReq {
-            dir: "/srv".into(),
+            dir: dir.into(),
             phase: ReqPhase::AwaitEcho {
-                sent: now,
-                last_len: 0,
-                last_change: now,
+                sent: at,
+                last_len: len,
+                last_change: at,
                 rtt: None,
             },
             client: Weak::new(),
-            armed: now,
+            armed: at,
         });
-        assert!(st.take_reply_target(now).is_none());
-        assert!(st.req.is_some(), "...and the query is still live");
+        st
+    }
 
-        // Payload out: this one IS the answer, exactly once, with the wait
-        // measured.
-        let sent = now - Duration::from_millis(900);
-        st.req = Some(CompReq {
-            dir: "/srv".into(),
-            phase: ReqPhase::AwaitReply { sent, budget: REQ_REPLY_MIN },
-            client: Weak::new(),
-            armed: sent,
-        });
-        let (_, asked, waited) = st.take_reply_target(now).expect("the query is owed an answer");
-        assert_eq!(asked, "/srv");
-        assert_eq!(waited, Duration::from_millis(900));
-        assert!(
-            st.take_reply_target(now).is_none(),
-            "a second listing must not be sent to a client that was already answered"
+    fn listing(names: &[&str]) -> CompDir {
+        CompDir {
+            entries: names
+                .iter()
+                .map(|n| CompEntry {
+                    name: n.to_string(),
+                    dir: true,
+                })
+                .collect(),
+            trunc: false,
+        }
+    }
+
+    /// A FAST shell that never answers is let go on exactly the old
+    /// schedule: echo seen within a tick, payload out once it settles, and
+    /// the query abandoned at the 2500ms floor — not a tick later because the
+    /// budget is now adaptive. Promptness matters: a pending Tab and the
+    /// GUI's in-flight dedupe both wait on this.
+    #[test]
+    fn a_fast_shell_that_never_answers_is_abandoned_on_the_floor() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let mut st = armed("/srv", t0, 100);
+
+        // Echo lands on the first tick (a loopback / local shell).
+        assert_eq!(st.step(ms(10), Some(108)), Step::Wait, "the echo just landed");
+        assert_eq!(st.echo_rtt, Some(Duration::from_millis(10)));
+        assert_eq!(st.step(ms(100), Some(108)), Step::Wait, "not settled yet");
+        assert_eq!(st.step(ms(160), Some(108)), Step::SendPayload, "echoed and settled");
+
+        let budget = st.begin_reply(ms(160)).expect("a query was awaiting its echo");
+        assert_eq!(budget, REQ_REPLY_MIN, "a fast link earns exactly the floor");
+        assert!(st.begin_reply(ms(160)).is_none(), "the payload goes out once");
+
+        assert_eq!(st.step(ms(160 + 2499), Some(108)), Step::Wait);
+        assert_eq!(
+            st.step(ms(160 + 2500), Some(108)),
+            Step::Abandon,
+            "a fast shell is given up on at the floor, no later"
         );
+    }
 
-        // THE REGRESSION this pins: the budget ran out, `comp_cancel` took the
-        // request and told the asker "nothing" — and then the shell answers.
-        // There is no target, so nothing is sent; the listing is only filed.
-        st.req = Some(CompReq {
-            dir: "/srv".into(),
-            phase: ReqPhase::AwaitReply { sent, budget: REQ_REPLY_MIN },
-            client: Weak::new(),
-            armed: sent,
-        });
-        st.req = None; // what comp_cancel / comp_on_input leave behind
-        assert!(st.take_reply_target(now).is_none());
-        // And the listing it carried cannot be served into a later spawn or a
-        // collapsed nested world even from the cache.
-        st.insert("/srv".into(), CompDir { entries: vec![], trunc: false }, now);
-        assert!(st.get("/srv", now).is_some());
+    /// A SLOW link is waited for, end to end, where the v0.1.20 constants
+    /// cut it off twice over.
+    ///
+    /// 400ms of round trip: the journal sits quiet for well over
+    /// REQ_ECHO_QUIET while the trigger is still in flight — the old quiet
+    /// arm sent the payload blind at 150ms, which retired the lane for the
+    /// spawn — and the answer then takes 3s, past the old flat 2500ms reply
+    /// timeout. Both must now be waited out.
+    #[test]
+    fn a_slow_link_is_waited_for_not_cut_off() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let mut st = armed("/srv", t0, 100);
+
+        for t in [150, 250, 300, 399] {
+            assert_eq!(
+                st.step(ms(t), Some(100)),
+                Step::Wait,
+                "{t}ms: quiet, but the echo has not come back — the payload must not go out blind"
+            );
+        }
+        assert_eq!(st.step(ms(400), Some(108)), Step::Wait, "the echo lands");
+        assert_eq!(st.echo_rtt, Some(Duration::from_millis(400)));
+        assert_eq!(st.step(ms(550), Some(108)), Step::SendPayload);
+
+        let budget = st.begin_reply(ms(550)).unwrap();
+        assert_eq!(budget, Duration::from_millis(3200), "eight measured round trips");
+
+        // The answer is 3s out: past the old constant, inside the budget.
+        assert_eq!(st.step(ms(550 + 2500), Some(108)), Step::Wait, "the old timeout");
+        assert_eq!(st.step(ms(550 + 3000), Some(108)), Step::Wait);
+        let (_, asked, waited) = st
+            .on_listing(1, 1, "/srv", &listing(&["a"]), ms(550 + 3000))
+            .expect("the slow answer reaches its asker");
+        assert_eq!(asked, "/srv");
+        assert_eq!(waited, Duration::from_millis(3000));
+        assert!(st.req.is_none() && !st.busy(), "answered: the lane is free again");
+
+        // The NEXT query on this terminal starts from the measured link, so
+        // even a missed echo is waited for past the old 1500ms deadline.
+        let mut st2 = armed("/etc", t0, 100);
+        st2.echo_rtt = st.echo_rtt;
+        assert_eq!(st2.step(ms(3199), Some(100)), Step::Wait);
+        assert_eq!(st2.step(ms(3200), Some(100)), Step::SendPayload, "the deadline arm still fires");
+
+        // ...and a link worse than any sane ceiling still lets the shell go.
+        let mut st3 = armed("/etc", t0, 100);
+        st3.echo_rtt = Some(Duration::from_secs(60));
+        assert_eq!(st3.step(t0 + REQ_ECHO_DEADLINE_MAX, Some(100)), Step::SendPayload);
+    }
+
+    /// A late answer — one that arrives after the lane gave up on it — never
+    /// reaches a draft, never lands under another directory's key, and never
+    /// collides with a later query. Every assertion below fails against the
+    /// pre-fix code, where the gate only saw `req`, any listing resolved
+    /// whatever query was waiting, and a second Tab's ask was declined.
+    #[test]
+    fn a_late_answer_never_lands_in_the_wrong_place() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let mut st = armed("/srv", t0, 100);
+        st.step(ms(10), Some(108));
+        st.step(ms(200), Some(108));
+        st.begin_reply(ms(200)).unwrap();
+
+        // The budget runs out with the payload out: `__tc_cq` is still
+        // running over there and WILL answer. The lane must not type a second
+        // trigger into that shell until it is back at a prompt.
+        assert_eq!(st.step(ms(2700), Some(108)), Step::Abandon);
+        let gone = st.abandon().expect("a query was in flight");
+        assert_eq!(gone.dir, "/srv");
+        assert!(st.req.is_none());
+        assert!(st.busy(), "the abandoned query's answer is still owed");
+
+        // Its answer arrives late. There is no one to send it to; it is filed
+        // under the directory it actually describes, and nowhere else.
+        assert!(st.on_listing(1, 1, "/srv", &listing(&["late"]), ms(3000)).is_none());
+        assert_eq!(st.get("/srv", ms(3000)), Some(&listing(&["late"])));
+        assert!(st.busy(), "the shell is not back at a prompt yet");
+        st.on_pre(1, 1);
+        assert!(!st.busy(), "the prompt came back: the lane reopens");
+
+        // A query for /etc is waiting. A listing of ANOTHER directory —
+        // a late reply, a prefetch from a `cd` still in flight — must not
+        // answer it, or /srv's names would be cached as /etc's.
+        let mut st = armed("/etc", t0, 100);
+        st.step(ms(10), Some(108));
+        st.step(ms(200), Some(108));
+        st.begin_reply(ms(200)).unwrap();
+        assert!(st.on_listing(1, 1, "/srv", &listing(&["late"]), ms(300)).is_none());
+        assert!(st.get("/etc", ms(300)).is_none(), "nothing filed under the asked key");
+        assert!(st.req.is_some(), "...and /etc is still waiting for ITS answer");
+        let (_, asked, _) = st
+            .on_listing(1, 1, "/etc", &listing(&["hosts"]), ms(400))
+            .expect("its own answer resolves it");
+        assert_eq!(asked, "/etc");
+
+        // The user typing while the answer is outstanding drops the waiting
+        // half — the answer goes to nobody — but it is still OWED.
+        let mut st = armed("/srv", t0, 100);
+        st.step(ms(10), Some(108));
+        st.step(ms(200), Some(108));
+        st.begin_reply(ms(200)).unwrap();
+        st.on_input(false);
+        assert!(st.req.is_none() && st.busy());
+        assert!(st.on_listing(1, 1, "/srv", &listing(&["x"]), ms(500)).is_none());
+
+        // A listing while the query still awaits its echo is a prefetch, not
+        // the answer: the query stays live.
+        let mut st = armed("/srv", t0, 100);
+        assert!(st.on_listing(1, 1, "/srv", &listing(&["p"]), ms(5)).is_none());
+        assert!(st.req.is_some());
+
+        // A new spawn forgets the debt, the cache and the link: the old shell
+        // is dead, and the new one may be a different host.
+        let mut st = armed("/srv", t0, 100);
+        st.step(ms(10), Some(108));
+        st.begin_reply(ms(200)).unwrap();
+        st.abandon();
+        st.insert("/srv".into(), listing(&["old"]), ms(300));
         st.rebase(2, 0);
-        assert!(st.get("/srv", now).is_none(), "a new spawn never sees it");
+        assert!(!st.busy(), "a dead shell owes nothing");
+        assert!(st.get("/srv", ms(300)).is_none(), "a new spawn never sees the old listing");
         assert_eq!(st.echo_rtt, None, "...and re-measures the link");
+    }
+
+    /// A second ask for the directory already in flight joins it. The GUI
+    /// re-asks once its own 3s in-flight dedupe lapses; on a slow link the
+    /// answer is still on its way, and declining the re-ask `InFlight` would
+    /// hand the GUI a definitive "nothing" that ends the wait.
+    #[test]
+    fn a_repeat_ask_joins_the_query_in_flight() {
+        let t0 = Instant::now();
+        let mut st = armed("/srv", t0, 100);
+        assert!(!st.join("/etc", Weak::new()), "another directory is not joined");
+        assert!(st.join("/srv", Weak::new()));
+        assert_eq!(st.req.as_ref().unwrap().dir, "/srv");
+    }
+
+    /// `answers_query` mirrors `__tc_comp`'s resolution of what it was asked.
+    #[test]
+    fn answers_query_follows_the_shells_resolution() {
+        assert!(answers_query("/srv", "/srv"));
+        assert!(answers_query("/", "/"));
+        assert!(answers_query("/home/dev/..", "/home/dev/.."));
+        assert!(!answers_query("/srv", "/srv/x"));
+        assert!(!answers_query("/etc", "/srv"));
+        // `~` is $HOME, which only the shell knows.
+        assert!(answers_query("~", "/home/dev"));
+        assert!(answers_query("~", "/root"));
+        assert!(!answers_query("~", ""));
+        // `~/x` is $HOME/x.
+        assert!(answers_query("~/src", "/home/dev/src"));
+        assert!(!answers_query("~/src", "/home/dev/other"));
+        assert!(!answers_query("~/src", "/home/dev/xsrc"));
+        // Anything else is ${PWD%/}/<asked> — including `~user/x`, which the
+        // lister does not expand.
+        assert!(answers_query("~dev/x", "/home/dev/~dev/x"));
+        assert!(answers_query("sub", "/sub"));
+        assert!(!answers_query("sub", "/home/devsub"));
     }
 
     /// zsh prefetches but is never typed into; bash gets both lanes.
