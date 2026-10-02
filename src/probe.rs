@@ -7609,6 +7609,75 @@ fn case_nested_completion() -> anyhow::Result<()> {
         other => anyhow::bail!("history check returned {other:?}"),
     }
 
+    // ── TAB, THEN ENTER ──────────────────────────────────────────────────
+    // The user submits while a query is still waiting for its echo — the
+    // composer's `cd pr<Tab><Enter>` at human speed. `__tc_cq` is parked in
+    // its `read`s by then, so the submitted line must reach the shell AFTER
+    // the payload, never INTO it: v0.1.20 let `read` swallow it, the command
+    // silently never ran, and the requested path was `eval`ed in its place
+    // (rig-reproduced). The input is fired the moment the trigger's echo is
+    // on screen — inside the echo phase (the payload waits one settle and a
+    // pump tick past that), and late enough for the mirror to vouch for the
+    // erase. A try that misses the window still has to RUN the line; the
+    // case only demands that one try actually lands in it.
+    let mut raced = false;
+    for (n, sub) in ["alpha", "bravo", "linkdir"].iter().enumerate() {
+        settle();
+        let typed0 = log_since(log0).matches("remote completion query typed").count();
+        c.send(&C2D::RequestCompletion {
+            id,
+            dir: format!("{root}/{sub}"),
+        })?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while log_since(log0).matches("remote completion query typed").count() == typed0
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !strip_ansi(&String::from_utf8_lossy(&c.replay(id)?)).contains("__tc_cq")
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let marker = format!("{root}/race_{n}");
+        c.send(&C2D::Input {
+            id,
+            bytes: format!(": > {marker}\r").into_bytes(),
+        })?;
+        // Let the query resolve and the raced line run to its own prompt
+        // before asking: `ctl run` fired into the middle of that would be
+        // timing its own submission against ours, not checking the result.
+        let answered = format!("remote completion listed {root}/{sub} ");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !log_since(log0).contains(&answered) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        settle();
+        await_hooked_prompt(&mut ctl, &mut rid, id, 30)?;
+        match ctl_run_retry(
+            &mut ctl,
+            &mut rid,
+            id,
+            &format!("test -e {marker} && echo RACE-RAN || echo RACE-LOST"),
+            Some(RunWait { timeout_ms: 30_000, tail_bytes: 2048 }),
+            60,
+        )? {
+            CtlBody::RunDone { output, .. } => anyhow::ensure!(
+                output.lines().any(|l| l.trim() == "RACE-RAN"),
+                "a line submitted during the echo phase never ran — the query \
+                 reader swallowed it: {output:?}"
+            ),
+            other => anyhow::bail!("race check returned {other:?}"),
+        }
+        if log_since(log0).contains("input arrived while the completion query waited for its echo")
+        {
+            raced = true;
+            break;
+        }
+    }
+    anyhow::ensure!(raced, "no submission ever landed inside the echo phase");
+
     // Tear the scratch tree down, leave the nested world, and prove the
     // outer shell is still healthy.
     let _ = ctl_run_retry(

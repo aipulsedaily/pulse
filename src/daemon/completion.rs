@@ -691,23 +691,32 @@ impl CompState {
     /// (the shell is running it; the next prompt clears `dirty` anyway);
     /// half-typed bytes do, and our trigger must never be appended to them.
     /// Either way an in-flight query is superseded: the user's keystroke wins.
-    fn on_input(&mut self, submitted: bool) {
+    ///
+    /// Returns true when the payload must be written NOW, ahead of the
+    /// user's bytes: the query is still waiting for its echo, so `__tc_cq`
+    /// is (or is about to be) parked in its two `read`s, and whatever reaches
+    /// the shell next is what they read. Left to the pump, the user's own
+    /// line went into `read` instead — `cd pr<Tab><Enter>` at human speed
+    /// silently never ran, and the requested path was `eval`ed in its place
+    /// (rig-reproduced). `nesthook_on_input` flushes for the same reason.
+    fn on_input(&mut self, submitted: bool) -> bool {
         if !submitted {
             self.dirty = true;
         }
-        // Phase 2 must NOT be abandoned — the shell is parked in our `read`
-        // builtins and the pump still owes it two lines. Only the waiting
-        // half is dropped, so the reply (if it comes) lands in the cache and
-        // nothing is sent to a client that has moved on; it is still OWED,
-        // so nothing else is typed until the shell is back at a prompt.
-        if let Some(r) = &mut self.req {
-            if matches!(r.phase, ReqPhase::AwaitReply { .. }) {
-                self.req = None;
-                self.owed = true;
-            } else {
-                r.client = Weak::new();
-            }
+        // Once the payload is out, only the waiting half is dropped, so the
+        // reply (if it comes) lands in the cache and nothing is sent to a
+        // client that has moved on; it is still OWED, so nothing else is
+        // typed until the shell is back at a prompt.
+        let Some(r) = &mut self.req else {
+            return false;
+        };
+        if matches!(r.phase, ReqPhase::AwaitReply { .. }) {
+            self.req = None;
+            self.owed = true;
+            return false;
         }
+        r.client = Weak::new();
+        true
     }
 }
 
@@ -784,10 +793,21 @@ impl Core {
             .on_pre(epoch, depth);
     }
 
-    /// Input arrived from the user (`CompState::on_input`).
+    /// Input arrived from the user (`CompState::on_input`). Both callers
+    /// write the user's bytes AFTER this returns, so a payload flushed here
+    /// reaches the shell first — the order `__tc_cq`'s `read`s need.
     pub(super) fn comp_on_input(&self, id: Uuid, submitted: bool) {
-        if let Some(st) = self.completion.lock().get_mut(&id) {
-            st.on_input(submitted);
+        let flush = self
+            .completion
+            .lock()
+            .get_mut(&id)
+            .is_some_and(|st| st.on_input(submitted));
+        if flush {
+            log::info!(
+                "terminal {id}: input arrived while the completion query waited for its echo — \
+                 its payload goes out first"
+            );
+            self.comp_send_payload(id);
         }
     }
 
@@ -1595,6 +1615,37 @@ mod tests {
         assert!(!st.busy(), "a dead shell owes nothing");
         assert!(st.get("/srv", ms(300)).is_none(), "a new spawn never sees the old listing");
         assert_eq!(st.echo_rtt, None, "...and re-measures the link");
+    }
+
+    /// The user's input while the query still awaits its echo must flush the
+    /// payload AHEAD of it: `__tc_cq` is parked in its `read`s, and whatever
+    /// reaches the shell next is what they read. v0.1.20 kept waiting for
+    /// the pump, so a fast `<Tab><Enter>` fed the user's own line to `read`
+    /// — the command never ran.
+    #[test]
+    fn input_during_the_echo_phase_flushes_the_payload_first() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+
+        // Echo phase, submitted or half-typed: flush, and nobody is answered.
+        for submitted in [true, false] {
+            let mut st = armed("/srv", t0, 100);
+            assert!(st.on_input(submitted), "the payload is owed to the parked shell NOW");
+            assert!(st.req.as_ref().unwrap().client.upgrade().is_none());
+            assert_eq!(st.dirty, !submitted);
+            // ...and it can still go out: the query was not dropped.
+            assert!(st.begin_reply(ms(5)).is_some());
+        }
+
+        // Payload already out: nothing left to flush; the answer is owed.
+        let mut st = armed("/srv", t0, 100);
+        st.begin_reply(ms(5)).unwrap();
+        assert!(!st.on_input(true));
+        assert!(st.req.is_none() && st.busy());
+
+        // Nothing in flight: nothing to flush.
+        let mut st = CompState::default();
+        assert!(!st.on_input(true));
     }
 
     /// A second ask for the directory already in flight joins it. The GUI
