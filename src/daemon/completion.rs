@@ -644,11 +644,10 @@ impl Core {
                         self.comp_send_payload(id);
                     }
                 }
-                Some(Err(sent)) => {
-                    if now.duration_since(sent) >= REQ_REPLY_TIMEOUT {
-                        self.comp_cancel(id, "the shell did not answer in time");
-                    }
+                Some(Err(sent)) if now.duration_since(sent) >= REQ_REPLY_TIMEOUT => {
+                    self.comp_cancel(id, "the shell did not answer in time");
                 }
+                Some(Err(_)) => {}
                 None => {}
             }
         }
