@@ -449,8 +449,14 @@ impl App {
             ui.add_space(12.0);
             if ghost_button(ui, ui.available_width(), "New terminal", Some(Icon::Plus)).clicked()
             {
-                ui.ctx()
-                    .memory_mut(|m| m.request_focus(Id::new("launcher_q")));
+                // The embed lives in the CENTRAL panel: whether its query
+                // field has been painted when this runs depends on panel
+                // order, and focusing an unpainted id is the
+                // accesskit_consumer crash. Arm it; the field claims it.
+                if let Some(l) = self.launcher.as_mut() {
+                    l.focus_req.arm(Id::new("launcher_q"));
+                }
+                ui.ctx().request_repaint();
             }
         }
     }
