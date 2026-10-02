@@ -12352,6 +12352,10 @@ fn case_nested_death_reinstate() -> anyhow::Result<()> {
             ))
         }
     };
+    // BatchMode: when the key is taken away below, the refusal must be the
+    // immediate "Permission denied (publickey…)" an unattended ladder meets,
+    // not a password prompt (the re-establish engine already stops at those).
+    let opener = opener.replacen("ssh ", "ssh -o BatchMode=yes ", 1);
     let log0 = daemon_log_len();
     let master = master_token()?;
     let mut c = Conn::open()?;

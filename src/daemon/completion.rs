@@ -936,7 +936,9 @@ impl Core {
             }
             return;
         }
-        self.comp_decline(&Arc::downgrade(client), id, dir, verdict);
+        if verdict != CompGate::Arm {
+            self.comp_decline(&Arc::downgrade(client), id, dir, verdict);
+        }
     }
 
     /// Answer an ask with a definitive "nothing" for `verdict`, logging it.

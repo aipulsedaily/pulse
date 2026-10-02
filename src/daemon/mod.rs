@@ -904,8 +904,15 @@ impl Core {
         // just finished. When that command was the opener of a nested episode,
         // this is how the episode ended — see `tracker::nested_end_verdict`.
         // Captured here because the match below moves the payload.
+        //
+        // PowerShell's folded `e` cannot be trusted for this: its wrapper
+        // reads `$LASTEXITCODE` only when it CHANGED, so a second identical
+        // link loss (-1 again) folded to a plain failure (1) and a reconnected
+        // session's next drop read as a deliberate exit. The raw value is
+        // exact here — the command that just finished is the native ssh that
+        // set it — so it wins where the hook supplies it.
         let pre_exit: Option<i64> = match &ev.verb {
-            blocks::HookVerb::Pre { exit, .. } => *exit,
+            blocks::HookVerb::Pre { exit, native, .. } => native.or(*exit),
             _ => None,
         };
         let is_init = matches!(ev.verb, blocks::HookVerb::Init { .. });
@@ -1026,7 +1033,7 @@ impl Core {
                     // folded into this exec rides along with the next save.
                     Some((store.epoch, recs, None))
                 }
-                blocks::HookVerb::Pre { exit, n, cwd } => {
+                blocks::HookVerb::Pre { exit, n, cwd, .. } => {
                     if let Some(fill) = pre_cwd_fill {
                         store.last_cwd = Some(fill);
                     }

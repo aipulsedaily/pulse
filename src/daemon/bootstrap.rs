@@ -134,7 +134,11 @@ function global:prompt {
   # boundary with no sleep (blocks.rs PendingClose; the ingest quiescence
   # fallback restores the old pre-position close if 133;A is ever lost).
   # The exec hook stays sleep-free as ever.
-  TCEmit 'pre' @{ e = $e; n = $script:TCN; d = $p }
+  # x: the RAW $LASTEXITCODE beside the folded e. The daemon reads it for
+  # one judgement only — how a nested ssh ended — where the command that
+  # just finished IS that native ssh, so it cannot be stale; folded, a second
+  # identical link loss (-1 again) read as a deliberate exit 1.
+  TCEmit 'pre' @{ e = $e; n = $script:TCN; d = $p; x = $lec }
   [Console]::Write([char]27 + ']9;9;' + $p + [char]7)
   $base = if ($script:TCPrevPrompt) { & $script:TCPrevPrompt } else { 'PS ' + $p + '> ' }
   $m = [char]27; $b = [char]7
@@ -1142,6 +1146,13 @@ pub fn delete_script(id: Uuid) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pwsh pre sends the RAW `$LASTEXITCODE` beside the folded `e` (see
+    /// `blocks::tests::a_pwsh_pre_carries_its_raw_native_exit`).
+    #[test]
+    fn pwsh_pre_sends_the_raw_native_exit() {
+        assert!(TEMPLATE.contains("TCEmit 'pre' @{ e = $e; n = $script:TCN; d = $p; x = $lec }"));
+    }
     use std::path::Path;
 
     /// U2: the automount translation — lowercase drive, slashes flipped,
@@ -1631,7 +1642,7 @@ mod tests {
         assert_eq!(verbs.len(), 3, "pre + PromptStart + PromptEnd only: {verbs:?}");
         assert_eq!(
             *verbs[0],
-            HookVerb::Pre { exit: None, n: 0, cwd: String::new() }
+            HookVerb::Pre { exit: None, n: 0, cwd: String::new(), native: None }
         );
         assert_eq!(evs[0].token, "0123456789abcdef");
         // D*: 133;A parses (the deferred-close anchor) and, in cmd's PROMPT

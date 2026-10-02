@@ -47,7 +47,9 @@ pub enum HookVerb {
         user: String,
     },
     Exec { cmd: String },
-    Pre { exit: Option<i64>, n: u32, cwd: String },
+    /// `native`: the raw `$LASTEXITCODE` (PowerShell only, else None) — see
+    /// `bootstrap::PWSH_*` and `Core::reinstate_nested_chain`.
+    Pre { exit: Option<i64>, n: u32, cwd: String, native: Option<i64> },
     /// OSC 133;B — end of the rendered prompt string (emitted by the
     /// bootstrap between the prompt text and PSReadLine taking over). Carries
     /// no token; GUI-side prompt-end capture only (P3 composer). The daemon
@@ -268,6 +270,10 @@ struct ExecPayload {
 struct PrePayload {
     #[serde(default)]
     e: Option<i64>,
+    /// PowerShell's RAW `$LASTEXITCODE` (`e` is the folded status the block
+    /// chrome uses). Absent from every other shell's hook.
+    #[serde(default)]
+    x: Option<i64>,
     #[serde(default)]
     n: u32,
     #[serde(default)]
@@ -386,6 +392,7 @@ fn parse_hook(body: &[u8], offset_after: usize) -> Option<BlockEvent> {
             exit: p.e,
             n: p.n,
             cwd: p.d,
+            native: p.x,
         }),
         // remote-completion: a listing is accepted only when the shell named
         // the ABSOLUTE directory it listed — that string is the cache key, and
@@ -908,6 +915,21 @@ impl BlockStore {
 mod tests {
     use super::*;
 
+    /// PowerShell's pre carries the RAW `$LASTEXITCODE` beside the folded
+    /// status; every other shell's pre carries none. The nested-death verdict
+    /// reads the raw value — folded, a second identical link loss (-1 again)
+    /// read as a deliberate exit 1.
+    #[test]
+    fn a_pwsh_pre_carries_its_raw_native_exit() {
+        let hex = |s: &str| s.bytes().map(|b| format!("{b:02x}")).collect::<String>();
+        let body = format!("7717;0123456789abcdef;pre;{}", hex(r#"{"e":1,"n":3,"d":"C:\\","x":-1}"#));
+        let ev = parse_hook(body.as_bytes(), 0).expect("a pre parses");
+        assert!(matches!(ev.verb, HookVerb::Pre { exit: Some(1), native: Some(-1), .. }));
+        let body = format!("7717;0123456789abcdef;pre;{}", hex(r#"{"e":255,"n":3,"d":"/"}"#));
+        let ev = parse_hook(body.as_bytes(), 0).expect("a pre parses");
+        assert!(matches!(ev.verb, HookVerb::Pre { exit: Some(255), native: None, .. }));
+    }
+
     fn hook(verb: &str, json: &str, token: &str) -> Vec<u8> {
         let hex = crate::strip::hex_lower(json.as_bytes());
         format!("\x1b]7717;{token};{verb};{hex}\x07").into_bytes()
@@ -1061,7 +1083,7 @@ mod tests {
         assert_eq!(evs[3].verb, HookVerb::Exec { cmd: "echo hi".into() });
         assert_eq!(
             evs[4].verb,
-            HookVerb::Pre { exit: Some(0), n: 2, cwd: "C:\\".into() }
+            HookVerb::Pre { exit: Some(0), n: 2, cwd: "C:\\".into(), native: None }
         );
         assert_eq!(evs[5].verb, HookVerb::Exec { cmd: "dir".into() });
         // exec #1's offset points at the 'h' of "hi\r\n".
@@ -1274,7 +1296,7 @@ mod tests {
         let evs = sc.feed(b"\x1b]7717;00000000deadbeef;pre;7b7d\x07");
         assert_eq!(
             evs[0].verb,
-            HookVerb::Pre { exit: None, n: 0, cwd: String::new() }
+            HookVerb::Pre { exit: None, n: 0, cwd: String::new(), native: None }
         );
         // Oversized body is abandoned without producing an event.
         let mut big = b"\x1b]7717;t;exec;".to_vec();
@@ -1550,7 +1572,7 @@ mod tests {
                         HookVerb::Exec { cmd } => {
                             st.open_block(cmd, off, 1);
                         }
-                        HookVerb::Pre { exit, n, cwd } => {
+                        HookVerb::Pre { exit, n, cwd, .. } => {
                             assert_eq!(st.on_pre(exit, n, cwd, off, 2), None);
                         }
                         _ => {}
