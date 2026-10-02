@@ -309,6 +309,80 @@ impl Core {
         );
     }
 
+
+    /// nested-death reinstate: the link under a LIVE outer shell died, so put
+    /// the nested world back.
+    ///
+    /// The field shape (second user): four `cmd.exe` terminals, each with a
+    /// hand-typed `ssh …` inside. The links drop overnight — a laptop sleep,
+    /// a flaky home network — and the outer shell's prompt simply comes back.
+    /// Pulse's whole recovery stack (dead-terminal Enter-to-relaunch, the
+    /// persistent Retry ladder, chain re-establish at launch) is keyed to a
+    /// dead TERMINAL; his terminal is alive, only the thing inside it died.
+    /// So he retyped his ssh by hand, every time, and the journals show it.
+    ///
+    /// This is the same engine `arm_reestablish` drives, armed WITHOUT a
+    /// relaunch: the recorded chain is replayed into the session that is
+    /// already there. Every property of the launch-time lane is inherited
+    /// unchanged — steps are the user's own recorded commands typed
+    /// **verbatim** (so `ssh -i "C:\path with spaces\key.pem" user@host`
+    /// round-trips byte-exact), each gated on output quiescence, and the whole
+    /// remainder aborts the instant the tail line looks like a credential
+    /// prompt. Credentials are never typed.
+    ///
+    /// It differs in exactly two ways:
+    ///
+    /// 1. It arms straight into `PendingSend` with a **backoff delay** rather
+    ///    than `AwaitPrompt`. The outer prompt is already here — that prompt
+    ///    IS the event — and a failed replay returns to that same prompt, so
+    ///    arming at `AwaitPrompt` would spin as fast as ssh can fail. The
+    ///    delay comes from the ssh retry ladder's own table in `manual` mode,
+    ///    which never exhausts (2s, 10s, 30s, then 30s forever): "keep trying
+    ///    until my server is back", which is precisely the ask.
+    /// 2. It carries no inner-CLI `resume` step. The launch lane composes one
+    ///    from a complete breadcrumb; here the nested world is being rebuilt
+    ///    under a shell that never died, and re-resuming a CLI the user may
+    ///    still have open elsewhere is a guess. The chain only.
+    ///
+    /// Returns true when a replay was armed.
+    pub(super) fn arm_nested_reinstate(
+        &self,
+        id: Uuid,
+        steps: Vec<String>,
+        attempt: u32,
+        delay: Duration,
+    ) -> bool {
+        if steps.is_empty() {
+            return false;
+        }
+        // Fail CLOSED: with no live session there is nothing to type into.
+        let Some(spawn_gen) = self.sessions.lock().get(&id).map(|s| s.gen) else {
+            return false;
+        };
+        log::info!(
+            "terminal {id}: nested shell died under a live outer shell — \
+             replaying the opener in {}s (attempt {}, verbatim: {})",
+            delay.as_secs(),
+            attempt + 1,
+            steps.join("; ")
+        );
+        self.reestablish.lock().insert(
+            id,
+            Reestablish {
+                steps,
+                idx: 0,
+                phase: Phase::PendingSend {
+                    step: 0,
+                    at: Instant::now() + delay,
+                },
+                resume: None,
+                hint: None,
+                spawn_gen,
+            },
+        );
+        true
+    }
+
     /// GENERATION BINDING: is the armed sequence still talking to the spawn
     /// it was armed for? A relaunch (a flapping ssh link is the field shape)
     /// bumps `Session::gen`; anything still armed for the previous one must

@@ -539,6 +539,13 @@ pub struct Core {
     /// `pump_reestablish` (250ms flush tick) gates each further step on
     /// output quiescence and ABORTS on any credential-prompt tail line.
     reestablish: Mutex<HashMap<Uuid, Reestablish>>,
+    /// nested-death reinstate: how many times the opener of a nested episode
+    /// has been replayed because the link under it DIED while the outer shell
+    /// stayed alive (LEAF lock). Drives the backoff ladder — the same
+    /// `reconnect_backoff_after(.., manual)` table the ssh retry ladder uses,
+    /// so it never gives up on its own. Reset when the nested world comes
+    /// back (its own hooks report in) and when the user cancels.
+    nested_retry: Mutex<HashMap<Uuid, u32>>,
     /// nested-shell-hooks: in-flight hook injections (LEAF lock): terminal →
     /// phase state. Armed by `open_nested_chain` the moment a nested-shell
     /// episode is WITNESSED in an already-hooked terminal, driven by
@@ -867,6 +874,14 @@ impl Core {
         }
         let now = now_ms();
         let is_pre = matches!(ev.verb, blocks::HookVerb::Pre { .. });
+        // nested-death reinstate: the outer shell's status for the command it
+        // just finished. When that command was the opener of a nested episode,
+        // this is how the episode ended — see `tracker::nested_end_verdict`.
+        // Captured here because the match below moves the payload.
+        let pre_exit: Option<i64> = match &ev.verb {
+            blocks::HookVerb::Pre { exit, .. } => *exit,
+            _ => None,
+        };
         let is_init = matches!(ev.verb, blocks::HookVerb::Init { .. });
         // P6a §7.2: the exec hook's command line, captured for the hook-based
         // inner-CLI fold below (WSL/remote process trees are invisible to the
@@ -1069,7 +1084,13 @@ impl Core {
             if scope.is_outer() {
                 let consumed = self.reestablish_on_pre(id);
                 if !consumed {
-                    self.clear_nested_chain(id, "hooked prompt returned");
+                    // nested-death reinstate: the nested world just ended.
+                    // Did the user leave it, or did the link under it die?
+                    // Only a death earns a replay — a session closed on
+                    // purpose must never be resurrected.
+                    if !self.reinstate_nested_chain(id, pre_exit) {
+                        self.clear_nested_chain(id, "hooked prompt returned");
+                    }
                 }
             } else {
                 self.reestablish_on_nested_pre(id);
@@ -2389,12 +2410,151 @@ impl Core {
         }
     }
 
+
+    /// nested-death reinstate — the decision half (the typing half is
+    /// `arm_nested_reinstate`). Called on the outer `pre` that ends a nested
+    /// episode, with that pre's exit status.
+    ///
+    /// Returns true when the breadcrumb was KEPT and a replay armed, which
+    /// tells the caller to skip the ordinary retirement. Returns false for
+    /// every ending we are not certain was a death — the conservative
+    /// direction: Pulse would rather forget a session than resurrect one the
+    /// user deliberately closed.
+    ///
+    /// Gates, in order:
+    /// * an episode must actually be live and carry a chain;
+    /// * `ShellCfg.auto_reestablish` — the one existing opt-out, honoured
+    ///   here exactly as at launch;
+    /// * `tracker::nested_end_verdict` must say `Died` (ssh status 255).
+    ///
+    /// cmd.exe terminals reach `Unknown` and stop here, permanently: its
+    /// `PROMPT` hook cannot carry `%ERRORLEVEL%`, so no exit status exists to
+    /// judge (`bootstrap::cmd_prompt_value`, D7). They still get the rest of
+    /// this work — the episode is now classified at all (see
+    /// `open_nested_chain_execless`), so the breadcrumb, the chain, and the
+    /// launch-time re-establish apply to them for the first time.
+    fn reinstate_nested_chain(&self, id: Uuid, pre_exit: Option<i64>) -> bool {
+        if !self.nested_open.lock().contains(&id) {
+            return false;
+        }
+        let (steps, opt_in) = {
+            let state = self.state.lock();
+            let Some(t) = state.terminal(id) else { return false };
+            let Some(chain) = t.nested_chain.as_ref() else {
+                return false;
+            };
+            (
+                chain.cmds.clone(),
+                t.shell_cfg.as_ref().is_none_or(|c| c.auto_reestablish),
+            )
+        };
+        // A ladder already climbing loosens the verdict for repeat failures
+        // only — see `nested_end_verdict` on PowerShell's `$LASTEXITCODE`
+        // repeat-collapse.
+        let ladder_live = self.nested_retry.lock().contains_key(&id);
+        let verdict =
+            tracker::nested_end_verdict(steps.first().map(String::as_str), pre_exit, ladder_live);
+        if verdict != tracker::NestedEnd::Died {
+            log::debug!(
+                "terminal {id}: nested episode ended ({verdict:?}, exit {pre_exit:?}) — retiring"
+            );
+            return false;
+        }
+        if !opt_in {
+            log::info!(
+                "terminal {id}: nested shell died, but auto re-establish is off for this terminal — retiring the breadcrumb"
+            );
+            return false;
+        }
+        // The nested world IS gone, even though we intend to rebuild it, so
+        // everything that describes the live episode retires now — only the
+        // breadcrumb is kept. This is not tidiness: an in-flight hook
+        // injection left armed types its payload into the OUTER shell (a
+        // stray visible line, and the field `clear_nested_chain` would
+        // normally have dropped), and that line then becomes the last command
+        // the outer shell ran — so the NEXT pre reports ITS exit status
+        // instead of ssh's 255, and the ladder reads the second death as a
+        // deliberate exit and gives up. Probe `nested_death_reinstate` caught
+        // exactly that.
+        self.nested_open.lock().remove(&id);
+        self.nesthooks.lock().remove(&id);
+        {
+            let mut state = self.state.lock();
+            if let Some(t) = state.terminal_mut(id) {
+                if t.inner_cli.as_ref().is_some_and(|c| c.nested) {
+                    t.inner_cli = None;
+                    state.save_logged("nested cli cleared (link died)");
+                }
+            }
+        }
+        let attempt = {
+            let mut map = self.nested_retry.lock();
+            let n = map.entry(id).or_insert(0);
+            let cur = *n;
+            *n += 1;
+            cur
+        };
+        // The ssh ladder's own table in MANUAL mode: 2s, 10s, 30s, then 30s
+        // forever. "Keep trying until my server is back" is exactly the ask,
+        // and the user can stop it the same way any supervision stops.
+        let delay = reconnect::reconnect_backoff_after_for_nested(attempt);
+        if self.arm_nested_reinstate(id, steps, attempt, delay) {
+            return true;
+        }
+        self.nested_retry.lock().remove(&id);
+        false
+    }
+
+    /// typed-ssh-nested, exec-less lane: open a nested episode from the
+    /// SubmitCommand ledger for a family that has NO exec hook.
+    ///
+    /// `open_nested_chain` fires from `track_hook_exec` only — i.e. only when
+    /// a shell's exec hook reports the command. cmd.exe has no exec hook at
+    /// all (`bootstrap::cmd_prompt_value`: a `PROMPT` macro is the only
+    /// per-prompt code cmd has, it cannot carry a payload, and block records
+    /// come from the SubmitCommand ledger instead). So a crossing opener run
+    /// in a cmd terminal opened no episode whatsoever: no breadcrumb, no hook
+    /// injection, no cwd crossover, no recovery — which is exactly what the
+    /// second user's data shows (four cmd terminals, long-lived `ssh …`
+    /// inside each, every `nested_chain` null).
+    ///
+    /// The ledger carries the same fact the exec hook would have, so it is
+    /// classified here with the same two predicates `track_hook_exec` uses.
+    /// Deliberately gated to `ShellFamily::Cmd`: pwsh/WSL/ssh already open the
+    /// episode from their real exec hook, and letting a second lane open it
+    /// would double-arm the hook injection.
+    fn open_nested_chain_execless(&self, id: Uuid, cmd: &str) {
+        // A live episode's deeper hops belong to `append_nested_chain`.
+        if self.nested_open.lock().contains(&id) {
+            return;
+        }
+        if !(tracker::nested_shell_cmd(cmd) && tracker::crosses_to_posix(cmd)) {
+            return;
+        }
+        let cwd = {
+            let state = self.state.lock();
+            let Some(t) = state.terminal(id) else { return };
+            if !matches!(
+                crate::state::shell_family(&t.kind, &t.program, &t.args),
+                crate::state::ShellFamily::Cmd
+            ) {
+                return;
+            }
+            t.live_cwd.clone().unwrap_or_else(|| t.cwd.clone())
+        };
+        self.open_nested_chain(id, cmd, &cwd);
+    }
+
     /// F1 spec §2.5 — the single retirement point: runtime marker, the
     /// breadcrumb chain, and a nested-tagged inner_cli (NEVER a non-nested
     /// one) all clear together. Change-gated: one state lock, one save, one
     /// Snapshot; a terminal with nothing nested pays a marker probe only.
     fn clear_nested_chain(&self, id: Uuid, why: &str) {
         let had_marker = self.nested_open.lock().remove(&id);
+        // nested-death reinstate: retiring the breadcrumb ends any replay
+        // ladder with it — there is nothing left to replay, and the next
+        // death must start at the first rung.
+        self.nested_retry.lock().remove(&id);
         // nested-shell-hooks: the nested world is gone, so its injection
         // bookkeeping is too (the tokens themselves were already retired by
         // `pop_nested_below` when the outer shell spoke).
@@ -3977,6 +4137,10 @@ impl Core {
         // the breadcrumb when it is itself a nested-shell spawn (deeper
         // hop). Both-gated inside: runtime marker + classifier.
         self.append_nested_chain(id, &chain_cmd);
+        // typed-ssh-nested, cmd lane: for a family with no exec hook this
+        // ledger IS the witness, so a crossing opener submitted here opens
+        // the episode that `track_hook_exec` would have opened elsewhere.
+        self.open_nested_chain_execless(id, &chain_cmd);
     }
 
     /// D14 (P6b §5.3) — the exec-less at-prompt evidence for Cmd-family
@@ -4873,6 +5037,7 @@ pub fn run() -> anyhow::Result<()> {
         expected_exits: Mutex::new(HashSet::new()),
         reconnects: Mutex::new(HashMap::new()),
         reestablish: Mutex::new(HashMap::new()),
+        nested_retry: Mutex::new(HashMap::new()),
         nesthooks: Mutex::new(HashMap::new()),
         probe_rt: Arc::new(remote_probe::Runtime::new()),
         probing: Mutex::new(HashSet::new()),

@@ -204,22 +204,91 @@ pub fn shell_family(kind: &TermKind, program: &str, args: &[String]) -> ShellFam
 /// synthesized `--cd/--exec` tail is added per-spawn and never persisted in
 /// meta.args, so it never reaches this classifier.
 fn wsl_family(args: &[String]) -> ShellFamily {
-    match args {
-        [] => ShellFamily::WslShell { distro: None },
-        [flag, distro] if flag == "-d" || flag == "--distribution" => ShellFamily::WslShell {
-            distro: Some(distro.clone()),
-        },
-        _ => ShellFamily::Other,
+    let mut distro = None;
+    let mut i = 0;
+    while i < args.len() {
+        // Value-consuming flags we can hook a terminal through. `-u/--user`
+        // joined `-d/--distribution` here because `wsl -u root` is an
+        // ordinary interactive shell and the synthesized tail
+        // (`--cd … --exec /bin/sh -c …`) composes with it cleanly.
+        //
+        // `--cd` and `--shell-type` are deliberately NOT accepted at
+        // TERMINAL level, even though `wsl_interactive_shell` accepts them
+        // for a TYPED opener: `synth_wsl_args` already emits its own `--cd`
+        // (cwd tracking owns it) and its own `--exec`, so a user-supplied
+        // one would be duplicated and silently overridden. Refusing is the
+        // honest answer; the typed lane has no such tail and so has no such
+        // conflict.
+        match args[i].as_str() {
+            "-d" | "--distribution" => {
+                let Some(v) = args.get(i + 1) else {
+                    return ShellFamily::Other;
+                };
+                distro = Some(v.clone());
+                i += 2;
+            }
+            "-u" | "--user" => {
+                if args.get(i + 1).is_none() {
+                    return ShellFamily::Other;
+                }
+                i += 2;
+            }
+            // An unrecognised flag, `-e`/`--exec`/`--`, or a bare operand
+            // (which is a COMMAND, not a shell) — the exotic-argv doctrine.
+            _ => return ShellFamily::Other,
+        }
     }
+    ShellFamily::WslShell { distro }
 }
 
-/// typed-ssh-nested: is this `wsl` argv (WITHOUT argv[0]) the bare
-/// interactive shape? Deliberately the SAME two shapes `wsl_family` hooks —
-/// a bare spawn or `-d <distro>` — so a typed `wsl` and a `wsl` TERMINAL can
-/// never disagree about whether the world behind them is one Pulse hooks.
-/// Anything else (`wsl -e …`, `wsl --system`, a command tail) is false.
+/// typed-ssh-nested: does this `wsl` argv (WITHOUT argv[0]) land the user in
+/// an interactive shell?
+///
+/// Field report ("WSL instances are still a little iffy"): this used to be
+/// `matches!(args, [] | ["-d" | "--distribution", _])` — only the two bare
+/// shapes. `wsl -u root`, `wsl --cd /tmp` and `wsl -d Ubuntu -u root` are
+/// perfectly ordinary interactive invocations, and all of them fell through,
+/// which is not a quiet degradation: a typed opener that does not classify
+/// gets no breadcrumb, no hook injection into the distro, and — worst — the
+/// Win32 cwd tracker keeps stamping the LOCAL Windows path over the POSIX one
+/// the user is actually sitting in.
+///
+/// Now gated with the same discipline `ssh_interactive_login` applies to
+/// OpenSSH's `-i`/`-p` and `strip_env_prefix` applies to `env` assignments:
+/// known flags are consumed with their values, and anything else — an
+/// unrecognised flag, `-e`/`--exec`/`--`, or a bare operand (which is a
+/// COMMAND, so the session is finite) — is FALSE. A flag-value miss is false
+/// too, never a guess.
+///
+/// Known interactive-preserving flags: `-d`/`--distribution`, `-u`/`--user`,
+/// `--cd`, `--shell-type` (except `none`, which asks for no shell at all).
+/// `--system` is deliberately excluded: it opens Microsoft's internal system
+/// distro, which is not the user's shell and may not even have bash.
+///
+/// This is a strict SUPERSET of the shapes `wsl_family` hooks at TERMINAL
+/// level, and that divergence is deliberate — see `wsl_family` for why `--cd`
+/// and `--shell-type` cannot ride a spawn. The question the two answer is the
+/// same ("is the world behind this a POSIX shell Pulse can hook"); only the
+/// terminal lane additionally has to compose a synthesized argv tail.
 pub fn wsl_interactive_shell(args: &[&str]) -> bool {
-    matches!(args, [] | ["-d" | "--distribution", _])
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if !matches!(
+            a,
+            "-d" | "--distribution" | "-u" | "--user" | "--cd" | "--shell-type"
+        ) {
+            return false;
+        }
+        let Some(v) = args.get(i + 1) else {
+            return false; // flag-value miss ⇒ never a false positive
+        };
+        if a == "--shell-type" && *v == "none" {
+            return false; // explicitly asks for no shell
+        }
+        i += 2;
+    }
+    true
 }
 
 /// The ssh destination (host) an argv addresses — the first non-flag arg,

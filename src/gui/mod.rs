@@ -1,5 +1,9 @@
 //! The GUI shell: folder sidebar + terminal area, all state served by the daemon.
 
+/// Accessibility-tree safety: keeps egui's focused-widget id and the AccessKit
+/// node list in agreement so `accesskit_consumer` cannot panic the process
+/// (the v0.1.18 "Focused ID … is not in the node list" field crash).
+pub mod a11y;
 mod bindings;
 /// Public within the crate: the gate-replay probe drives `ComposerState` +
 /// `gate()` against real session bytes (pure logic, GUI-free).
@@ -1263,6 +1267,56 @@ fn prefs_path() -> PathBuf {
 /// consent state (hook-host verdicts, paste_warn, "never ask again"), and
 /// silently defaulting over a corrupt file would re-prompt for everything
 /// AND destroy the evidence on the next save.
+/// Coalescing window for font-size writes. A wheel zoom is 5-20 notches and
+/// every write is an fsync on the paint thread (R3-5).
+const FONT_SAVE_THROTTLE: Duration = Duration::from_millis(500);
+
+/// What a font-size step should do about persistence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FontSave {
+    /// Write gui.json now — this step is outside the coalescing window, so
+    /// nothing is pending to carry it and an abrupt exit would lose it.
+    Now,
+    /// A write happened moments ago; arm the trailing save instead.
+    Defer,
+}
+
+/// Leading-edge throttle for font-size persistence.
+///
+/// `last_write` is when font_size last reached disk. The first step of a
+/// gesture (and the first step after the window lapses) writes immediately;
+/// steps inside the window only arm the trailing save that `logic()` flushes.
+///
+/// Pure so the policy is testable without an `App` or an event loop — the
+/// debounce-only predecessor was untestable, which is how "font size does not
+/// persist" shipped.
+fn font_save_plan(last_write: Option<Instant>, now: Instant) -> FontSave {
+    match last_write {
+        Some(t) if now.saturating_duration_since(t) < FONT_SAVE_THROTTLE => FontSave::Defer,
+        _ => FontSave::Now,
+    }
+}
+
+/// Atomically replace `path` with `prefs` (temp file + fsync + rename), so a
+/// power cut can never leave a truncated gui.json.
+///
+/// Split out of `App::save_prefs` so the save/load pair can be exercised on a
+/// real file by tests; `save_prefs` is the `&self` wrapper that logs.
+fn write_prefs(path: &std::path::Path, prefs: &Prefs) -> std::io::Result<()> {
+    use std::io::Write;
+    let data = serde_json::to_vec_pretty(prefs)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(&data)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 fn load_prefs(path: &std::path::Path) -> Prefs {
     let Ok(bytes) = std::fs::read(path) else {
         return Prefs::default(); // no file yet — first run
@@ -1518,11 +1572,16 @@ pub struct App {
     /// zoom). A cell-metric change with a recent step is a deliberate user
     /// action, not a DPI/monitor-hop flap.
     font_step_t0: Option<Instant>,
-    /// R3-5: pending debounced prefs save (font_size only — a zoom gesture is
+    /// R3-5: pending TRAILING prefs save (font_size only — a zoom gesture is
     /// 5-20 wheel notches and each save_prefs is an fsync on the paint
     /// thread). Flushed by logic() once due, and on exit. Consent answers
     /// keep their immediate save_prefs().
     prefs_save_due: Option<Instant>,
+    /// When font_size was last actually written to gui.json. Drives the
+    /// LEADING edge of the throttle in [`App::font_step`]: the first step of
+    /// a gesture is persisted at once, so the change cannot be lost by an
+    /// exit that never reaches `on_exit`. See [`font_save_plan`].
+    font_last_write: Option<Instant>,
     /// ssh-drop (#26): the toast stack — bottom-right of the central area,
     /// shown at the end of `ui()`. The app's first toast surface (§5).
     toasts: toast::Toasts,
@@ -1692,6 +1751,10 @@ impl App {
         }
         install_fonts(&cc.egui_ctx);
         style(&cc.egui_ctx);
+        // Must be installed before the first frame: it is the only thing
+        // standing between a stale focus id and an accesskit_consumer panic
+        // that takes the whole process down (see `gui::a11y`).
+        a11y::install(&cc.egui_ctx);
 
         let mut prefs = load_prefs(&prefs_path());
         // #34 Axis 7: post-update boot detection. `updated_from` is Some only
@@ -1790,6 +1853,7 @@ impl App {
             font_perf: None,
             font_step_t0: None,
             prefs_save_due: None,
+            font_last_write: None,
             toasts: toast::Toasts::default(),
             uploads: ssh_drop::Uploads::new(cc.egui_ctx.clone()),
             pending_ssh_drop: None,
@@ -1833,10 +1897,29 @@ impl App {
             return;
         }
         self.prefs.font_size = new;
-        // Debounced (R3-5): persist 500ms after the LAST step of the gesture.
-        // A power cut inside the window loses only the final zoom level.
-        self.prefs_save_due = Some(Instant::now() + Duration::from_millis(500));
         let now = Instant::now();
+        // Leading-edge throttle (field bug: "font size does not survive a
+        // restart"). The old code was debounce-ONLY: the write happened 500ms
+        // later from `logic()`, or from `on_exit()`. font_size was the only
+        // pref with no inline write — every consent/toggle calls save_prefs()
+        // directly — so it was the only one an exit that never reaches
+        // `on_exit` could silently discard: a panic (v0.1.18 shipped one, see
+        // `gui::a11y`), the updater's `process::exit(0)` in update.rs, a
+        // kill, a Windows session end. Now the FIRST step of a gesture is on
+        // disk immediately and only the steps inside the window are
+        // coalesced, which keeps R3-5's point (a 20-notch wheel zoom is two
+        // fsyncs, not twenty) without betting the user's setting on a
+        // later frame ever happening.
+        match font_save_plan(self.font_last_write, now) {
+            FontSave::Now => {
+                self.save_prefs();
+                self.font_last_write = Some(now);
+                self.prefs_save_due = None;
+            }
+            FontSave::Defer => {
+                self.prefs_save_due = Some(now + FONT_SAVE_THROTTLE);
+            }
+        }
         self.font_step_t0 = Some(now);
         if self.perf3.is_some() {
             log::info!("[perf] fontstep click size={new} ms={}", gui_ms());
@@ -1845,25 +1928,10 @@ impl App {
     }
 
     fn save_prefs(&self) {
-        let Ok(data) = serde_json::to_vec_pretty(&self.prefs) else {
-            return;
-        };
-        // Atomic write: fsync a temp file, then rename over the old prefs so a
-        // power cut can never leave a truncated gui.json. C4 honesty: a
-        // silent failure loses consent state ("never ask again" answers) —
-        // the user gets re-prompted with no clue why; log it.
-        let path = prefs_path();
-        let tmp = path.with_extension("json.tmp");
-        let write_tmp = || -> std::io::Result<()> {
-            use std::io::Write;
-            std::fs::create_dir_all(crate::state::data_dir())?;
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&data)?;
-            f.sync_all()?;
-            std::fs::rename(&tmp, &path)?;
-            Ok(())
-        };
-        if let Err(e) = write_tmp() {
+        // Atomic write (see `write_prefs`). C4 honesty: a silent failure loses
+        // consent state ("never ask again" answers) — the user gets
+        // re-prompted with no clue why; log it.
+        if let Err(e) = write_prefs(&prefs_path(), &self.prefs) {
             log::error!("gui.json save failed (consent/prefs may re-prompt): {e}");
         }
     }
@@ -5656,7 +5724,17 @@ impl App {
                 self.launcher = Some(self.fresh_launcher(folder, false));
             }
         }
-        ctx.memory_mut(|m| m.request_focus(Id::new("launcher_q")));
+        // The query field is normally painted later in THIS frame (the
+        // launcher draws after input handling), which is why a plain
+        // `request_focus` has worked. It is not guaranteed though — an embed
+        // created here renders next frame — and a focus request naming a
+        // widget that is not painted in the same pass is exactly the
+        // accesskit_consumer crash. Arming the field's own claim is correct in
+        // both orders: `launcher_q` takes it the moment it paints.
+        if let Some(l) = self.launcher.as_mut() {
+            l.focus_req.arm(Id::new("launcher_q"));
+        }
+        ctx.request_repaint();
     }
 
     fn fresh_launcher(&self, folder: Option<Uuid>, embedded: bool) -> LauncherState {
@@ -5900,10 +5978,12 @@ impl eframe::App for App {
                 ctx.request_repaint_after(Duration::from_millis(150));
             }
         }
-        // R3-5: flush the debounced font-size prefs save once the gesture
-        // settles (the 1Hz heartbeat bounds the idle-GUI flush latency).
+        // R3-5: flush the TRAILING font-size save once the gesture settles
+        // (the 1Hz heartbeat bounds the idle-GUI flush latency). The gesture's
+        // leading edge already wrote — see `App::font_step`.
         if self.prefs_save_due.is_some_and(|t| Instant::now() >= t) {
             self.prefs_save_due = None;
+            self.font_last_write = Some(Instant::now());
             self.save_prefs();
         }
         self.reconnect_if_needed(ctx);
@@ -7033,6 +7113,230 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&Prefs::default()).unwrap()).unwrap();
         assert_eq!(load_prefs(&path), Prefs::default());
         assert!(path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Bug 2 (field report): "font size does not persist across restart" ──
+
+    /// The end-to-end round trip the field report says is broken, driven
+    /// through the REAL production pair (`write_prefs` is what `save_prefs`
+    /// calls; `load_prefs` is what `App::new` calls) over a real file:
+    /// change → save → reload → the value is what the user chose.
+    ///
+    /// The pre-existing `prefs_migration_and_round_trip` only round-trips
+    /// serde in memory; nothing covered the disk pair, which is where the
+    /// persistence story actually lives.
+    #[test]
+    fn font_size_survives_save_and_reload() {
+        let dir = std::env::temp_dir().join(format!("tc-font-rt-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("gui.json");
+
+        // First run: no file ⇒ the documented default.
+        let mut prefs = load_prefs(&path);
+        assert_eq!(prefs.font_size, 13.0, "default font size");
+
+        // The user zooms in four notches (what `font_step` does to prefs).
+        for _ in 0..4 {
+            prefs.font_size = (prefs.font_size + 1.0).clamp(8.0, 28.0);
+        }
+        assert_eq!(prefs.font_size, 17.0);
+        write_prefs(&path, &prefs).expect("save must succeed");
+
+        // Restart.
+        let reloaded = load_prefs(&path);
+        assert_eq!(reloaded.font_size, 17.0, "font size must survive a restart");
+        assert_eq!(reloaded, prefs, "and nothing else may drift");
+
+        // A second restart that changes nothing must not revert it either.
+        assert_eq!(load_prefs(&path).font_size, 17.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The clamp is part of the persisted contract: a hand-edited or
+    /// out-of-range gui.json must not survive into an unusable grid, and the
+    /// bounds `font_step` enforces are the ones that round-trip.
+    #[test]
+    fn font_size_bounds_round_trip() {
+        let dir = std::env::temp_dir().join(format!("tc-font-bounds-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("gui.json");
+        for px in [8.0_f32, 13.0, 28.0] {
+            let prefs = Prefs {
+                font_size: px,
+                ..Prefs::default()
+            };
+            write_prefs(&path, &prefs).unwrap();
+            assert_eq!(load_prefs(&path).font_size, px, "{px}px must round-trip");
+        }
+        // Fractional sizes (Ctrl+wheel on a precision device) too.
+        let prefs = Prefs {
+            font_size: 14.5,
+            ..Prefs::default()
+        };
+        write_prefs(&path, &prefs).unwrap();
+        assert_eq!(load_prefs(&path).font_size, 14.5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `write_prefs` replaces an EXISTING file (Windows rename-over) and
+    /// leaves no .tmp behind. A save that silently failed here is exactly the
+    /// "it reverted" symptom, and the atomic-rename path is the one place it
+    /// could.
+    #[test]
+    fn write_prefs_replaces_in_place_atomically() {
+        let dir = std::env::temp_dir().join(format!("tc-font-atomic-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("gui.json");
+        let tmp = path.with_extension("json.tmp");
+
+        write_prefs(
+            &path,
+            &Prefs {
+                font_size: 11.0,
+                ..Prefs::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(load_prefs(&path).font_size, 11.0);
+        assert!(!tmp.exists(), "no temp file left behind");
+
+        // Overwrite an existing gui.json — the case a first run never hits.
+        write_prefs(
+            &path,
+            &Prefs {
+                font_size: 22.0,
+                ..Prefs::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(load_prefs(&path).font_size, 22.0, "replaced, not appended");
+        assert!(!tmp.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE REGRESSION. The persistence policy itself: the first step of a
+    /// gesture writes IMMEDIATELY, so the setting cannot be lost by an exit
+    /// that never reaches `on_exit` (a panic — v0.1.18 shipped one, see
+    /// `gui::a11y` — the updater's `process::exit(0)`, a kill, a session
+    /// end). Steps inside the window still coalesce, so R3-5's fsync budget
+    /// survives.
+    ///
+    /// The old policy was debounce-only and would answer `Defer` here for
+    /// every step, which is the defect.
+    #[test]
+    fn font_save_is_durable_on_the_first_step_of_a_gesture() {
+        let t0 = Instant::now();
+
+        // Nothing written yet ⇒ the very first step must hit disk.
+        assert_eq!(font_save_plan(None, t0), FontSave::Now);
+
+        // Steps inside the coalescing window only arm the trailing save.
+        let just_wrote = Some(t0);
+        assert_eq!(
+            font_save_plan(just_wrote, t0 + Duration::from_millis(1)),
+            FontSave::Defer
+        );
+        assert_eq!(
+            font_save_plan(just_wrote, t0 + FONT_SAVE_THROTTLE - Duration::from_millis(1)),
+            FontSave::Defer
+        );
+
+        // Once the window lapses the next step is durable again, so even a
+        // long continuous zoom keeps landing on disk rather than riding one
+        // ever-postponed trailing save.
+        assert_eq!(
+            font_save_plan(just_wrote, t0 + FONT_SAVE_THROTTLE),
+            FontSave::Now
+        );
+        assert_eq!(
+            font_save_plan(just_wrote, t0 + Duration::from_secs(30)),
+            FontSave::Now
+        );
+    }
+
+    /// A 20-notch wheel zoom must not be 20 fsyncs (R3-5). Replaying the
+    /// policy over a realistic gesture bounds the writes: one per throttle
+    /// window, plus the trailing flush `logic()` does.
+    #[test]
+    fn font_save_coalesces_a_wheel_gesture() {
+        let t0 = Instant::now();
+        let mut last_write: Option<Instant> = None;
+        let mut writes = 0;
+        // 20 notches, ~16ms apart (one per frame) — about 320ms total.
+        for i in 0..20u32 {
+            let now = t0 + Duration::from_millis(u64::from(i) * 16);
+            if font_save_plan(last_write, now) == FontSave::Now {
+                writes += 1;
+                last_write = Some(now);
+            }
+        }
+        assert_eq!(writes, 1, "a 320ms gesture is ONE leading write");
+
+        // A slow deliberate gesture (one step per second) is durable each
+        // time — the user who nudges once and quits must never lose it.
+        let mut last_write: Option<Instant> = None;
+        let mut writes = 0;
+        for i in 0..5u32 {
+            let now = t0 + Duration::from_millis(u64::from(i) * 1000);
+            if font_save_plan(last_write, now) == FontSave::Now {
+                writes += 1;
+                last_write = Some(now);
+            }
+        }
+        assert_eq!(writes, 5, "every settled step is persisted at once");
+    }
+
+    /// DPI contract: the persisted font size is a LOGICAL point size, never
+    /// multiplied by `pixels_per_point`, so the same gui.json renders the same
+    /// on a 1080p and a 4K monitor. The grid converts to physical pixels at
+    /// paint time (`central.rs`: `FontId::monospace(prefs.font_size)` then
+    /// snapping the CELL to whole physical pixels) — the pref itself must stay
+    /// device-independent.
+    ///
+    /// Asserted by measuring the real egui text metrics at two
+    /// `pixels_per_point` values: the LOGICAL row height for a given stored
+    /// size is identical, while the physical height scales — which is exactly
+    /// what "logical" means and what a ppp-scaled pref would break.
+    #[test]
+    fn stored_font_size_is_logical_not_physical() {
+        let stored = 17.0_f32;
+        let font = egui::FontId::monospace(stored);
+        let mut logical = Vec::new();
+        for ppp in [1.0_f32, 1.5, 2.0] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(ppp);
+            let _ = ctx.run_ui(Default::default(), |ui| {
+                ui.label("warm the font atlas");
+            });
+            let h = ctx.fonts_mut(|f| f.row_height(&font));
+            logical.push((ppp, h));
+        }
+        let (_, base) = logical[0];
+        for (ppp, h) in &logical {
+            assert!(
+                (h - base).abs() < 0.001,
+                "row height at ppp={ppp} is {h}, expected the ppp-independent {base} \
+                 — a stored size must be logical points"
+            );
+            // The same size in PHYSICAL pixels does scale with the display.
+            let physical = h * ppp;
+            assert!(
+                (physical - base * ppp).abs() < 0.001,
+                "physical height must track ppp"
+            );
+        }
+
+        // And the value that round-trips through gui.json is that same
+        // logical number, untouched by any display scale.
+        let dir = std::env::temp_dir().join(format!("tc-font-dpi-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("gui.json");
+        write_prefs(
+            &path,
+            &Prefs {
+                font_size: stored,
+                ..Prefs::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(load_prefs(&path).font_size, stored);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

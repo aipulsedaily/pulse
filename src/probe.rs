@@ -11378,6 +11378,291 @@ fn ensure_isolated_daemon(what: &str) -> anyhow::Result<()> {
     )))
 }
 
+/// Is an OpenSSH client available? `case_nested_death_reinstate` drives a
+/// REAL ssh to get a real 255; without one the case skips honestly.
+fn ssh_client_present() -> bool {
+    std::env::var_os("PATH")
+        .map(|p| {
+            std::env::split_paths(&p).any(|d| d.join("ssh.exe").is_file())
+        })
+        .unwrap_or(false)
+}
+
+/// typed-ssh-nested, cmd lane (field report, second user): a crossing opener
+/// run in a **cmd.exe** terminal must open a nested-shell episode.
+///
+/// Pre-fix it did not, and could not: `open_nested_chain` fires only from
+/// `track_hook_exec`, i.e. only from an EXEC hook, and cmd.exe has no exec
+/// hook at all (`bootstrap::cmd_prompt_value` — a `PROMPT` macro is the only
+/// per-prompt code cmd has and it cannot carry a payload). So every `ssh …`
+/// he ran inside cmd was invisible: no breadcrumb, no hook injection, no
+/// recovery. His four terminals all show `nested_chain: null` after 16-hour
+/// ssh sessions. v0.1.15's `pwsh_typed_nested_hooks` covered the pwsh lane
+/// only, which is why this went unnoticed.
+///
+/// The SubmitCommand ledger is cmd's substitute for the exec hook and carries
+/// the same fact. `wsl -d <distro>` stands in for `ssh host` — the same two
+/// classifiers (`nested_shell_cmd` + `crosses_to_posix`) accept both, and it
+/// needs no network or credentials.
+fn case_cmd_nested_episode() -> anyhow::Result<()> {
+    let Some(distro) = wsl_probe_distro() else {
+        return Err(skip("no WSL distro in the Lxss registry".into()));
+    };
+    let opener = format!("wsl -d {distro}");
+    anyhow::ensure!(
+        crate::daemon::tracker::nested_shell_cmd(&opener)
+            && crate::daemon::tracker::crosses_to_posix(&opener),
+        "the probe's own opener must classify as a crossing nested shell"
+    );
+    let log0 = daemon_log_len();
+    let master = master_token()?;
+    let mut c = Conn::open()?;
+    let _ = c.first_snapshot()?;
+    let id = create_cmd_terminal(&mut c, "__probe_cmd_nest__", "C:\\")?;
+    c.send(&C2D::Attach { id, cols: 120, rows: 30 })?;
+    let mut ctl = Conn::open_ctl(&master, None)?;
+    let mut rid = 9700u64;
+    await_hooked_prompt(&mut ctl, &mut rid, id, 60)?;
+
+    // No episode yet — the terminal is a plain hooked cmd.
+    let snap = c.snapshot_until(10, |s| s.terminals.iter().any(|t| t.id == id))?;
+    anyhow::ensure!(
+        snap.terminals
+            .iter()
+            .find(|t| t.id == id)
+            .is_some_and(|t| t.nested_chain.is_none()),
+        "a fresh cmd terminal must carry no breadcrumb"
+    );
+
+    // The crossing opener, through the ledger the composer uses.
+    c.send(&C2D::SubmitCommand {
+        id,
+        cmd: opener.clone(),
+        write: true,
+    })?;
+
+    // THE REGRESSION: pre-fix this snapshot never arrives.
+    let snap = c.snapshot_until(45, |s| {
+        s.terminals
+            .iter()
+            .any(|t| t.id == id && t.nested_chain.is_some())
+    })?;
+    let chain = snap
+        .terminals
+        .iter()
+        .find(|t| t.id == id)
+        .and_then(|t| t.nested_chain.clone())
+        .expect("breadcrumb");
+    anyhow::ensure!(
+        chain.cmds == vec![opener.clone()],
+        "the breadcrumb must record the opener VERBATIM, got {:?}",
+        chain.cmds
+    );
+    let log = log_since(log0);
+    anyhow::ensure!(
+        log.contains(&format!("nested-shell episode opened ({opener})")),
+        "a crossing opener submitted in a cmd terminal must open an episode: {:?}",
+        log.lines()
+            .filter(|l| l.contains("nested"))
+            .collect::<Vec<_>>()
+    );
+
+    // Leaving it the ordinary way retires the breadcrumb — a deliberate exit
+    // keeps today's behaviour exactly (cmd reports no exit status at all, so
+    // the death verdict can never fire here; see `nested_end_verdict`).
+    c.send(&C2D::Input {
+        id,
+        bytes: b"exit\r".to_vec(),
+    })?;
+    c.snapshot_until(45, |s| {
+        s.terminals
+            .iter()
+            .any(|t| t.id == id && t.nested_chain.is_none())
+    })?;
+    let log = log_since(log0);
+    anyhow::ensure!(
+        !log.contains("nested shell died under a live outer shell"),
+        "a cmd terminal must NEVER auto-replay: it has no exit status to judge"
+    );
+    Ok(())
+}
+
+/// nested-death reinstate (field report, second user): when the link under a
+/// typed nested shell DIES while the outer shell stays alive, Pulse must put
+/// the nested world back instead of leaving the user to retype it — and must
+/// replay the opener VERBATIM.
+///
+/// Driven by a real `ssh` that really exits 255: an unresolvable host is the
+/// same failure class as a dropped link (ssh's documented "255 if an error
+/// occurred"), needs no network, no credentials, and no remote host. The
+/// opener deliberately carries a QUOTED path containing spaces, because the
+/// field opener does (`ssh -i "C:\…\hosting.pem" ubuntu@host`) and the replay
+/// must round-trip it byte-exact.
+fn case_nested_death_reinstate() -> anyhow::Result<()> {
+    if !ssh_client_present() {
+        return Err(skip("no ssh.exe on PATH".into()));
+    }
+    // A host that cannot resolve ⇒ ssh exits 255 immediately, which is
+    // exactly the status a dropped link produces.
+    let opener = concat!(
+        r#"ssh -i "C:\tc probe keys\nosuch.pem" "#,
+        "-o BatchMode=yes -o ConnectTimeout=2 ",
+        "tc-probe-nosuchhost.invalid"
+    )
+    .to_string();
+    anyhow::ensure!(
+        crate::daemon::tracker::nested_shell_cmd(&opener)
+            && crate::daemon::tracker::crosses_to_posix(&opener),
+        "the probe's own opener must classify as a crossing nested shell"
+    );
+    anyhow::ensure!(
+        crate::daemon::tracker::nested_end_verdict(Some(&opener), Some(255), false)
+            == crate::daemon::tracker::NestedEnd::Died,
+        "the probe's own opener must read as a death at 255"
+    );
+
+    let log0 = daemon_log_len();
+    let master = master_token()?;
+    let mut c = Conn::open()?;
+    let _ = c.first_snapshot()?;
+    let id = create_probe_terminal(&mut c, "__probe_nest_death__")?;
+    c.send(&C2D::Attach { id, cols: 120, rows: 30 })?;
+    let mut ctl = Conn::open_ctl(&master, None)?;
+    let mut rid = 9800u64;
+    await_hooked_prompt(&mut ctl, &mut rid, id, 90)?;
+    std::thread::sleep(Duration::from_millis(400));
+
+    // Type the opener exactly as a user would. pwsh's exec hook witnesses it
+    // and opens the episode; ssh then dies 255 on its own.
+    c.send(&C2D::Input {
+        id,
+        bytes: format!("{opener}\r").into_bytes(),
+    })?;
+
+    // THE REGRESSION: pre-fix the breadcrumb was retired the moment the
+    // outer prompt came back ("hooked prompt returned") and nothing replayed.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let log = log_since(log0);
+        if log.contains("nested shell died under a live outer shell") {
+            break;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "a dead nested ssh must arm a replay: {:?}",
+            log.lines()
+                .filter(|l| l.contains("nested"))
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let log = log_since(log0);
+    anyhow::ensure!(
+        !log.contains("nested-shell breadcrumb retired"),
+        "the breadcrumb must be KEPT across a death, not retired"
+    );
+    // VERBATIM REPLAY: the logged replay line carries the opener byte-exact,
+    // quotes and spaces intact.
+    anyhow::ensure!(
+        log.contains(&format!("verbatim: {opener}")),
+        "the replay must name the opener byte-exact (quoted key path intact)"
+    );
+
+    // The breadcrumb survived in persisted state too, byte-exact.
+    let snap = c.snapshot_until(20, |s| {
+        s.terminals
+            .iter()
+            .any(|t| t.id == id && t.nested_chain.is_some())
+    })?;
+    let chain = snap
+        .terminals
+        .iter()
+        .find(|t| t.id == id)
+        .and_then(|t| t.nested_chain.clone())
+        .expect("breadcrumb kept");
+    anyhow::ensure!(
+        chain.cmds == vec![opener.clone()],
+        "the kept chain must be the opener VERBATIM, got {:?}",
+        chain.cmds
+    );
+
+    // IDEMPOTENCY / the ladder: the replay fails the same way (the host still
+    // does not resolve), so a SECOND death must climb to attempt 2 rather
+    // than spin or give up.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let log = log_since(log0);
+        if log.contains("(attempt 2,") {
+            break;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "a second death must advance the backoff ladder: {:?}",
+            log.lines()
+                .filter(|l| l.contains("nested shell died"))
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    Ok(())
+}
+
+/// nested-death reinstate, the other half: a DELIBERATE exit must keep
+/// today's behaviour exactly — the breadcrumb retires and nothing is ever
+/// replayed. A session the user closed on purpose must never come back.
+fn case_nested_exit_is_not_a_death() -> anyhow::Result<()> {
+    let Some(distro) = wsl_probe_distro() else {
+        return Err(skip("no WSL distro in the Lxss registry".into()));
+    };
+    let opener = format!("wsl -d {distro}");
+    let log0 = daemon_log_len();
+    let master = master_token()?;
+    let mut c = Conn::open()?;
+    let _ = c.first_snapshot()?;
+    let id = create_probe_terminal(&mut c, "__probe_nest_exit__")?;
+    c.send(&C2D::Attach { id, cols: 120, rows: 30 })?;
+    let mut ctl = Conn::open_ctl(&master, None)?;
+    let mut rid = 9900u64;
+    await_hooked_prompt(&mut ctl, &mut rid, id, 90)?;
+    std::thread::sleep(Duration::from_millis(400));
+
+    c.send(&C2D::Input {
+        id,
+        bytes: format!("{opener}\r").into_bytes(),
+    })?;
+    c.snapshot_until(60, |s| {
+        s.terminals
+            .iter()
+            .any(|t| t.id == id && t.nested_chain.is_some())
+    })?;
+    // Give the nested shell a moment to finish hooking, then leave on purpose.
+    std::thread::sleep(Duration::from_secs(2));
+    c.send(&C2D::Input {
+        id,
+        bytes: b"exit\r".to_vec(),
+    })?;
+
+    // The breadcrumb retires, exactly as before this feature.
+    c.snapshot_until(60, |s| {
+        s.terminals
+            .iter()
+            .any(|t| t.id == id && t.nested_chain.is_none())
+    })?;
+    let log = log_since(log0);
+    anyhow::ensure!(
+        !log.contains("nested shell died under a live outer shell"),
+        "a deliberate exit must NEVER arm a replay: {:?}",
+        log.lines()
+            .filter(|l| l.contains("nested"))
+            .collect::<Vec<_>>()
+    );
+    anyhow::ensure!(
+        log.contains("nested-shell breadcrumb retired"),
+        "a deliberate exit must retire the breadcrumb as it always did"
+    );
+    Ok(())
+}
+
 pub fn run(case: Option<&str>) -> anyhow::Result<()> {
     // Probes are measurement tools: a hidden background probe gets parked on
     // E-cores under foreground load, corrupting flood/latency numbers on the
@@ -11505,6 +11790,9 @@ pub fn run(case: Option<&str>) -> anyhow::Result<()> {
         ("sleep_freeze_frame", case_sleep_freeze_frame),
         ("frame_corrupt_degrade", case_frame_corrupt_degrade),
         ("launcher_claude_cwd", case_launcher_claude_cwd),
+        ("cmd_nested_episode", case_cmd_nested_episode),
+        ("nested_death_reinstate", case_nested_death_reinstate),
+        ("nested_exit_is_not_a_death", case_nested_exit_is_not_a_death),
     ];
 
     let selected: Vec<_> = match case {

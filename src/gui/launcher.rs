@@ -912,6 +912,20 @@ pub struct LauncherState {
     pub built_at: Instant,
     /// §6.1 empty-state embed (inline content, no Area, no close).
     pub embedded: bool,
+    /// Deferred keyboard focus for an expansion field.
+    ///
+    /// The Custom/SSH row toggles are *collected* inside the ScrollArea body
+    /// and *applied* after it (so the row list is not mutated mid-iteration),
+    /// which means the expansion — and therefore its text field — cannot have
+    /// been painted on the frame the row is clicked. Calling
+    /// `request_focus(Id::new("launcher_ssh_host"))` there focused a widget
+    /// that did not exist, which egui forwards verbatim into the AccessKit
+    /// tree and `accesskit_consumer` turns into a process-killing panic
+    /// ("Focused ID … is not in the node list"). See `gui::a11y`.
+    ///
+    /// So the intent is *armed* here and *claimed* by the field itself on the
+    /// next frame, when it is really on screen.
+    pub focus_req: crate::gui::a11y::FocusRequest,
 }
 
 impl LauncherState {
@@ -942,6 +956,7 @@ impl LauncherState {
             built: u64::MAX,
             built_at: Instant::now(),
             embedded,
+            focus_req: Default::default(),
         }
     }
 }
@@ -1168,7 +1183,18 @@ pub fn view(ui: &mut egui::Ui, st: &mut LauncherState, vc: &ViewCtx) -> Launcher
             .frame(egui::Frame::NONE)
             .desired_width(te_rect.width()),
     );
-    if vc.keys_enabled && !st.custom_open && !st.ssh_open && !st.folder_menu {
+    // A focus intent armed when the launcher was opened is claimed here, on
+    // the painted response — never as a bare `request_focus` for an id that
+    // may not exist in this pass (see `LauncherState::focus_req`).
+    let claimed = st.focus_req.take_if(Id::new("launcher_q"));
+    // Still armed after that means the intent belongs to an expansion field
+    // that is about to paint: the query must not snatch focus back from it.
+    let pending_elsewhere = st.focus_req.is_armed();
+    if (claimed || (vc.keys_enabled && !pending_elsewhere))
+        && !st.custom_open
+        && !st.ssh_open
+        && !st.folder_menu
+    {
         te.request_focus();
     }
     if te.changed() {
@@ -1195,10 +1221,18 @@ pub fn view(ui: &mut egui::Ui, st: &mut LauncherState, vc: &ViewCtx) -> Launcher
         }
     }
     if esc {
+        // Collapsing an expansion must also drop any focus intent aimed at a
+        // field inside it: that field is about to stop being painted.
         match esc_act(st.folder_menu, st.custom_open, st.ssh_open) {
             EscAct::CloseFolderMenu => st.folder_menu = false,
-            EscAct::CollapseCustom => st.custom_open = false,
-            EscAct::CollapseSsh => st.ssh_open = false,
+            EscAct::CollapseCustom => {
+                st.custom_open = false;
+                st.focus_req.clear();
+            }
+            EscAct::CollapseSsh => {
+                st.ssh_open = false;
+                st.focus_req.clear();
+            }
             EscAct::Close => {
                 if !vc.embedded {
                     out.close = true;
@@ -1431,13 +1465,19 @@ pub fn view(ui: &mut egui::Ui, st: &mut LauncherState, vc: &ViewCtx) -> Launcher
             }
         });
 
+    // Toggles are applied AFTER the body above, so the expansion they open
+    // paints for the first time on the NEXT frame. Focus is therefore armed,
+    // not requested: `expansion_field` claims it when the field is real.
+    // Requesting it here focused a non-existent widget and killed the process
+    // through the AccessKit tree — see `LauncherState::focus_req`.
     if toggle_custom {
         st.custom_open = !st.custom_open;
         if st.custom_open {
             st.ssh_open = false; // one inline expansion at a time
             st.custom_reveal = true;
-            ui.ctx()
-                .memory_mut(|m| m.request_focus(Id::new("launcher_custom_prog")));
+            st.focus_req.arm(Id::new("launcher_custom_prog"));
+        } else {
+            st.focus_req.clear(); // the field is gone; never focus it later
         }
     }
     if toggle_ssh {
@@ -1445,10 +1485,14 @@ pub fn view(ui: &mut egui::Ui, st: &mut LauncherState, vc: &ViewCtx) -> Launcher
         if st.ssh_open {
             st.custom_open = false;
             st.ssh_reveal = true;
-            ui.ctx()
-                .memory_mut(|m| m.request_focus(Id::new("launcher_ssh_host")));
+            st.focus_req.arm(Id::new("launcher_ssh_host"));
+        } else {
+            st.focus_req.clear();
         }
     }
+    // Age the pending request after the UI has had its chance to claim it, so
+    // a request for an expansion that never opens cannot ambush a later one.
+    st.focus_req.tick();
 
     // ── footer lane (28px, §4.2) — overlay AND the §6.1 empty-state embed.
     // The embed used to skip it entirely, leaving the zero-terminal first
@@ -1508,7 +1552,18 @@ pub fn view(ui: &mut egui::Ui, st: &mut LauncherState, vc: &ViewCtx) -> Launcher
 
 /// One borderless expansion field on a SURFACE_2 well (shared by the custom
 /// and ssh expansions).
-fn expansion_field(ui: &mut egui::Ui, width: f32, id: &str, text: &mut String, hint: &str) {
+///
+/// `focus` carries the deferred focus intent armed when the row was clicked a
+/// frame earlier (see [`LauncherState::focus_req`]): the field claims it here,
+/// where the widget provably exists, so focus can never name an unpainted id.
+fn expansion_field(
+    ui: &mut egui::Ui,
+    width: f32,
+    id: &str,
+    text: &mut String,
+    hint: &str,
+    focus: &mut crate::gui::a11y::FocusRequest,
+) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 28.0), Sense::hover());
     let well = Rect::from_min_max(
         Pos2::new(rect.min.x + 36.0, rect.min.y + 2.0),
@@ -1520,14 +1575,18 @@ fn expansion_field(ui: &mut egui::Ui, width: f32, id: &str, text: &mut String, h
             .max_rect(well.shrink2(Vec2::new(8.0, 3.0)))
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
-    fui.add(
+    let wid = Id::new(id);
+    let resp = fui.add(
         egui::TextEdit::singleline(text)
-            .id(Id::new(id))
+            .id(wid)
             .hint_text(hint)
             .font(FontId::proportional(13.0))
             .frame(egui::Frame::NONE)
             .desired_width(well.width() - 16.0),
     );
+    if focus.take_if(wid) {
+        resp.request_focus();
+    }
     ui.add_space(2.0);
 }
 
@@ -1570,8 +1629,22 @@ fn custom_expansion(
     out: &mut LauncherOut,
 ) {
     ui.add_space(4.0);
-    expansion_field(ui, width, "launcher_custom_prog", &mut st.custom_prog, "program");
-    expansion_field(ui, width, "launcher_custom_args", &mut st.custom_args, "arguments");
+    expansion_field(
+        ui,
+        width,
+        "launcher_custom_prog",
+        &mut st.custom_prog,
+        "program",
+        &mut st.focus_req,
+    );
+    expansion_field(
+        ui,
+        width,
+        "launcher_custom_args",
+        &mut st.custom_args,
+        "arguments",
+        &mut st.focus_req,
+    );
     if expansion_create(ui, width, "launcher_custom_create", ready) {
         out.activate = Some(Activation::Custom {
             prog: st.custom_prog.clone(),
@@ -1604,6 +1677,7 @@ fn ssh_expansion(
         "launcher_ssh_host",
         &mut st.ssh_host,
         "user@host  (ssh flags ok, host last)",
+        &mut st.focus_req,
     );
     // Remote-hooks toggle: accent text affordance, no box (doctrine §7).
     let (trect, _) = ui.allocate_exact_size(Vec2::new(width, 18.0), Sense::hover());

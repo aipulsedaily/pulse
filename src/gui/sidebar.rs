@@ -449,8 +449,15 @@ impl App {
             ui.add_space(12.0);
             if ghost_button(ui, ui.available_width(), "New terminal", Some(Icon::Plus)).clicked()
             {
-                ui.ctx()
-                    .memory_mut(|m| m.request_focus(Id::new("launcher_q")));
+                // The embed lives in the CENTRAL panel: whether it even
+                // exists yet, let alone has painted, depends on panel order
+                // (`central::empty_state` creates it), and focusing an
+                // unpainted id is the accesskit_consumer crash. Route through
+                // the one entry point that both ensures the embed and ARMS
+                // the focus intent for its query field to claim when it
+                // paints.
+                let ctx = ui.ctx().clone();
+                self.open_launcher(&ctx, None);
             }
         }
     }
