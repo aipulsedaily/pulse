@@ -2601,7 +2601,7 @@ impl Core {
         // deliberate exit and gives up. Probe `nested_death_reinstate` caught
         // exactly that.
         self.nested_open.lock().remove(&id);
-        self.nesthooks.lock().remove(&id);
+        self.remove_nesthook(id, None);
         {
             let mut state = self.state.lock();
             if let Some(t) = state.terminal_mut(id) {
@@ -2683,7 +2683,7 @@ impl Core {
         // nested-shell-hooks: the nested world is gone, so its injection
         // bookkeeping is too (the tokens themselves were already retired by
         // `pop_nested_below` when the outer shell spoke).
-        self.nesthooks.lock().remove(&id);
+        self.remove_nesthook(id, None);
         let changed = {
             let mut state = self.state.lock();
             let Some(t) = state.terminal_mut(id) else { return };
@@ -3951,33 +3951,20 @@ impl Core {
                 client.attached.lock().remove(&id);
             }
             C2D::Input { id, bytes } => {
-                // F2: the user typing takes the shell back — any in-flight
-                // nested-chain re-establish stops instantly (our own step
-                // writes go through the session writer directly, never this
-                // arm, so the automation can't cancel itself).
-                self.cancel_reestablish(id, "user input");
-                // nested-shell-hooks: a SUBMITTED line (ends in Enter)
-                // keeps the injection waiting for the next settled prompt;
-                // half-typed bytes hand the shell straight back. Phase 2
-                // always FINISHES (the shell is parked in our `read`).
-                let submitted = bytes.last().is_some_and(|b| *b == b'\r' || *b == b'\n');
-                self.nesthook_on_input(id, submitted);
-                // remote-completion: the user's keystroke supersedes any
-                // in-flight query (flushing a payload the shell is parked on
-                // ahead of these bytes), and the shell is dirty until its
-                // next prompt so no trigger lands in a line or a command.
-                self.comp_on_input(id);
-                // Clone the writer Arc out and write OUTSIDE the sessions
-                // mutex (SubmitCommand's pattern): a full ConPTY input pipe
-                // (app stopped reading stdin) blocks write_all indefinitely,
-                // and holding the global guard across it would wedge every
-                // terminal's input plus every sessions-taking thread.
-                let writer = self.sessions.lock().get(&id).map(|s| s.writer.clone());
-                if let Some(w) = writer {
-                    let mut w = w.lock();
-                    let _ = w.write_all(&bytes);
-                    let _ = w.flush();
-                }
+                // The one input path (`write_user_input`): the user typing
+                // takes the shell back from a chain re-establish (F2),
+                // supersedes a completion query (flushing a payload the shell
+                // is parked on ahead of these bytes), and is routed around a
+                // hook injection — a submitted line keeps it waiting for the
+                // shell's answer, half-typed bytes abandon it, and input that
+                // arrives while the shell is parked in its `read`s is HELD
+                // and written right after the payload. Pulse's own lines are
+                // typed under the same per-terminal writer lock, so nothing
+                // can interleave. The writer is cloned out of the sessions
+                // map first (a full ConPTY input pipe blocks write_all
+                // indefinitely; the global guard must never be held across
+                // it).
+                let _ = self.write_user_input(id, &bytes, "user input");
             }
             C2D::Resize { id, cols, rows } => self.do_resize(id, cols, rows),
 
@@ -4160,11 +4147,11 @@ impl Core {
         // F2: a composer submission is the user driving the shell — any
         // in-flight nested-chain re-establish stops.
         self.cancel_reestablish(id, "user input");
-        // A composer submission is a whole line: the injection keeps waiting
-        // for the prompt that comes back after it (nested-shell-hooks).
-        self.nesthook_on_input(id, true);
         // remote-completion: a submission supersedes any in-flight query and
-        // closes the lane until the next prompt (see `comp_on_input`).
+        // closes the lane until the next prompt (see `comp_on_input`). The
+        // hook injection is told at the WRITE below (`write_user_input`): a
+        // refused submission types nothing, so it must not make the
+        // injection wait for an answer that will never come.
         self.comp_on_input(id);
         if let Err(msg) = validate_submit_command(&cmd) {
             log::warn!("SubmitCommand for {id} refused: {msg}");
@@ -4200,8 +4187,7 @@ impl Core {
                     return;
                 }
             };
-            let writer = self.sessions.lock().get(&id).map(|s| s.writer.clone());
-            let Some(w) = writer else {
+            if !self.sessions.lock().contains_key(&id) {
                 log::debug!("SubmitCommand: terminal {id} is not running");
                 if let Some(f) = frame_bytes(&D2C::Error {
                     message: "SubmitCommand refused: terminal is not running".into(),
@@ -4209,12 +4195,11 @@ impl Core {
                     client.enqueue(&f);
                 }
                 return;
-            };
-            {
-                let mut w = w.lock();
-                let _ = w.write_all(&bytes);
-                let _ = w.flush();
             }
+            // The one input path: a whole line (the hook injection keeps
+            // waiting for the shell's answer to it, or holds it while the
+            // shell is parked in the injection's reads).
+            let _ = self.write_user_input(id, &bytes, "user input");
             self.open_synthetic(id, cmd, at_off);
         } else {
             // Record-only: the bytes already went via Input (a GUI-observed
