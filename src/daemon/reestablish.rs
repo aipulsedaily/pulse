@@ -242,6 +242,18 @@ pub(crate) fn growth_watch(since_sent: Duration, has_more_steps: bool) -> WatchA
 /// typed the next chain step, or a session-restoring resume, into a shell
 /// whose identity was never positively confirmed. A chain that cannot prove
 /// where it is stops and leaves the user the manual line.
+///
+/// `tail_wants_secret`: the settled screen's last line is a credential or
+/// host-key prompt. It overrides `Absent` — the injection "resolving" by
+/// giving up on exactly such a prompt is the commonest way to get there on a
+/// slow link. The step's own watcher judges "settled" by 700ms of silence,
+/// and an ssh handshake over a ~600ms-RTT link is several seconds of
+/// silence, so the step "settles" before ssh has asked anything and the next
+/// line is held for the injection; the password prompt arrives, the injection
+/// aborts on it (Absent), and the held line — `sudo su`, or the resume
+/// `claude --dangerously-skip-permissions` — was then typed straight into
+/// ssh's password prompt as a login attempt. Credentials are never typed, and
+/// neither is anything else into a credential prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HoldAction {
     Wait,
@@ -249,13 +261,13 @@ pub(crate) enum HoldAction {
     Abort,
 }
 
-pub(crate) fn hold_action(expired: bool, nest: NestState) -> HoldAction {
-    if resume_may_send(nest) {
-        HoldAction::Send
-    } else if expired {
-        HoldAction::Abort
-    } else {
-        HoldAction::Wait
+pub(crate) fn hold_action(expired: bool, nest: NestState, tail_wants_secret: bool) -> HoldAction {
+    match nest {
+        NestState::Hooked => HoldAction::Send,
+        NestState::Absent if tail_wants_secret => HoldAction::Abort,
+        NestState::Absent => HoldAction::Send,
+        NestState::Pending if expired => HoldAction::Abort,
+        NestState::Pending => HoldAction::Wait,
     }
 }
 
@@ -492,30 +504,55 @@ impl Core {
     /// the re-established nested shell AND its exec hook will attribute the
     /// CLI (spec-I1 ordering intact, now with attribution).
     pub(super) fn reestablish_on_nested_pre(&self, id: Uuid) {
-        let entry = {
+        self.finish_resume(
+            id,
+            |p| matches!(p, Phase::AwaitNestedPrompt { .. }),
+            "the nested shell's hooked prompt settled",
+        );
+    }
+
+    /// Type the parked/settled inner-CLI resume, or leave the manual hint —
+    /// for the entry still in a phase `expect` accepts.
+    ///
+    /// The entry is taken out of the map HERE, under the terminal's PTY
+    /// writer lock, and the resume is typed before that lock is released.
+    /// Callers used to remove it first and type after, unlocked: input that
+    /// arrived in between found nothing to cancel, was written, and the resume
+    /// was then typed onto the end of it — a half-typed `rm -rf ./build `
+    /// followed by ` cd '/srv/app' && claude --resume …` is one command. User
+    /// input cancels this engine under the same lock (`write_user_input`), so
+    /// now either the input lands first and the resume is never typed, or the
+    /// resume is typed whole and the input follows it.
+    fn finish_resume(&self, id: Uuid, expect: fn(&Phase) -> bool, why: &str) {
+        let session = self
+            .sessions
+            .lock()
+            .get(&id)
+            .map(|s| (s.writer.clone(), s.gen));
+        let mut guard = session.as_ref().map(|(w, _)| w.lock());
+        let e = {
             let mut map = self.reestablish.lock();
-            match map.get(&id).map(|e| e.phase) {
-                Some(Phase::AwaitNestedPrompt { .. }) => map.remove(&id),
+            match map.get(&id) {
+                Some(e) if expect(&e.phase) => map.remove(&id),
+                // Cancelled (user input, abort) or moved on: type nothing.
                 _ => None,
             }
         };
-        let Some(e) = entry else { return };
-        self.finish_resume(id, &e, "the nested shell's hooked prompt settled");
-    }
-
-    /// Type the parked/settled inner-CLI resume, or leave the manual hint.
-    fn finish_resume(&self, id: Uuid, e: &Reestablish, why: &str) {
-        let live = self.sessions.lock().get(&id).map(|s| s.gen);
-        if live != Some(e.spawn_gen) {
+        let Some(e) = e else { return };
+        if session.as_ref().map(|(_, gen)| *gen) != Some(e.spawn_gen) {
             log::info!(
                 "terminal {id}: nested chain re-establish abandoned — the session was relaunched under a new generation; the inner-CLI resume is not typed"
             );
-            self.push_resume_hint(id, e);
+            self.push_resume_hint(id, &e);
             return;
         }
         let n = e.steps.len();
+        let typed = match (&e.resume, guard.as_mut()) {
+            (Some(cmd), Some(w)) => nesthook::write_line(&mut ***w, cmd),
+            _ => false,
+        };
         match &e.resume {
-            Some(cmd) if self.type_reestablish_line(id, cmd) => {
+            Some(cmd) if typed => {
                 log::info!(
                     "terminal {id}: nested chain re-established ({n} step(s) typed, {why}); resuming the inner CLI: {cmd}"
                 );
@@ -524,7 +561,7 @@ impl Core {
                 log::info!(
                     "terminal {id}: nested chain re-established ({n} step(s) typed) but the session is gone — inner-CLI resume skipped"
                 );
-                self.push_resume_hint(id, e);
+                self.push_resume_hint(id, &e);
             }
             None => {
                 log::info!("terminal {id}: nested chain re-established ({n} step(s) typed)");
@@ -538,7 +575,6 @@ impl Core {
     pub(super) fn type_reestablish_line(&self, id: Uuid, cmd: &str) -> bool {
         let writer = self.sessions.lock().get(&id).map(|s| s.writer.clone());
         let Some(w) = writer else { return false };
-        use std::io::Write;
         let mut w = w.lock();
         // EVERY leg is load-bearing. Discarding these errors and returning
         // `true` reported a send that never reached the PTY - the caller
@@ -546,9 +582,7 @@ impl Core {
         // that failed, which is the "sends after uncertainty" class in its
         // purest form. A half-written line is worse than none, so the caller
         // abandons this generation.
-        let ok = w.write_all(cmd.as_bytes()).is_ok()
-            && w.write_all(b"\r").is_ok()
-            && w.flush().is_ok();
+        let ok = nesthook::write_line(&mut **w, cmd);
         if !ok {
             log::warn!(
                 "terminal {id}: the PTY write failed mid-line - this re-establish generation is abandoned"
@@ -559,6 +593,11 @@ impl Core {
 
     /// Type steps[idx], then move the entry to Watch with the CURRENT
     /// journal length as the quiescence base.
+    ///
+    /// The entry is checked and the step typed under the terminal's PTY
+    /// writer lock — the lock user input takes to cancel this engine — so a
+    /// step can never be typed onto the end of a line the user started in
+    /// the same instant (see `finish_resume`).
     fn send_reestablish_step(&self, id: Uuid, idx: usize) {
         if !self.reestablish_gen_ok(id) {
             self.cancel_reestablish(
@@ -567,35 +606,51 @@ impl Core {
             );
             return;
         }
-        let cmd = match self.reestablish.lock().get(&id) {
-            Some(e) => match e.steps.get(idx) {
-                Some(c) => c.clone(),
-                None => return,
-            },
-            None => return,
-        };
-        let total = self.reestablish.lock().get(&id).map(|e| e.steps.len()).unwrap_or(0);
-        log::info!(
-            "terminal {id}: nested chain re-establish — typing step {}/{}: {cmd}",
-            idx + 1,
-            total
-        );
-        if !self.type_reestablish_line(id, &cmd) {
+        let Some(writer) = self.sessions.lock().get(&id).map(|s| s.writer.clone()) else {
             self.cancel_reestablish(id, "session gone before the step could be typed");
             return;
-        }
-        let len = self
-            .journal(id)
-            .map(|j| j.lock().absolute_len())
-            .unwrap_or(0);
-        let now = Instant::now();
-        if let Some(e) = self.reestablish.lock().get_mut(&id) {
-            e.idx = idx;
-            e.phase = Phase::Watch {
-                sent: now,
-                last_len: len,
-                last_change: now,
+        };
+        let typed = {
+            let mut w = writer.lock();
+            let (cmd, total) = match self.reestablish.lock().get(&id) {
+                Some(e) => match e.steps.get(idx) {
+                    Some(c) => (c.clone(), e.steps.len()),
+                    None => return,
+                },
+                // Cancelled by input that won the lock: type nothing.
+                None => return,
             };
+            log::info!(
+                "terminal {id}: nested chain re-establish — typing step {}/{}: {cmd}",
+                idx + 1,
+                total
+            );
+            // Measured BEFORE the write, so the step's own echo counts as
+            // output the watcher waits out.
+            let len = self
+                .journal(id)
+                .map(|j| j.lock().absolute_len())
+                .unwrap_or(0);
+            if nesthook::write_line(&mut **w, &cmd) {
+                let now = Instant::now();
+                if let Some(e) = self.reestablish.lock().get_mut(&id) {
+                    e.idx = idx;
+                    e.phase = Phase::Watch {
+                        sent: now,
+                        last_len: len,
+                        last_change: now,
+                    };
+                }
+                true
+            } else {
+                false
+            }
+        };
+        if !typed {
+            log::warn!(
+                "terminal {id}: the PTY write failed mid-line - this re-establish generation is abandoned"
+            );
+            self.cancel_reestablish(id, "session gone before the step could be typed");
         }
     }
 
@@ -657,18 +712,20 @@ impl Core {
                 .collect();
             (sends, watches)
         };
+        // A line held for an injection that gave up is released only if the
+        // screen is not now asking for a secret (see `hold_action`).
+        const SECRET_ABORT: &str = "a prompt only you can answer appeared (a credential, or a host key to confirm) — finish it manually; Pulse never types into those";
         for (id, since) in parked {
-            match hold_action(
-                now.duration_since(since) >= NESTED_HOOK_WAIT,
-                self.nesthook_state(id),
-            ) {
+            let nest = self.nesthook_state(id);
+            let secret = nest == NestState::Absent && self.tail_wants_secret(id);
+            match hold_action(now.duration_since(since) >= NESTED_HOOK_WAIT, nest, secret) {
                 HoldAction::Wait => {}
-                HoldAction::Send => {
-                    let entry = self.reestablish.lock().remove(&id);
-                    if let Some(e) = entry {
-                        self.finish_resume(id, &e, "the nested shell's hook injection resolved");
-                    }
-                }
+                HoldAction::Send => self.finish_resume(
+                    id,
+                    |p| matches!(p, Phase::AwaitNestedPrompt { .. }),
+                    "the nested shell's hook injection resolved",
+                ),
+                HoldAction::Abort if secret => self.cancel_reestablish(id, SECRET_ABORT),
                 HoldAction::Abort => self.cancel_reestablish(
                     id,
                     "the nested shell never resolved its hooks within the wait — the resume is not typed into an unconfirmed shell (the manual line is in the preface)",
@@ -680,12 +737,12 @@ impl Core {
         // release it anyway once the hold outlives that give-up, so an
         // unhookable link never costs the rest of the chain.
         for (id, next, since) in step_holds {
-            match hold_action(
-                now.duration_since(since) >= NESTED_HOOK_WAIT,
-                self.nesthook_state(id),
-            ) {
+            let nest = self.nesthook_state(id);
+            let secret = nest == NestState::Absent && self.tail_wants_secret(id);
+            match hold_action(now.duration_since(since) >= NESTED_HOOK_WAIT, nest, secret) {
                 HoldAction::Wait => {}
                 HoldAction::Send => self.send_reestablish_step(id, next),
+                HoldAction::Abort if secret => self.cancel_reestablish(id, SECRET_ABORT),
                 // CONTAINMENT (was: "typing on"): the previous hop was never
                 // positively confirmed, so the next step would be typed into
                 // whatever shell actually holds the line. A partially-entered
@@ -744,23 +801,10 @@ impl Core {
             }
             let quiet_for = now.duration_since(last_change);
             let since_sent = now.duration_since(sent);
-            // The credential check reads the settled screen's LAST non-blank
-            // line (mirror truth — same grid ctl `read --screen` serializes).
-            let tail_line = || self.last_screen_line(id).unwrap_or_default();
-            // typed-ssh-nested: a replayed `ssh <host>` step can land on the
-            // host-key question just as easily as on a password prompt — both
-            // are answers only the user may give, so both abort the chain.
             let action = watch_action(
                 since_sent,
                 quiet_for,
-                quiet_for >= STEP_QUIET && {
-                    let tail = tail_line();
-                    credential_prompt_line(&tail)
-                        || matches!(
-                            crate::gui::composer::detect_auth_prompt(&tail),
-                            crate::gui::composer::AuthPrompt::HostKey
-                        )
-                },
+                quiet_for >= STEP_QUIET && self.tail_wants_secret(id),
                 has_more,
             );
             match action {
@@ -824,19 +868,36 @@ impl Core {
                             }
                         }
                     }
-                    let Some(e) = self.reestablish.lock().remove(&id) else {
-                        continue;
-                    };
-                    debug_assert_eq!(
-                        e.idx + 1,
-                        e.steps.len(),
-                        "Done edge requires the LAST chain step to have settled"
-                    );
+                    if let Some(e) = self.reestablish.lock().get(&id) {
+                        debug_assert_eq!(
+                            e.idx + 1,
+                            e.steps.len(),
+                            "Done edge requires the LAST chain step to have settled"
+                        );
+                    }
                     debug_assert!(resume_may_type(action), "Done is the only resume edge");
-                    self.finish_resume(id, &e, "every chain step settled");
+                    self.finish_resume(
+                        id,
+                        |p| matches!(p, Phase::Watch { .. }),
+                        "every chain step settled",
+                    );
                 }
             }
         }
+    }
+
+    /// Is the settled screen asking for something only the user may answer?
+    /// Reads the LAST non-blank line (mirror truth — the same grid ctl `read
+    /// --screen` serializes). typed-ssh-nested: a replayed `ssh <host>` can
+    /// land on the host-key question just as easily as on a password prompt,
+    /// so both count.
+    pub(super) fn tail_wants_secret(&self, id: Uuid) -> bool {
+        let tail = self.last_screen_line(id).unwrap_or_default();
+        credential_prompt_line(&tail)
+            || matches!(
+                crate::gui::composer::detect_auth_prompt(&tail),
+                crate::gui::composer::AuthPrompt::HostKey
+            )
     }
 
     /// Last non-blank line of the live mirror screen (the grid `read
@@ -1002,20 +1063,49 @@ mod tests {
     fn hold_action_refuses_to_type_after_an_unconfirmed_hop() {
         // Resolved: send, deadline or not.
         for expired in [false, true] {
-            assert_eq!(hold_action(expired, NestState::Hooked), HoldAction::Send);
-            assert_eq!(hold_action(expired, NestState::Absent), HoldAction::Send);
+            assert_eq!(hold_action(expired, NestState::Hooked, false), HoldAction::Send);
+            assert_eq!(hold_action(expired, NestState::Absent, false), HoldAction::Send);
         }
         // Unresolved inside the wait: hold the line.
-        assert_eq!(hold_action(false, NestState::Pending), HoldAction::Wait);
+        assert_eq!(hold_action(false, NestState::Pending, false), HoldAction::Wait);
         // Unresolved AT the deadline: abort - never type on.
-        assert_eq!(hold_action(true, NestState::Pending), HoldAction::Abort);
+        assert_eq!(hold_action(true, NestState::Pending, false), HoldAction::Abort);
         // The predicate agrees with the resume gate it shares (one rule).
         for nest in [NestState::Hooked, NestState::Absent, NestState::Pending] {
             assert_eq!(
-                hold_action(false, nest) == HoldAction::Send,
+                hold_action(false, nest, false) == HoldAction::Send,
                 resume_may_send(nest)
             );
         }
+    }
+
+    /// The slow-link credential case. Over a ~600ms-RTT link the step's
+    /// watcher "settles" on the silence of the ssh handshake, the next line
+    /// is held for the injection, ssh then asks for a password, and the
+    /// injection aborts on it — `Absent`. Releasing on `Absent` alone typed
+    /// the held `sudo su`, or the resume `claude --dangerously-skip-permissions`,
+    /// into ssh's password prompt as a login attempt. With the screen asking
+    /// for a secret, an injection that gave up is no licence to type.
+    #[test]
+    fn a_held_line_is_never_released_into_a_credential_prompt() {
+        for expired in [false, true] {
+            assert_eq!(
+                hold_action(expired, NestState::Absent, true),
+                HoldAction::Abort,
+                "the injection gave up on a password prompt: abort, never type into it"
+            );
+            // A hooked shell announced itself from its own prompt, so its
+            // screen is not a credential prompt; a pending one keeps the
+            // ordinary hold/abort rule.
+            assert_eq!(hold_action(expired, NestState::Hooked, true), HoldAction::Send);
+        }
+        assert_eq!(hold_action(false, NestState::Pending, true), HoldAction::Wait);
+        assert_eq!(hold_action(true, NestState::Pending, true), HoldAction::Abort);
+        // The shapes that land there, judged by the same classifiers the
+        // step watcher and the injection use.
+        assert!(credential_prompt_line("dev@203.0.113.10's password:"));
+        assert!(credential_prompt_line("[sudo] password for dev:"));
+        assert!(!credential_prompt_line("dev@host:~$"));
     }
 
     #[test]

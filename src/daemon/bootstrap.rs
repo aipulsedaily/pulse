@@ -966,25 +966,48 @@ __tc_hscrub; unset -f __tc_hscrub
 pub const NESTED_LINE_MAX: usize = 3500;
 
 /// The reader line — the only line of the injection a terminal ever echoes,
-/// and the one the erase payload below wipes back off the screen.
+/// and the one the erase row below wipes back off the screen.
 ///
 /// Deliberately readable rather than golfed (`__pulse_*` names: if the erase
 /// ever declines, a user who sees the line can tell whose plumbing it is),
 /// and every piece is load-bearing:
 ///   - a LEADING SPACE so `HISTCONTROL=ignorespace`/`ignoreboth` shells never
 ///     record it (the payload's `BASH_HIST_SCRUB` covers the rest);
-///   - `stty -echo` so the three base64 payload lines that follow are typed
-///     INVISIBLY (they are written only after this line has been echoed back
-///     and executed — see `nesthook`'s two-phase send);
+///   - `stty -echo` so the four payload lines that follow are typed
+///     INVISIBLY. They are written only once this line's echo has come back
+///     to the daemon (see `nesthook`'s two-phase send): the echo is the proof
+///     the shell accepted the line, so `stty -echo` runs before the payload
+///     can even arrive;
 ///   - a THREE-way family switch evaluated by the shell itself, never guessed
 ///     daemon-side: bash gets the bash body, zsh the zsh body, and anything
-///     else (dash/sh/fish/busybox) decodes an EMPTY string and evals nothing —
-///     the graceful skip. All three payload lines are consumed in every
-///     branch, so an unknown shell can never execute base64 as a command;
-///   - the ERASE blob (`__pulse_e`) is evaluated FIRST and UNCONDITIONALLY by
-///     every shell family: it is the daemon's own "wipe the line I just
-///     typed" (see `nested_erase_payload`), so even a shell we cannot hook
-///     leaves no artifact behind.
+///     else (dash/sh/fish/busybox) evaluates nothing — the graceful skip;
+///   - the erase is a ROW NUMBER, not code: the shell checks it is all digits
+///     and formats the cursor move itself, for every family, before the body
+///     runs. An empty row (the daemon's mirror declined) erases nothing and
+///     the line honestly stays visible.
+///
+/// NOTHING READ HERE IS EVALUATED UNLESS IT IS PROVABLY OURS. The body is
+/// still `eval`ed — running Pulse's hook body in the CURRENT shell is the
+/// whole feature, and every alternative is either the same thing spelled
+/// differently (`. <(…)`, which dash cannot even parse) or writes a file to
+/// the remote host, which this injection never does. What changed is what can
+/// reach it (`NESTED_TAGS`):
+///   - every payload line carries its own tag, and the decoded body is
+///     non-empty only when all FOUR `read`s returned their own tag. The
+///     reader reads the other three only after the first proved to be ours —
+///     the daemon writes the four lines contiguously, under the terminal's
+///     input lock, so the first being ours means the rest are too — and a
+///     first line that is not ours stops the reads cold: nothing is listed,
+///     erased or evaluated, and no more of the user's lines are swallowed;
+///   - the tags lead with ` #`, so if the payload ever lands at a live prompt
+///     instead (that desync), each line is an inert comment, not base64 run
+///     as a command.
+///
+/// Before this, the reader `eval`ed whatever four lines came next: a line the
+/// user submitted between the reader and the payload became `__pulse_b`, the
+/// payload shifted by one, the zsh body was evaluated by bash, the user's
+/// bytes were base64-decoded into the evaluated string, and the erase line
+/// was left to run at the prompt.
 ///
 /// Pure POSIX: it has to parse in whatever shell the nested world turned out
 /// to be, before that shell has told us what it is.
@@ -996,51 +1019,38 @@ pub const NESTED_LINE_MAX: usize = 3500;
 ///     it past the cap as a single line), and a payload line that the line
 ///     discipline silently truncates would eval to garbage. The arity is
 ///     FIXED at four lines in every branch — an empty continuation is still a
-///     line `read` consumes — so an unknown shell can never fall out of step
-///     and start executing base64 as commands.
-const NESTED_READER: &str = " stty -echo 2>/dev/null;IFS= read -r __pulse_b;IFS= read -r __pulse_c;IFS= read -r __pulse_z;IFS= read -r __pulse_e;stty echo 2>/dev/null;__pulse_h=;[ -n \"$BASH_VERSION\" ]&&__pulse_h=$__pulse_b$__pulse_c;[ -n \"$ZSH_VERSION\" ]&&__pulse_h=$__pulse_z;eval \"$(printf %s \"$__pulse_e\"|base64 -d 2>/dev/null)\";eval \"$(printf %s \"$__pulse_h\"|base64 -d 2>/dev/null)\";unset __pulse_b __pulse_c __pulse_z __pulse_e __pulse_h";
+///     line `read` consumes — so an unknown shell can never fall out of step.
+const NESTED_READER: &str = " stty -echo 2>/dev/null;__pulse_h=;IFS= read -r __pulse_b;case $__pulse_b in ' #pb:'*)IFS= read -r __pulse_c;IFS= read -r __pulse_z;IFS= read -r __pulse_e;;esac;stty echo 2>/dev/null;case $__pulse_b in ' #pb:'*)case $__pulse_c in ' #pc:'*)case $__pulse_z in ' #pz:'*)case $__pulse_e in ' #pe:'*)__pulse_e=${__pulse_e#' #pe:'};case $__pulse_e in ''|*[!0-9]*);;*)printf '\\033[%s;1H\\033[J' \"$__pulse_e\";;esac;[ -n \"$BASH_VERSION\" ]&&__pulse_h=${__pulse_b#' #pb:'}${__pulse_c#' #pc:'};[ -n \"$ZSH_VERSION\" ]&&__pulse_h=${__pulse_z#' #pz:'};;esac;;esac;;esac;;esac;[ -n \"$__pulse_h\" ]&&eval \"$(printf %s \"$__pulse_h\"|base64 -d 2>/dev/null)\";unset __pulse_b __pulse_c __pulse_z __pulse_e __pulse_h";
 
-/// The erase payload: an absolute cursor move to the row the echoed reader
-/// line STARTS on, then erase-to-end-of-display. The shell's next prompt then
-/// paints exactly where the old one was, so the seam reads as if nothing had
-/// been typed at all.
-///
-/// `row` is 1-based and comes from `nesthook::erase_start_row`, which returns
-/// one ONLY when the daemon's own mirror shows that region holding exactly
-/// our reader line and nothing else — the byte-exact gate. `None` (mirror
-/// disagreed, the region scrolled off, alt-screen) yields an EMPTY blob: the
-/// shell evals nothing and the line honestly stays visible.
-///
-/// Erasing rather than filtering the render is deliberate, and the reason is
-/// evidence, not preference: the echo is NOT byte-contiguous in the stream.
-/// readline splices `\033[?2004l` (bracketed-paste off) in at an arbitrary
-/// character boundary the moment Enter is accepted, and a line wrap inserts
-/// `\r\n\033[<row>;<col>H` mid-line — so a byte-exact match against the
-/// journal is not achievable, and a control-sequence-tolerant matcher would
-/// have to GUESS which sequences belonged to our echo. This way the journal
-/// keeps the literal truth (the erase included) and every renderer — daemon
-/// mirror, live client, replay reconstruction — reproduces the same clean
-/// screen from the same bytes, with no render-side special case anywhere.
-pub fn nested_erase_payload(row: Option<usize>) -> String {
-    match row {
-        Some(r) => base64_encode(format!("printf '\\033[{r};1H\\033[J'").as_bytes()),
-        None => String::new(),
-    }
-}
+/// The four payload tags, in the order `NESTED_READER` reads the lines: bash
+/// body (first half), bash body (second half), zsh body, erase row. Each is
+/// spelled out literally in the reader, and the goldens pin that they agree.
+pub const NESTED_TAGS: [&str; 4] = [" #pb:", " #pc:", " #pz:", " #pe:"];
 
-/// One nested-shell hook injection, as the four lines the daemon types.
+/// One nested-shell hook injection, as the lines the daemon types.
 #[derive(Debug, Clone)]
 pub struct NestedInjection {
     /// Phase 1: the reader line (see `NESTED_READER`).
     pub reader: String,
-    /// Phase 2, line 1: base64 of the bash body (hooks + history scrub).
+    /// Phase 2, lines 1-2: base64 of the bash body (hooks + history scrub).
     pub bash_b64: String,
-    /// Phase 2, line 2: base64 of the zsh body.
+    /// Phase 2, line 3: base64 of the zsh body.
     pub zsh_b64: String,
-    /// Phase 2, line 3: base64 of the erase (see `nested_erase_payload`).
-    /// Filled in at SEND time, never at arm time — the row it targets can
-    /// only be read off the mirror once the echo has actually landed.
-    pub erase_b64: String,
+    /// Phase 2, line 4: the 1-based screen row the echoed reader line starts
+    /// on, or None (the mirror declined: nothing is erased). Filled in at
+    /// SEND time, never at arm time — the row can only be read off the
+    /// mirror once the echo has actually landed.
+    ///
+    /// Erasing rather than filtering the render is deliberate, and the
+    /// reason is evidence, not preference: the echo is NOT byte-contiguous
+    /// in the stream. readline splices `\033[?2004l` (bracketed-paste off) in
+    /// at an arbitrary character boundary the moment Enter is accepted, and a
+    /// line wrap inserts `\r\n\033[<row>;<col>H` mid-line — so a byte-exact
+    /// match against the journal is not achievable. This way the journal
+    /// keeps the literal truth (the erase included) and every renderer —
+    /// daemon mirror, live client, replay reconstruction — reproduces the
+    /// same clean screen from the same bytes.
+    pub erase_row: Option<usize>,
 }
 
 /// Build the injection for `token` — the hook token the daemon registered
@@ -1057,21 +1067,28 @@ pub fn nested_injection(token: &str) -> NestedInjection {
         reader: NESTED_READER.to_string(),
         bash_b64: base64_encode(bash.as_bytes()),
         zsh_b64: base64_encode(zsh.as_bytes()),
-        erase_b64: String::new(),
+        erase_row: None,
     }
 }
 
 impl NestedInjection {
-    /// The four payload lines, in the order `NESTED_READER` reads them: the
-    /// bash body split in half, the zsh body, the erase blob.
+    /// The four payload lines, tagged, in the order `NESTED_READER` reads
+    /// them: the bash body split in half, the zsh body, the erase row.
     ///
     /// The split point is arbitrary BY DESIGN — base64 is ASCII, so any byte
-    /// index is a char boundary and the reader's `$__pulse_b$__pulse_c`
-    /// rejoins the two halves byte-exact. Halving keeps both lines far under
-    /// `NESTED_LINE_MAX` with room for the hook body to keep growing.
-    pub fn payload_lines(&self) -> [&str; 4] {
+    /// index is a char boundary and the reader's rejoin is byte-exact.
+    /// Halving keeps both lines far under `NESTED_LINE_MAX` with room for the
+    /// hook body to keep growing.
+    pub fn payload_lines(&self) -> [String; 4] {
         let (a, b) = self.bash_b64.split_at(self.bash_b64.len() / 2);
-        [a, b, &self.zsh_b64, &self.erase_b64]
+        let row = self.erase_row.map(|r| r.to_string()).unwrap_or_default();
+        let [tb, tc, tz, te] = NESTED_TAGS;
+        [
+            format!("{tb}{a}"),
+            format!("{tc}{b}"),
+            format!("{tz}{}", self.zsh_b64),
+            format!("{te}{row}"),
+        ]
     }
     /// Every line fits the canonical-mode limit.
     pub fn within_line_limit(&self) -> bool {
@@ -1351,23 +1368,27 @@ mod tests {
         // anything past N_TTY_BUF_SIZE (4096). Everything stays under
         // NESTED_LINE_MAX with room to spare.
         assert!(inj.within_line_limit(), "a line exceeded the canonical-mode cap");
-        for l in [inj.reader.as_str()].into_iter().chain(inj.payload_lines()) {
+        for l in std::iter::once(inj.reader.clone()).chain(inj.payload_lines()) {
             assert!(l.len() <= NESTED_LINE_MAX, "line too long: {}", l.len());
             assert!(!l.contains('\n') && !l.contains('\r'), "a typed line must be ONE line");
         }
-        // The erase blob is filled in at SEND time (the row is only knowable
+        // The erase row is filled in at SEND time (the row is only knowable
         // once the echo has landed); an un-sent injection carries none, and
-        // an empty one still occupies its payload line so the reader's third
+        // an empty one still occupies its payload line so the reader's fourth
         // `read` always has something to consume.
-        assert!(inj.erase_b64.is_empty(), "the erase must be composed at send time");
+        assert_eq!(inj.erase_row, None, "the erase must be composed at send time");
         assert_eq!(inj.payload_lines().len(), 4);
         // The bash body is FRAMED across two lines and rejoins byte-exact —
         // the reader concatenates before decoding, so the split point is
-        // arbitrary and the ARITY is what has to be fixed (an unknown shell
-        // that fell out of step would start executing base64 as commands).
+        // arbitrary and the ARITY is what has to be fixed.
         let lines = inj.payload_lines();
-        assert_eq!(format!("{}{}", lines[0], lines[1]), inj.bash_b64);
-        assert!(inj.reader.contains(r#"__pulse_h=$__pulse_b$__pulse_c"#));
+        let untag = |l: &str, t: &str| l.strip_prefix(t).expect("tagged").to_string();
+        assert_eq!(
+            untag(&lines[0], NESTED_TAGS[0]) + &untag(&lines[1], NESTED_TAGS[1]),
+            inj.bash_b64
+        );
+        assert_eq!(untag(&lines[2], NESTED_TAGS[2]), inj.zsh_b64);
+        assert_eq!(lines[3], NESTED_TAGS[3], "no row ⇒ an empty row ⇒ nothing is erased");
         assert!(inj.reader.contains("$BASH_VERSION") && inj.reader.contains("$ZSH_VERSION"));
         assert_eq!(
             inj.reader.matches("read -r").count(),
@@ -1375,19 +1396,52 @@ mod tests {
             "every payload line must be consumed in every shell branch"
         );
         let with_erase = NestedInjection {
-            erase_b64: nested_erase_payload(Some(12)),
+            erase_row: Some(12),
             ..inj.clone()
         };
         assert!(with_erase.within_line_limit());
-        let erase = String::from_utf8(b64_decode(&with_erase.erase_b64)).unwrap();
-        assert_eq!(
-            erase, "printf '\\033[12;1H\\033[J'",
-            "the erase is an absolute cursor move + erase-to-end-of-display"
-        );
+        assert_eq!(with_erase.payload_lines()[3], format!("{}12", NESTED_TAGS[3]));
+        // The erase is a ROW the shell formats itself — digits only — not a
+        // blob it evaluates.
         assert!(
-            nested_erase_payload(None).is_empty(),
-            "no row ⇒ an empty blob ⇒ eval \"\" ⇒ the line honestly stays visible"
+            inj.reader.contains(r#"case $__pulse_e in ''|*[!0-9]*);;*)printf '\033[%s;1H\033[J' "$__pulse_e";;esac"#),
+            "the erase must be a digits-only row the shell formats"
         );
+
+        // NOTHING UNTAGGED IS EVER EVALUATED (the H2-shaped desync). Exactly
+        // one eval, and the only string it can see is `__pulse_h`, which is
+        // reset first and assigned ONLY inside the four nested tag cases.
+        assert_eq!(inj.reader.matches("eval").count(), 1, "one eval, of the body only");
+        assert!(inj.reader.contains(r#"[ -n "$__pulse_h" ]&&eval "$(printf %s "$__pulse_h"|base64 -d"#));
+        let reset = inj.reader.find("__pulse_h=;").expect("the body string is reset first");
+        let first_read = inj.reader.find("read -r").unwrap();
+        assert!(reset < first_read, "a stale __pulse_h must never survive into the eval");
+        let [tb, tc, tz, te] = NESTED_TAGS;
+        let gate = format!(
+            "case $__pulse_b in '{tb}'*)case $__pulse_c in '{tc}'*)case $__pulse_z in '{tz}'*)case $__pulse_e in '{te}'*)"
+        );
+        let gate_at = inj.reader.find(&gate).expect("all four tags gate the body");
+        let gate_end = inj.reader[gate_at..].find(";;esac;;esac;;esac;;esac;").unwrap() + gate_at;
+        for (i, _) in inj.reader.match_indices("__pulse_h=$").chain(inj.reader.match_indices("__pulse_h=${")) {
+            assert!(
+                gate_at < i && i < gate_end,
+                "__pulse_h may only be assigned inside the tag gate (offset {i})"
+            );
+        }
+        // ...and the first line decides whether the other three are read at
+        // all: a line that is not ours stops the reader without swallowing
+        // any more of the user's input.
+        assert!(
+            inj.reader.contains(&format!(
+                "IFS= read -r __pulse_b;case $__pulse_b in '{tb}'*)IFS= read -r __pulse_c;IFS= read -r __pulse_z;IFS= read -r __pulse_e;;esac"
+            )),
+            "lines 2-4 must only be read after line 1 proved to be ours"
+        );
+        // Every tag is ` #`-led: a payload line that lands at a live prompt
+        // is an inert comment, never base64 run as a command.
+        for t in NESTED_TAGS {
+            assert!(t.starts_with(" #") && t.ends_with(':'), "{t:?}");
+        }
 
         // Quiet by construction: leading space (HISTCONTROL=ignorespace) and
         // echo suppressed around the payload read.
@@ -1399,23 +1453,15 @@ mod tests {
         let evl = inj.reader.find("eval").unwrap();
         assert!(off < on && on < evl, "echo must be restored BEFORE the eval runs");
 
-        // Family switch: decided by the shell, never guessed daemon-side, and
-        // EVERY payload line is consumed on every path (an unknown shell can
-        // never execute base64 as a command) — asserted against the arity
-        // above, so adding a line can never silently desynchronize them.
-        // The erase is evaluated FIRST and by EVERY family — a shell we
+        // The erase runs BEFORE the body and for EVERY family — a shell we
         // cannot hook still gets its screen cleaned up.
-        let erase_at = inj.reader.find("$__pulse_e\"|base64").unwrap();
-        let body_at = inj.reader.find("$__pulse_h\"|base64").unwrap();
-        assert!(erase_at < body_at, "the erase must run before the hook body");
-        assert!(
-            !inj.reader[..erase_at].contains("$__pulse_h\"|base64"),
-            "the erase eval must not sit behind the family switch"
-        );
+        let erase_at = inj.reader.find("printf '\\033[%s;1H").unwrap();
+        let fam_at = inj.reader.find("$BASH_VERSION").unwrap();
+        assert!(erase_at < fam_at && erase_at < evl, "the erase must run before the hook body");
         // ...and the reader line itself is POSIX: no [[ ]], no (( )), no
         // arrays — it has to PARSE in dash/busybox sh before that shell can
         // tell us it is not bash.
-        for bashism in ["[[", "((", "=~", "$'"] {
+        for bashism in ["[[", "((", "=~", "$'", "<("] {
             assert!(!inj.reader.contains(bashism), "reader line is not POSIX: {bashism}");
         }
 

@@ -513,23 +513,14 @@ impl Core {
             }
             Some(false) => {}
         }
-        self.cancel_reestablish(id, "controller input");
-        let submitted = bytes.last().is_some_and(|b| *b == b'\r' || *b == b'\n');
-        self.nesthook_on_input(id, submitted);
-        self.comp_on_input(id);
-        let writer = self.sessions.lock().get(&id).map(|s| s.writer.clone());
-        match writer {
-            Some(w) => {
-                use std::io::Write;
-                // r2-F7: a broken/full pipe (session dying mid-request) must
-                // not be answered Done — the controller was promised the
-                // bytes arrived.
-                let mut w = w.lock();
-                w.write_all(bytes)
-                    .and_then(|()| w.flush())
-                    .map_err(|e| ("io", format!("pty write failed: {e}")))
-            }
-            None => Err(("dead", "terminal is not running".into())),
+        // r2-F7: a broken/full pipe (session dying mid-request) must not be
+        // answered Done — the controller was promised the bytes arrived.
+        // Bytes HELD for a hook injection are accepted: they are written,
+        // in order, the moment its payload is out (a bounded wait).
+        match self.write_user_input(id, bytes, "controller input") {
+            Ok(super::nesthook::Delivery::NoSession) => Err(("dead", "terminal is not running".into())),
+            Ok(super::nesthook::Delivery::Written | super::nesthook::Delivery::Held) => Ok(()),
+            Err(e) => Err(("io", format!("pty write failed: {e}"))),
         }
     }
 
